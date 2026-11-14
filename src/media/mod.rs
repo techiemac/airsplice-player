@@ -1,6 +1,7 @@
 //! Media engine: demuxing, decoding, audio output and A/V sync.
 
 pub mod audio;
+pub mod mp4_timing;
 pub mod opus;
 pub mod player;
 pub mod video;

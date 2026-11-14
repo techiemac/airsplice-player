@@ -228,6 +228,10 @@ fn convert(pic: &Dav1dPicture) -> Result<DecodedFrame> {
 }
 
 impl VideoDecoder for Av1Decoder {
+    fn name(&self) -> &'static str {
+        "rav1d (software)"
+    }
+
     fn is_keyframe(&self, data: &[u8]) -> bool {
         is_keyframe(data)
     }

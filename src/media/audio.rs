@@ -23,6 +23,9 @@ pub struct AudioState {
     /// Seek generation the buffered samples belong to.
     pub generation: u64,
     pub paused: bool,
+    /// False while waiting for the first video frame (pre-roll): the device
+    /// plays silence and the clock holds, so video does not start late.
+    pub primed: bool,
     pub volume: f32,
     pub muted: bool,
     /// Most recent peak level per channel, for the level meter.
@@ -56,6 +59,7 @@ impl AudioOutput {
             base_secs: 0.0,
             generation: 0,
             paused: false,
+            primed: true,
             volume,
             muted,
             peak: [0.0; 2],
@@ -91,7 +95,7 @@ where
             let mut st = state.lock().unwrap();
             let gain = if st.muted { 0.0 } else { st.volume * st.volume };
             let silence = T::from_sample(0.0f32);
-            if st.paused {
+            if st.paused || !st.primed {
                 out.fill(silence);
                 st.peak = [0.0; 2];
                 return;
@@ -121,7 +125,9 @@ where
 /// The media clock. Audio-driven when the file has audio, wall-clock driven
 /// otherwise.
 pub enum Clock {
-    Audio { state: Arc<Mutex<AudioState>>, rate: u32 },
+    /// `preroll`: the media has video, so playback holds after open and
+    /// after each seek until the first frame is ready.
+    Audio { state: Arc<Mutex<AudioState>>, rate: u32, preroll: bool },
     Wall(Mutex<WallClock>),
 }
 
@@ -142,7 +148,7 @@ impl Clock {
 
     pub fn now(&self) -> f64 {
         match self {
-            Clock::Audio { state, rate } => {
+            Clock::Audio { state, rate, .. } => {
                 let st = state.lock().unwrap();
                 st.base_secs + st.consumed_frames as f64 / *rate as f64
             }
@@ -173,8 +179,9 @@ impl Clock {
     /// decoded samples are still valid.
     pub fn seek(&self, secs: f64, generation: u64) {
         match self {
-            Clock::Audio { state, .. } => {
+            Clock::Audio { state, preroll, .. } => {
                 let mut st = state.lock().unwrap();
+                st.primed = !*preroll;
                 st.buf.clear();
                 st.consumed_frames = 0;
                 st.base_secs = secs;
@@ -190,13 +197,24 @@ impl Clock {
     }
 
     /// Start a wall clock that is waiting for its first frame.
+    pub fn is_primed(&self) -> bool {
+        match self {
+            Clock::Audio { state, .. } => state.lock().unwrap().primed,
+            Clock::Wall(w) => w.lock().unwrap().primed,
+        }
+    }
+
+    /// Let a clock held for pre-roll run.
     pub fn prime(&self) {
-        if let Clock::Wall(w) = self {
-            let mut w = w.lock().unwrap();
-            if !w.primed {
-                w.primed = true;
-                if !w.paused {
-                    w.started = Some(Instant::now());
+        match self {
+            Clock::Audio { state, .. } => state.lock().unwrap().primed = true,
+            Clock::Wall(w) => {
+                let mut w = w.lock().unwrap();
+                if !w.primed {
+                    w.primed = true;
+                    if !w.paused {
+                        w.started = Some(Instant::now());
+                    }
                 }
             }
         }

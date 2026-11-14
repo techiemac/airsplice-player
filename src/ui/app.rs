@@ -1303,7 +1303,11 @@ impl MediaPlayer {
                 }
                 body = body.child(row("Duration", info.duration.map_or("Unknown".into(), format_time)));
                 if let Some(v) = &info.video {
-                    body = body.child(section("VIDEO")).child(row("Codec", v.codec.into())).child(row("Size", format!("{} × {}", v.width, v.height)));
+                    body = body
+                        .child(section("VIDEO"))
+                        .child(row("Codec", v.codec.into()))
+                        .child(row("Size", format!("{} × {}", v.width, v.height)))
+                        .child(row("Decoder", v.decoder.into()));
                 } else if let Some(why) = &info.video_unsupported {
                     body = body.child(section("VIDEO")).child(row("Status", why.clone()));
                 }
@@ -1355,7 +1359,8 @@ impl MediaPlayer {
         let summary = self.player.as_ref().map(|p| {
             let mut parts = Vec::new();
             if let Some(v) = &p.info.video {
-                parts.push(format!("{} {}×{}", v.codec, v.width, v.height));
+                let hw = if v.decoder.contains("hardware") { " (HW)" } else { "" };
+                parts.push(format!("{}{hw} {}×{}", v.codec, v.width, v.height));
             }
             if let Some(a) = &p.info.audio {
                 parts.push(format!("{} {} kHz {}", a.codec, fmt_khz(a.sample_rate), channel_label(a.channels)));

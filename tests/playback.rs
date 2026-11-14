@@ -144,6 +144,9 @@ fn h264_with_aac_plays_in_sync_on_the_audio_clock() {
     assert_eq!((a.codec.as_str(), a.sample_rate, a.channels), ("AAC", 44_100, 2));
     let shown = play_to_end(&player, Duration::from_secs(8));
     assert_in_sync("h264_aac.mp4", &shown);
+    // Pre-roll: audio waits for the first frame, so it is not late.
+    let first = &shown[0];
+    assert!(first.pts < 0.01 && first.position - first.pts < 0.02, "first frame {:.3}s shown at {:.3}s", first.pts, first.position);
     let end = player.position();
     assert!((end - 3.0).abs() < 0.1, "ended at {end:.3}s");
 }
@@ -180,10 +183,11 @@ fn pause_freezes_the_audio_clock() {
 
 #[test]
 fn unsupported_video_falls_back_to_audio() {
-    let Some(player) = open("hevc_aac.mp4") else { return };
+    // VP8: no decoder on any platform.
+    let Some(player) = open("vp8_opus.webm") else { return };
     assert!(player.info.video.is_none());
     let why = player.info.video_unsupported.as_deref().unwrap();
-    assert!(why.contains("HEVC"), "{why}");
+    assert!(why.contains("video"), "{why}");
     assert!(player.info.audio.is_some());
     play_to_end(&player, Duration::from_secs(8));
 }
@@ -224,5 +228,28 @@ fn seek_back_after_the_end_works_in_every_container() {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(player.error().is_none(), "{name}: {:?}", player.error());
+    }
+}
+
+/// HEVC and VP9 play through the OS hardware decoder where there is one;
+/// elsewhere they fall back to audio (covered above).
+#[test]
+fn hardware_decoded_video_plays_in_sync_and_seeks() {
+    for name in ["hevc_aac.mp4", "hevc_10bit_opus.mkv", "vp9_opus.webm"] {
+        let Some(mut player) = open(name) else { return };
+        let Some(video) = player.info.video.clone() else {
+            eprintln!("skipping {name}: {:?}", player.info.video_unsupported);
+            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                panic!("{name} should decode on Apple silicon");
+            }
+            continue;
+        };
+        assert!(video.decoder.contains("hardware"), "{name}: {}", video.decoder);
+        let shown = play_to_end(&player, Duration::from_secs(8));
+        assert_in_sync(name, &shown);
+        player.set_paused(true);
+        player.seek(1.4);
+        let f = wait_for_frame(&player, Duration::from_secs(5), |f| f.pts > 1.3);
+        assert_eq!(colour(&f), "green", "{name}: frame at {:.3}s after seek", f.pts);
     }
 }

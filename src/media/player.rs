@@ -11,7 +11,7 @@
 //! decoded for and is dropped if stale. No thread ever has to acknowledge a
 //! seek, so a seek can never deadlock against a full queue while paused.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,6 +41,8 @@ const VIDEO_PACKET_QUEUE: usize = 96;
 const NO_GENERATION: u64 = u64::MAX;
 /// Pre-roll frames this far before a seek target count as "at" the target.
 const PREROLL_TOLERANCE: f64 = 0.1;
+/// Longest the clock waits for the first video frame after open or seek.
+const MAX_PREROLL: StdDuration = StdDuration::from_millis(500);
 
 #[derive(Clone, Debug, Default)]
 pub struct MediaInfo {
@@ -67,6 +69,8 @@ pub struct AudioInfo {
 #[derive(Clone, Debug)]
 pub struct VideoInfo {
     pub codec: &'static str,
+    /// The decoder in use, e.g. "VideoToolbox (hardware)".
+    pub decoder: &'static str,
     pub width: u32,
     pub height: u32,
 }
@@ -118,6 +122,34 @@ enum VideoMsg {
     EndOfStream { generation: u64 },
 }
 
+/// Corrects the timestamps Symphonia reports to presentation times:
+/// MP4 composition offsets and edit lists (which it ignores), and an encoder
+/// delay a track declares but neither trims nor folds into its timestamps
+/// (Ogg Opus pre-skip).
+struct Timestamps {
+    mp4: HashMap<u32, super::mp4_timing::TrackTiming>,
+    /// (audio track, declared delay); the shift is decided on its first packet.
+    declared_delay: Option<(u32, i64)>,
+    delay_shift: Option<i64>,
+}
+
+impl Timestamps {
+    fn fix(&mut self, p: &mut symphonia::core::packet::Packet) {
+        if let Some(t) = self.mp4.get(&p.track_id) {
+            p.pts = Timestamp::new(t.pts(p.pts.get()));
+            return;
+        }
+        if let Some((track, delay)) = self.declared_delay
+            && track == p.track_id
+        {
+            // MP3 and Vorbis express the delay as a negative first PTS with
+            // `trim_start`; only shift when the packets ignore it.
+            let shift = *self.delay_shift.get_or_insert(if p.pts.get() >= 0 && p.trim_start.is_zero() { -delay } else { 0 });
+            p.pts = Timestamp::new(p.pts.get() + shift);
+        }
+    }
+}
+
 /// Where the demuxer sends video packets.
 struct VideoRoute {
     track_id: u32,
@@ -164,9 +196,11 @@ fn seek_reader(
     }
 }
 
-/// Seek so the first video packet read is a keyframe, backing off 1 s, 2 s,
-/// 4 s... before the target when it is not. Containers differ in how (and
-/// whether) they honour sync samples, so this does not rely on them.
+/// Seek so the first video packet read is a keyframe at or before the
+/// target, backing off 1 s, 2 s, 4 s... when it is not. Containers differ:
+/// Symphonia's MP4 reader ignores sync samples (lands mid-GOP) and its
+/// Matroska reader can land on the next cue point (after the target), so
+/// this checks the result rather than trusting either.
 /// Returns packets already read, to be processed before reading more.
 fn seek_to_keyframe(
     format: &mut Box<dyn FormatReader>,
@@ -175,6 +209,7 @@ fn seek_to_keyframe(
     target: f64,
     seek_track: Option<u32>,
     video: Option<&VideoRoute>,
+    timestamps: &mut Timestamps,
 ) -> VecDeque<symphonia::core::packet::Packet> {
     let mut back = 0.0;
     loop {
@@ -184,8 +219,12 @@ fn seek_to_keyframe(
         let mut pending = VecDeque::new();
         let first_video_is_key = loop {
             match format.next_packet() {
-                Ok(Some(p)) => {
-                    let key = (p.track_id == v.track_id).then(|| (v.is_keyframe)(&p.data));
+                Ok(Some(mut p)) => {
+                    timestamps.fix(&mut p);
+                    let key = (p.track_id == v.track_id).then(|| {
+                        let at = v.time_base.calc_time(p.pts).map_or(0.0, |t| t.as_secs_f64());
+                        (v.is_keyframe)(&p.data) && at <= target + 0.001
+                    });
                     pending.push_back(p);
                     if key.is_some() || pending.len() > 4096 {
                         break key;
@@ -212,6 +251,10 @@ pub struct Player {
     clock: Arc<Clock>,
     audio: Option<AudioOutput>,
     paused: bool,
+    /// (generation, pts) of the last frame handed to the UI.
+    last_shown: std::cell::Cell<Option<(u64, f64)>>,
+    /// When the current pre-roll began (open or seek).
+    preroll_since: std::cell::Cell<std::time::Instant>,
 }
 
 impl Player {
@@ -237,6 +280,7 @@ impl Player {
                     let p = params.expect("checked above");
                     info.video = Some(VideoInfo {
                         codec: video::codec_name(p.codec),
+                        decoder: dec.name(),
                         width: p.width.unwrap_or(0) as u32,
                         height: p.height.unwrap_or(0) as u32,
                     });
@@ -304,7 +348,11 @@ impl Player {
         info.duration = media_duration(format.as_ref());
 
         let clock = Arc::new(match &audio_out {
-            Some(out) => Clock::Audio { state: out.state.clone(), rate: out.rate },
+            Some(out) => {
+                let preroll = video_track.is_some();
+                out.state.lock().unwrap().primed = !preroll;
+                Clock::Audio { state: out.state.clone(), rate: out.rate, preroll }
+            }
             None => Clock::wall(),
         });
 
@@ -322,15 +370,28 @@ impl Player {
         }
 
         let seek_track = video_track.as_ref().or(audio_track.as_ref()).map(|t| t.id);
+        let timestamps = Timestamps {
+            mp4: if format.format_info().short_name == "isomp4" { super::mp4_timing::read(path) } else { HashMap::new() },
+            declared_delay: audio_track.as_ref().and_then(|t| Some((t.id, t.delay.filter(|d| *d > 0)? as i64))),
+            delay_shift: None,
+        };
         {
             let shared = shared.clone();
             let path = path.to_path_buf();
             thread::Builder::new()
                 .name("demux".into())
-                .spawn(move || demux_thread(format, path, audio_pipeline, video_route, seek_track, shared))?;
+                .spawn(move || demux_thread(format, path, audio_pipeline, video_route, seek_track, timestamps, shared))?;
         }
 
-        Ok(Self { info, shared, clock, audio: audio_out, paused: false })
+        Ok(Self {
+            info,
+            shared,
+            clock,
+            audio: audio_out,
+            paused: false,
+            last_shown: Default::default(),
+            preroll_since: std::cell::Cell::new(std::time::Instant::now()),
+        })
     }
 
     pub fn position(&self) -> f64 {
@@ -356,6 +417,7 @@ impl Player {
             None => secs.max(0.0),
         };
         let generation = self.shared.current() + 1;
+        self.preroll_since.set(std::time::Instant::now());
         // Order matters: invalidate queued audio and frames under their
         // locks before publishing the new generation.
         self.clock.seek(secs, generation);
@@ -380,15 +442,31 @@ impl Player {
     /// The newest decoded frame whose time has come, dropping any older ones.
     pub fn take_frame(&self) -> Option<VideoFrame> {
         let generation = self.shared.current();
-        if self.shared.frames.lock().unwrap().iter().any(|f| f.generation == generation) {
-            self.clock.prime();
+        let target = *self.shared.seek_target.lock().unwrap();
+        if !self.clock.is_primed() {
+            // Pre-roll: hold the clock until the frame for the start point
+            // is decoded (bounded, so a broken stream cannot hang playback).
+            let ready = self
+                .shared
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|f| f.generation == generation && f.pts >= target - PREROLL_TOLERANCE);
+            let gave_up = self.preroll_since.get().elapsed() > MAX_PREROLL
+                || self.shared.video_done.load(Ordering::Acquire) == generation;
+            if ready || gave_up {
+                self.clock.prime();
+            }
         }
         let now = self.clock.now();
-        let target = *self.shared.seek_target.lock().unwrap();
         let mut frames = self.shared.frames.lock().unwrap();
         let mut best = None;
+        let last_shown = self.last_shown.get().filter(|(g, _)| *g == generation).map(|(_, pts)| pts);
         while let Some(front) = frames.front() {
-            if front.generation != generation {
+            if front.generation != generation || last_shown.is_some_and(|l| front.pts <= l) {
+                // Stale, or older than what is on screen: a frame that
+                // arrived late must never make the picture step backwards.
                 frames.pop_front();
             } else if front.pts <= now + 0.004 {
                 best = frames.pop_front();
@@ -407,6 +485,9 @@ impl Player {
         }
         drop(frames);
         self.shared.frames_cv.notify_all();
+        if let Some(f) = &best {
+            self.last_shown.set(Some((generation, f.pts)));
+        }
         best
     }
 
@@ -605,7 +686,8 @@ impl AudioPipeline {
         let end = frames - to_frames(packet.trim_end).min(frames - start);
 
         if let Some(target) = *skip_until {
-            let pkt_start = self.time_base.calc_time(packet.pts).map_or(0.0, |t| t.as_secs_f64());
+            // `pts` marks the first decoded frame, before `trim_start`.
+            let pkt_start = self.time_base.calc_time(packet.pts).map_or(0.0, |t| t.as_secs_f64()) + start as f64 / self.rate as f64;
             let pkt_end = pkt_start + (end - start) as f64 / self.rate as f64;
             if pkt_end <= target {
                 return;
@@ -645,11 +727,13 @@ fn demux_thread(
     mut audio: Option<AudioPipeline>,
     video: Option<VideoRoute>,
     seek_track: Option<u32>,
+    mut timestamps: Timestamps,
     shared: Arc<Shared>,
 ) {
     let mut generation = 0;
     let mut eof = false;
-    let mut skip_until: Option<f64> = None;
+    // Audio before time zero is encoder priming: drop it from the start.
+    let mut skip_until: Option<f64> = Some(0.0);
     let mut pending = VecDeque::new();
     // Set once the reader has returned end-of-stream or an error.
     let mut exhausted = false;
@@ -661,7 +745,7 @@ fn demux_thread(
         if current != generation {
             generation = current;
             let target = *shared.seek_target.lock().unwrap();
-            pending = seek_to_keyframe(&mut format, &path, &mut exhausted, target, seek_track, video.as_ref());
+            pending = seek_to_keyframe(&mut format, &path, &mut exhausted, target, seek_track, video.as_ref(), &mut timestamps);
             if let Some(a) = audio.as_mut() {
                 a.reset();
             }
@@ -683,7 +767,12 @@ fn demux_thread(
         }
         let next = match pending.pop_front() {
             Some(p) => Ok(Some(p)),
-            None => format.next_packet(),
+            None => format.next_packet().map(|p| {
+                p.map(|mut p| {
+                    timestamps.fix(&mut p);
+                    p
+                })
+            }),
         };
         let packet = match next {
             Ok(Some(p)) => p,

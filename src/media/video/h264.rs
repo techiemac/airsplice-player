@@ -10,7 +10,8 @@ use openh264::decoder::{Decoder, DecoderConfig, Flush};
 use openh264_sys2::{DECODER_OPTION, DECODER_OPTION_NUM_OF_FRAMES_REMAINING_IN_BUFFER, SBufferInfo, dsErrorFree};
 
 use super::yuv::{self, Planes, Subsampling};
-use super::{DecodedFrame, VideoDecoder};
+use super::bitstream::BitReader;
+use super::{DecodedFrame, Reorder, VideoDecoder};
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 const NAL_SLICE: u8 = 1;
@@ -22,6 +23,8 @@ pub struct AvcConfig {
     pub nal_length_size: usize,
     /// SPS and PPS NAL units already prefixed with start codes.
     pub annexb_headers: Vec<u8>,
+    /// The first SPS NAL unit (header byte included).
+    pub sps: Vec<u8>,
 }
 
 pub fn parse_avcc(data: &[u8]) -> Result<AvcConfig> {
@@ -31,6 +34,7 @@ pub fn parse_avcc(data: &[u8]) -> Result<AvcConfig> {
     let truncated = || anyhow!("truncated avcC");
     let nal_length_size = (data[4] & 0x03) as usize + 1;
     let mut headers = Vec::new();
+    let mut sps = Vec::new();
     let mut pos = 5;
     for count_mask in [0x1f, 0xff] {
         let count = (*data.get(pos).ok_or_else(truncated)? & count_mask) as usize;
@@ -38,12 +42,16 @@ pub fn parse_avcc(data: &[u8]) -> Result<AvcConfig> {
         for _ in 0..count {
             let len = u16::from_be_bytes(data.get(pos..pos + 2).ok_or_else(truncated)?.try_into()?) as usize;
             pos += 2;
+            let nal = data.get(pos..pos + len).ok_or_else(truncated)?;
+            if sps.is_empty() && count_mask == 0x1f {
+                sps = nal.to_vec();
+            }
             headers.extend_from_slice(&START_CODE);
-            headers.extend_from_slice(data.get(pos..pos + len).ok_or_else(truncated)?);
+            headers.extend_from_slice(nal);
             pos += len;
         }
     }
-    Ok(AvcConfig { nal_length_size, annexb_headers: headers })
+    Ok(AvcConfig { nal_length_size, annexb_headers: headers, sps })
 }
 
 /// Iterate the NAL units of a length-prefixed access unit.
@@ -69,54 +77,150 @@ pub fn to_annexb(data: &[u8], nal_length_size: usize, out: &mut Vec<u8>) {
     }
 }
 
-/// Minimal Exp-Golomb reader over a NAL payload, skipping emulation
-/// prevention bytes.
-struct BitReader<'a> {
-    data: &'a [u8],
-    byte: usize,
-    bit: u8,
-    zeros: u8,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, byte: 0, bit: 0, zeros: 0 }
-    }
-
-    fn read_bit(&mut self) -> Option<u32> {
-        if self.bit == 0 {
-            // 0x00 0x00 0x03 -> drop the 0x03.
-            if self.zeros >= 2 && self.data.get(self.byte) == Some(&3) {
-                self.byte += 1;
-                self.zeros = 0;
-            }
-            let b = *self.data.get(self.byte)?;
-            self.zeros = if b == 0 { self.zeros + 1 } else { 0 };
+/// How many frames may precede a frame in decode order but follow it in
+/// display order (H.264 7.3.2.1 and E.1.1): the VUI's
+/// `max_num_reorder_frames` when present, else a safe bound (0 for streams
+/// that cannot reorder, otherwise the level's DPB size from Table A-1).
+pub fn reorder_depth(sps: &[u8]) -> Option<usize> {
+    let mut r = BitReader::new(sps.get(1..)?);
+    let profile = r.read_bits(8)?;
+    r.read_bits(8)?; // constraint flags
+    let level = r.read_bits(8)?;
+    r.read_ue()?; // seq_parameter_set_id
+    if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
+        let chroma_format = r.read_ue()?;
+        if chroma_format == 3 {
+            r.read_bit()?;
         }
-        let b = self.data[self.byte];
-        let v = (b >> (7 - self.bit)) & 1;
-        self.bit += 1;
-        if self.bit == 8 {
-            self.bit = 0;
-            self.byte += 1;
-        }
-        Some(v as u32)
-    }
-
-    fn read_ue(&mut self) -> Option<u32> {
-        let mut leading = 0;
-        while self.read_bit()? == 0 {
-            leading += 1;
-            if leading > 31 {
-                return None;
+        r.read_ue()?; // bit_depth_luma_minus8
+        r.read_ue()?; // bit_depth_chroma_minus8
+        r.read_bit()?; // qpprime_y_zero_transform_bypass_flag
+        if r.read_bit()? == 1 {
+            for i in 0..if chroma_format == 3 { 12 } else { 8 } {
+                if r.read_bit()? == 1 {
+                    let size = if i < 6 { 16 } else { 64 };
+                    let (mut last, mut next) = (8i32, 8i32);
+                    for _ in 0..size {
+                        if next != 0 {
+                            next = (last + r.read_se()? + 256) % 256;
+                        }
+                        if next != 0 {
+                            last = next;
+                        }
+                    }
+                }
             }
         }
-        let mut v = 0u32;
-        for _ in 0..leading {
-            v = (v << 1) | self.read_bit()?;
-        }
-        Some((1u32 << leading) - 1 + v)
     }
+    r.read_ue()?; // log2_max_frame_num_minus4
+    let poc_type = r.read_ue()?;
+    match poc_type {
+        0 => {
+            r.read_ue()?;
+        }
+        1 => {
+            r.read_bit()?;
+            r.read_se()?;
+            r.read_se()?;
+            for _ in 0..r.read_ue()? {
+                r.read_se()?;
+            }
+        }
+        _ => {}
+    }
+    r.read_ue()?; // max_num_ref_frames
+    r.read_bit()?; // gaps_in_frame_num_value_allowed_flag
+    let width_mbs = r.read_ue()? as usize + 1;
+    let height_units = r.read_ue()? as usize + 1;
+    let frame_mbs_only = r.read_bit()?;
+    if frame_mbs_only == 0 {
+        r.read_bit()?;
+    }
+    r.read_bit()?; // direct_8x8_inference_flag
+    if r.read_bit()? == 1 {
+        for _ in 0..4 {
+            r.read_ue()?;
+        }
+    }
+    // Baseline and POC type 2 streams output in decode order.
+    let cannot_reorder = profile == 66 || poc_type == 2;
+    let fallback = || {
+        if cannot_reorder {
+            return 0;
+        }
+        let frame_mbs = width_mbs * height_units * (2 - frame_mbs_only as usize);
+        let max_dpb_mbs = match level {
+            // Level 1b signalled as idc 11 gets level 1.1's (larger) bound.
+            9 | 10 => 396,
+            11 => 900,
+            12 | 13 | 20 => 2376,
+            21 => 4752,
+            22 | 30 => 8100,
+            31 => 18000,
+            32 => 20480,
+            40 | 41 => 32768,
+            42 => 34816,
+            50 => 110400,
+            51 | 52 => 184320,
+            _ => 696320,
+        };
+        (max_dpb_mbs / frame_mbs.max(1)).min(16)
+    };
+    if r.read_bit()? == 0 {
+        return Some(fallback()); // no VUI
+    }
+    if r.read_bit()? == 1 && r.read_bits(8)? == 255 {
+        r.read_bits(32)?; // sar_width, sar_height
+    }
+    if r.read_bit()? == 1 {
+        r.read_bit()?; // overscan_appropriate_flag
+    }
+    if r.read_bit()? == 1 {
+        r.read_bits(4)?; // video_format, video_full_range_flag
+        if r.read_bit()? == 1 {
+            r.read_bits(24)?; // colour description
+        }
+    }
+    if r.read_bit()? == 1 {
+        r.read_ue()?;
+        r.read_ue()?;
+    }
+    if r.read_bit()? == 1 {
+        r.read_bits(32)?;
+        r.read_bits(32)?;
+        r.read_bit()?;
+    }
+    let hrd = |r: &mut BitReader<'_>| -> Option<()> {
+        let count = r.read_ue()? + 1;
+        r.read_bits(8)?;
+        for _ in 0..count {
+            r.read_ue()?;
+            r.read_ue()?;
+            r.read_bit()?;
+        }
+        r.read_bits(20)?;
+        Some(())
+    };
+    let nal_hrd = r.read_bit()? == 1;
+    if nal_hrd {
+        hrd(&mut r)?;
+    }
+    let vcl_hrd = r.read_bit()? == 1;
+    if vcl_hrd {
+        hrd(&mut r)?;
+    }
+    if nal_hrd || vcl_hrd {
+        r.read_bit()?;
+    }
+    r.read_bit()?; // pic_struct_present_flag
+    if r.read_bit()? == 0 {
+        return Some(fallback()); // no bitstream_restriction
+    }
+    r.read_bit()?;
+    for _ in 0..4 {
+        r.read_ue()?;
+    }
+    Some(r.read_ue()? as usize)
 }
 
 /// An access unit decoding can start from: an IDR, or an intra-coded first
@@ -146,17 +250,23 @@ pub struct H264Decoder {
     /// decoder never saw; they are skipped rather than shown as garbage.
     seen_keyframe: bool,
     discard_before: i64,
+    /// OpenH264's low-latency API emits decode order.
+    reorder: Reorder,
 }
 
 impl H264Decoder {
     pub fn new(avcc: &[u8]) -> Result<Self> {
         let config = parse_avcc(avcc)?;
+        // An unparseable SPS gets the largest bound: correct, if slower to
+        // show the first frame.
+        let reorder_depth = reorder_depth(&config.sps).unwrap_or(16);
         Ok(Self {
             decoder: Self::make_decoder()?,
             config,
             scratch: Vec::new(),
             seen_keyframe: false,
             discard_before: i64::MIN,
+            reorder: Reorder::new(reorder_depth),
         })
     }
 
@@ -203,6 +313,10 @@ impl H264Decoder {
 }
 
 impl VideoDecoder for H264Decoder {
+    fn name(&self) -> &'static str {
+        "OpenH264 (software)"
+    }
+
     fn is_keyframe(&self, data: &[u8]) -> bool {
         is_keyframe(data, self.config.nal_length_size)
     }
@@ -242,7 +356,7 @@ impl VideoDecoder for H264Decoder {
         }
         let frame = self.frame_from(&info, &dst);
         self.scratch = annexb;
-        Ok(frame.into_iter().collect())
+        Ok(self.reorder.push(frame))
     }
 
     fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
@@ -263,13 +377,16 @@ impl VideoDecoder for H264Decoder {
             }
             frames.extend(self.frame_from(&info, &dst));
         }
-        Ok(frames)
+        let mut out = self.reorder.push(frames);
+        out.extend(self.reorder.drain());
+        Ok(out)
     }
 
     fn reset(&mut self, discard_before: i64) -> Result<()> {
         self.decoder = Self::make_decoder()?;
         self.seen_keyframe = false;
         self.discard_before = discard_before;
+        self.reorder.drain();
         Ok(())
     }
 }
@@ -312,11 +429,4 @@ mod tests {
         assert!(!is_keyframe(&[0, 0, 0, 9, 0x65], 4));
     }
 
-    #[test]
-    fn exp_golomb_skips_emulation_prevention() {
-        // 0x00 0x00 0x03 0x01: the 0x03 is dropped, leaving 23 zero bits, a
-        // 1, then 23 zero value bits: ue = 2^23 - 1.
-        let mut r = BitReader::new(&[0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0x00]);
-        assert_eq!(r.read_ue(), Some((1 << 23) - 1));
-    }
 }

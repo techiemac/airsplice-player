@@ -20,7 +20,7 @@ ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=48000:d=3" -filter_complex "$V10" -ma
 ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=44100:d=3" -filter_complex "$V" -map "[v]" -map 0:a \
   -c:v libx264 -bf 2 -g 25 -c:a libmp3lame -b:a 64k h264_mp3.mkv
 ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=44100:d=3" -filter_complex "$V" -map "[v]" -map 0:a \
-  -c:v libx265 -x265-params log-level=error:info=0 -tag:v hvc1 -c:a aac -b:a 64k hevc_aac.mp4
+  -c:v libx265 -x265-params log-level=error -tag:v hvc1 -c:a aac -b:a 64k hevc_aac.mp4  # keeps x265's SEI: hvcC > 1 KiB
 ffmpeg "${q[@]}" -filter_complex "$V" -map "[v]" -c:v libx264 -bf 2 -g 25 video_only.mp4
 
 ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=96000:d=2" -ac 1 -c:a flac mono_96k.flac
@@ -29,3 +29,15 @@ ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=44100:d=2" -ac 2 -c:a libmp3lame -b:a
 ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=48000:d=2" -ac 2 -c:a libopus -b:a 48k stereo.opus
 ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=44100:d=2" -ac 2 -c:a vorbis -strict -2 stereo.ogg
 ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=22050:d=2" -ac 2 -c:a pcm_s16le stereo_22k.wav
+
+# Codecs decoded by OS hardware decoders, and one nothing here decodes.
+ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=48000:d=3" -filter_complex "$V" -map "[v]" -map 0:a \
+  -c:v libvpx-vp9 -b:v 200k -g 25 -c:a libopus -b:a 48k vp9_opus.webm
+ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=48000:d=3" -filter_complex "$V10" -map "[v]" -map 0:a \
+  -c:v libx265 -x265-params log-level=error:info=0 -profile:v main10 -c:a libopus -b:a 48k hevc_10bit_opus.mkv
+ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=48000:d=3" -filter_complex "$V" -map "[v]" -map 0:a \
+  -c:v libvpx -b:v 200k -g 25 -c:a libopus -b:a 48k vp8_opus.webm
+
+# Moving content with B-frames, to check decoders emit display order.
+ffmpeg "${q[@]}" -f lavfi -i "testsrc2=s=160x120:r=25:d=2" -c:v libx264 -bf 3 -b_strategy 0 -g 25 -pix_fmt yuv420p bframes_h264.mp4
+ffmpeg "${q[@]}" -f lavfi -i "testsrc2=s=160x120:r=25:d=2" -c:v libx265 -x265-params log-level=error:info=0:bframes=3:b-adapt=0:keyint=25 -pix_fmt yuv420p bframes_hevc.mkv

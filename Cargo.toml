@@ -50,7 +50,16 @@ raw-window-handle = "0.6"
 # Compile GPUI's Metal shaders at launch so building needs no separate Metal
 # Toolchain download (Xcode 26 no longer bundles it).
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+# Hardware video decoding through the OS (VideoToolbox).
+objc2-video-toolbox = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-core-video = "0.3.2"
+objc2-core-foundation = "0.3.2"
 
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
 usvg = "0.45"
+
+[patch.crates-io]
+# Lifts a 1 KiB limit on avcC/hvcC records; see vendor/symphonia-format-isomp4/PATCHED.md.
+symphonia-format-isomp4 = { path = "vendor/symphonia-format-isomp4" }

@@ -13,7 +13,11 @@ fn main() -> anyhow::Result<()> {
     while start.elapsed().as_secs_f64() < secs && !player.is_finished() {
         if let Some(f) = player.take_frame() {
             shown += 1;
-            max_late = max_late.max(player.position() - f.pts);
+            let late = player.position() - f.pts;
+            if late > 0.02 {
+                eprintln!("  late {:.0} ms at frame pts {:.3}", late * 1000.0, f.pts);
+            }
+            max_late = max_late.max(late);
             if prev_pts >= 0.0 {
                 gaps.push(f.pts - prev_pts);
             }
