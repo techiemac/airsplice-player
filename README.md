@@ -23,6 +23,44 @@ the Raspberry Pi 5. The Windows build has not been tested yet.
 - Seeks land on the requested time, decoding forward from the previous
   keyframe
 
+## Why not FFmpeg
+
+FFmpeg plays nearly everything and is the usual foundation for a player.
+This project builds on Rust libraries instead, for three reasons:
+
+- **Memory safety in the parsing code.** Demuxers and decoders read
+  untrusted input, and media libraries written in C have a long history of
+  memory-safety bugs in exactly that code. Here, container parsing, audio
+  decoding, AV1 decoding and HEVC header parsing are written in Rust.
+- **One build.** Every dependency is a Cargo crate. There is no system
+  FFmpeg to install or match versions against, and cross-compiling for a
+  Raspberry Pi is a single `cargo build` in a container.
+- **Direct hardware access.** The player talks to the platform's decoder
+  itself (VideoToolbox on macOS, the V4L2 request API on Linux), so frame
+  timing, reordering and colour conversion are under its control.
+
+The stack:
+
+| Role | Crate |
+|---|---|
+| UI | [gpui](https://crates.io/crates/gpui) |
+| Containers and most audio codecs | [symphonia](https://github.com/pdeljanov/Symphonia) |
+| Opus | [ropus](https://github.com/0x4D44/ropus), a Rust port of libopus |
+| AV1 | [rav1d](https://github.com/memorysafety/rav1d), a Rust port of dav1d |
+| Audio output and resampling | [cpal](https://github.com/RustAudio/cpal), [rubato](https://github.com/HEnquist/rubato) |
+| macOS hardware video | VideoToolbox through the [objc2](https://github.com/madsmtm/objc2) bindings |
+| Raspberry Pi hardware video | own V4L2 request-API backend, with [v4l2r](https://github.com/Gnurou/v4l2r) and the [cros-codecs](https://github.com/chromeos/cros-codecs) HEVC parser |
+| Media keys and Now Playing | [souvlaki](https://github.com/Sinono3/souvlaki) |
+
+Two parts are not Rust: H.264 software decoding uses Cisco's
+[OpenH264](https://github.com/cisco/openh264) (C++, compiled from bundled
+source), since there is no production-ready Rust H.264 decoder yet; and
+hardware decoding is done by the operating system's drivers.
+
+The cost is coverage. FFmpeg decodes far more formats, and some of these
+crates are young; the workarounds this project carries are listed under
+[Upstream issues worked around](#upstream-issues-worked-around).
+
 ## Format support
 
 **Containers:** MP4/MOV, Matroska/WebM, Ogg, WAV, AIFF, CAF, MP3, FLAC.
@@ -42,11 +80,6 @@ every platform.
 
 When a file's video codec is not supported, its audio still plays and the
 player says why. The info panel (Cmd/Ctrl+R) shows which decoder is in use.
-
-Software decoders: [rav1d](https://github.com/memorysafety/rav1d) for AV1
-and Cisco's [OpenH264](https://github.com/cisco/openh264) for H.264
-(compiled from bundled source; it is the one C++ component, since there is
-no production-ready Rust H.264 decoder).
 
 ### Performance
 
@@ -203,15 +236,3 @@ These are worth fixing upstream; each workaround can go once they are.
 - On the Pi 5, 4K HEVC full screen on a 4K display runs at about 18 fps.
 - With PulseAudio's ALSA plugin, sound can start about 2 s late (video
   waits for it, so sync is kept). PipeWire does not show this.
-
-## License
-
-Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
-
-The patched crates in `vendor/` keep their own licenses. Notably,
-`vendor/symphonia-format-isomp4` is MPL-2.0, so changes to its files stay
-under MPL-2.0.
-
-The license covers this code, not codec patents. H.264 and HEVC are
-patented, and because OpenH264 is built from source here, Cisco's patent
-coverage for its own binaries does not apply.
