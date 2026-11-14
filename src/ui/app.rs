@@ -200,6 +200,10 @@ pub struct MediaPlayer {
     drag_fraction: f64,
     last_drag_seek: Instant,
     drawn_position: f64,
+    /// Frames shown since `fps_since`, for the `RUST_LOG=media_play=debug`
+    /// presentation-rate log.
+    fps_count: u32,
+    fps_since: Instant,
     /// Tags and durations for playlist entries, filled in the background.
     summaries: std::collections::HashMap<PathBuf, Summary>,
     os_media: Option<OsMedia>,
@@ -248,6 +252,8 @@ impl MediaPlayer {
             drag_fraction: 0.0,
             last_drag_seek: Instant::now(),
             drawn_position: -1.0,
+            fps_count: 0,
+            fps_since: Instant::now(),
             summaries: Default::default(),
             os_media: None,
             store,
@@ -406,6 +412,13 @@ impl MediaPlayer {
                 let _ = window.drop_image(old);
             }
             changed = true;
+            self.fps_count += 1;
+            let elapsed = self.fps_since.elapsed();
+            if elapsed >= Duration::from_secs(2) {
+                log::debug!("presented {:.1} frames/s", self.fps_count as f64 / elapsed.as_secs_f64());
+                self.fps_count = 0;
+                self.fps_since = Instant::now();
+            }
         }
         let position = player.position();
         if (position - self.drawn_position).abs() >= 0.04 || (!player.is_paused() && player.info.audio.is_some()) {

@@ -13,6 +13,7 @@ decoders. No ffmpeg.
 | Audio: AAC, MP3, FLAC, Vorbis, ALAC, PCM, ADPCM | `symphonia` | Rust |
 | Audio: Opus (incl. 5.1/7.1) | `ropus` (bit-exact port of libopus) | Rust |
 | Video, macOS: H.264, HEVC (8/10 bit), VP9, AV1 | VideoToolbox hardware decoding, via `objc2` bindings | OS |
+| Video, Linux: HEVC (8/10 bit) on stateless V4L2 decoders (Raspberry Pi 4/5) | own V4L2 request-API backend; `cros-codecs` HEVC parser, `v4l2r` kernel bindings | Rust |
 | Video, software: AV1 (8 and 10 bit) | `rav1d` (port of dav1d) | Rust |
 | Video, software: H.264 | `openh264` (Cisco, BSD, built from bundled source) | C++ |
 | Audio output | `cpal` (CoreAudio, WASAPI, ALSA/PulseAudio/PipeWire) | Rust |
@@ -25,9 +26,15 @@ production-quality pure-Rust H.264 decoder yet). `MEDIA_PLAY_SOFTWARE_VIDEO=1`
 forces software. The info panel shows which decoder is running.
 
 **HEVC and VP9** need a hardware decoder: macOS has one (VP9 and AV1 on
-recent Apple silicon). Windows (Media Foundation) and Linux (VA-API)
-backends are not written yet; there, files with those tracks play their
-audio and say why.
+recent Apple silicon), and HEVC works on Linux boards with a stateless
+V4L2 HEVC decoder such as the Raspberry Pi 4 and 5. Elsewhere (Windows,
+other Linux machines) files with those tracks play their audio and say why.
+
+The Raspberry Pi backend (`src/media/video/hevc/`) derives picture order
+counts, reference picture sets and reference lists itself (H.265 8.3),
+drives the kernel's request API, and de-tiles the Pi's column-128 output.
+Its output is bit-identical to ffmpeg's software HEVC decoder on the test
+streams; a golden-checksum test holds it there.
 
 **Performance** (M5 Max, release build, decode plus BGRA conversion):
 
@@ -40,6 +47,16 @@ audio and say why.
 
 OpenH264's threaded mode deadlocks with the low-latency API this player
 uses, so software H.264 stays single-threaded.
+
+**Raspberry Pi 5**, frames presented by the app on the Pi's display:
+
+| Stream | Decoder | Presented |
+|---|---|---|
+| 1080p60 HEVC | V4L2 hardware | 60 fps (decode path 2.1x real time) |
+| 4K30 HEVC 10-bit | V4L2 hardware | ~18 fps (see open items) |
+
+The hardware decodes 4K in ~9 ms; the limit is converting the Pi's tiled
+YUV to BGRA on the CPU and uploading 33 MB per frame through GPUI.
 
 ## Interface
 
@@ -100,7 +117,7 @@ suite runs on a Pi 5 in about 35 s. `scripts/pi.sh release` and
 Set `PI_HOST` (`user@host`), `PI_KEY` (SSH key) and optionally `PI_DIR` to
 choose the Pi; nothing about a particular machine is stored in the repo.
 
-The Linux script builds in a Debian container with the CI job's packages
+The Linux script builds in a Debian 13 container with the CI job's packages
 and plays audio into a PulseAudio null sink, so the audio-clock tests run in
 real time.
 
@@ -156,6 +173,9 @@ timestamp.
     at or before the target and back off otherwise.
   - Symphonia 0.6.1's MP4 and Matroska readers cannot seek after reaching
     end of stream; the engine reopens the file.
+  - cros-codecs 0.0.6's HEVC slice parser panics on more than 32 entry
+    point offsets (every 4K wavefront stream); `vendor/cros-codecs` reads
+    past them (see its `PATCHED.md`).
   - gpui 0.2.2 pulls in xattr 0.2.3, which does not build on Linux with
     current libc (the deprecated `ENOATTR` alias was removed);
     `vendor/xattr` is a patched copy (see its `PATCHED.md`).
@@ -167,10 +187,12 @@ timestamp.
   sync is unaffected, but sound starts late. On a Raspberry Pi 5 desktop
   with PipeWire the playback tests show no such delay (inferred from their
   timing, not measured per stream).
-- No hardware video backend on Windows (Media Foundation) or Linux: HEVC
-  and VP9 play audio only there. On Raspberry Pi the hardware is a V4L2
-  stateless HEVC decoder (`rpi-hevc-dec`) with column-tiled output; a
-  backend is planned on cros-codecs' HEVC parser.
+- 4K HEVC on a Raspberry Pi 5 presents ~18 fps, not 30: CPU colour
+  conversion and the GPUI upload of full-size BGRA are the limit, not the
+  decoder.
+- No hardware video backend on Windows (Media Foundation), for H.264 on
+  Raspberry Pi 4 (stateful V4L2), or VA-API desktops: HEVC and VP9 play
+  audio only there.
   - The published `rav1d` 1.1.0 crate omits `src/arm/asm-offsets.h`, so its
     assembly is disabled (pure Rust, still faster than real time at 1080p).
   - `opus-decoder` 0.1.1 was rejected: its multistream framing does not

@@ -199,3 +199,55 @@ fn decoders_emit_frames_in_display_order() {
         assert!(pts.windows(2).all(|w| w[1] > w[0]), "{name} ({backend:?}) emitted out of order: {pts:?}");
     }
 }
+
+/// FNV-1a over each frame's BGRA, in display order. Taken from the Raspberry
+/// Pi 5's V4L2 decode of `bframes_hevc.mkv`, which was verified bit-identical
+/// to ffmpeg's software HEVC decoder followed by this player's BT.601
+/// converter. Decoders that convert colour themselves (VideoToolbox) differ
+/// slightly and are not held to it.
+const BFRAMES_HEVC_GOLDEN: [u64; 50] = [
+    0x09159aafc5400be9, 0x98c0440074356ea3, 0xcbc1cf1689d519c5, 0x180a3ff90910a59f, 0x3a5dc6137edf5e40,
+    0x702558f8443bfbad, 0xfa0bbf3fc295657e, 0xe01070cb86953eee, 0x9cde897f188e8159, 0x4e3156d08c76e57c,
+    0x51ec9037e9d28a94, 0xd594832f0cfebf91, 0x813a3ee068a56349, 0x16803b621d9d4548, 0x5ab66da4536daaca,
+    0x3893596585fb84b7, 0xd4f960ba48fe1368, 0xcd54ec273946becf, 0xe9df5a41a9133e7b, 0x7a3582b6a5ee5d18,
+    0x0bb1a6da2d1266f9, 0x0d79a51b0fba9b71, 0xfa9e99dfb68e5633, 0x75cdf1af169ca3be, 0x1642ad543798d032,
+    0xfaba43ef81013ef1, 0x050c3da4d6f885ca, 0xd9551db811e49b43, 0x6c65024c676a31d0, 0xae444a26415bebe8,
+    0xb0cc4c45b3c37943, 0x748c82133138606e, 0x382aff419dc34ff3, 0xd249f4e4b0ad25d4, 0xf6cdf4eaa1674e25,
+    0xc501de67b995ec42, 0xb2d299bf7ede49db, 0x4565fe7064de77c7, 0x99c84318626d0b61, 0x3b2b87c09a09cb6f,
+    0xe5ed978db2c26c75, 0x0c16a77db9bbe9d1, 0xad2feb57e0ffb773, 0x5b0f3886a9d46ed2, 0x4121c73cdd695927,
+    0xdbf0436b999df1b2, 0x6d46eed0cd533282, 0x9d066c125b2037ab, 0x53087d7e2498fdc5, 0xbd6678f537edcd65,
+];
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
+#[test]
+fn v4l2_hevc_decode_is_bit_exact() {
+    let path = fixture("bframes_hevc.mkv");
+    let mss = MediaSourceStream::new(Box::new(File::open(&path).unwrap()), Default::default());
+    let mut format = symphonia::default::get_probe()
+        .probe(Hint::new().with_extension("mkv"), mss, FormatOptions::default(), MetadataOptions::default())
+        .unwrap();
+    let track = format.default_track(TrackType::Video).unwrap().clone();
+    let Ok(Some(mut dec)) = make_hardware_decoder(track.codec_params.as_ref().unwrap().video().unwrap()) else {
+        eprintln!("skipping: no hardware HEVC decoder here");
+        return;
+    };
+    if !dec.name().contains("V4L2") {
+        eprintln!("skipping: {} converts colour itself", dec.name());
+        return;
+    }
+    let mut frames = Vec::new();
+    while let Some(p) = format.next_packet().unwrap() {
+        if p.track_id == track.id {
+            frames.extend(dec.decode(&p.data, p.pts.get()).unwrap());
+        }
+    }
+    frames.extend(dec.flush().unwrap());
+    let hashes: Vec<u64> = frames.iter().map(|f| fnv1a(&f.bgra)).collect();
+    assert_eq!(hashes.len(), 50);
+    for (i, (got, want)) in hashes.iter().zip(BFRAMES_HEVC_GOLDEN).enumerate() {
+        assert_eq!(*got, want, "frame {i} differs from the verified decode");
+    }
+}

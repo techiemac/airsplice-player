@@ -7,6 +7,7 @@
 pub mod av1;
 pub mod bitstream;
 pub mod h264;
+pub mod hevc;
 #[cfg(target_os = "macos")]
 pub mod videotoolbox;
 pub mod yuv;
@@ -103,7 +104,22 @@ pub fn make_decoder(params: &VideoCodecParameters) -> Result<Box<dyn VideoDecode
 pub fn make_hardware_decoder(params: &VideoCodecParameters) -> Result<Option<Box<dyn VideoDecoder>>> {
     #[cfg(target_os = "macos")]
     return Ok(Some(Box::new(videotoolbox::VtDecoder::new(params)?)));
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    return match params.codec {
+        // Stateless V4L2 HEVC decoders (Raspberry Pi 4 and 5).
+        CODEC_ID_HEVC => {
+            let hvcc = params
+                .extra_data
+                .iter()
+                .find(|e| e.id == VIDEO_EXTRA_DATA_ID_HEVC_DECODER_CONFIG)
+                .ok_or_else(|| anyhow!("HEVC track has no hvcC decoder configuration"))?;
+            let nal_length_size = bitstream::hvcc_nal_length_size(&hvcc.data)?;
+            let depth = bitstream::hevc_reorder_depth(&hvcc.data).unwrap_or(16);
+            Ok(Some(Box::new(hevc::v4l2::V4l2HevcDecoder::new(&hvcc.data, nal_length_size, depth, keyframe_check(params)?)?)))
+        }
+        _ => Ok(None),
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     Ok(None)
 }
 

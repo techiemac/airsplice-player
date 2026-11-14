@@ -34,6 +34,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 dirs = "7.0.0"
 souvlaki = { version = "0.9.3", default-features = false, features = ["use_zbus"] }
+cros-codecs = { version = "0.0.6", default-features = false }
 
 [profile.dev.package."*"]
 # Decoders are unusably slow without optimisation, even in debug builds.
@@ -41,6 +42,12 @@ opt-level = 3
 
 [profile.release]
 lto = "thin"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Stateless V4L2 hardware decoding (Raspberry Pi HEVC): kernel struct
+# definitions generated from the system headers, and ioctl declarations.
+v4l2r = "0.0.8"
+nix = { version = "0.28", features = ["ioctl"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # The window handle souvlaki needs for Windows media controls.
@@ -65,3 +72,5 @@ usvg = "0.45"
 symphonia-format-isomp4 = { path = "vendor/symphonia-format-isomp4" }
 # Builds on Linux with current libc; see vendor/xattr/PATCHED.md.
 xattr = { path = "vendor/xattr" }
+# Parses 4K wavefront HEVC streams; see vendor/cros-codecs/PATCHED.md.
+cros-codecs = { path = "vendor/cros-codecs" }

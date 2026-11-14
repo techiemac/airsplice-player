@@ -28,17 +28,17 @@ pub struct Planes<'a, T> {
 }
 
 /// Fixed-point (Q14) limited-range YUV to RGB coefficients.
-struct Matrix {
-    y: i32,
-    rv: i32,
-    gu: i32,
-    gv: i32,
-    bu: i32,
+pub(crate) struct Matrix {
+    pub(crate) y: i32,
+    pub(crate) rv: i32,
+    pub(crate) gu: i32,
+    pub(crate) gv: i32,
+    pub(crate) bu: i32,
 }
 
 /// BT.709 for HD, BT.601 for SD: the convention when the stream carries no
 /// colour description.
-fn matrix_for(height: usize) -> Matrix {
+pub(crate) fn matrix_for(height: usize) -> Matrix {
     let (kr, kb) = if height >= 720 { (0.2126, 0.0722) } else { (0.299, 0.114) };
     let kg = 1.0 - kr - kb;
     let scale = 16384.0;
@@ -56,6 +56,17 @@ fn matrix_for(height: usize) -> Matrix {
 #[inline]
 fn clamp8(v: i32) -> u8 {
     v.clamp(0, 255) as u8
+}
+
+/// One pixel: 8-bit-scale `y`, `u`, `v` (already shifted down from higher
+/// bit depths) to BGRA. Every conversion path goes through this.
+#[inline(always)]
+pub(crate) fn pixel(m: &Matrix, y: i32, u: i32, v: i32, px: &mut [u8]) {
+    let (yy, u, v) = ((y - 16) * m.y, u - 128, v - 128);
+    px[0] = clamp8((yy + m.bu * u + 8192) >> 14);
+    px[1] = clamp8((yy - m.gu * u - m.gv * v + 8192) >> 14);
+    px[2] = clamp8((yy + m.rv * v + 8192) >> 14);
+    px[3] = 255;
 }
 
 pub fn to_bgra<T>(p: &Planes<'_, T>) -> Vec<u8>
@@ -77,25 +88,14 @@ where
         let y_row = &p.y[row * p.y_stride..];
         let uv_off = (row >> sy) * p.uv_stride;
         for x in 0..w {
-            let yv = (y_row[x].into() >> shift) as i32 - 16;
+            let y = (y_row[x].into() >> shift) as i32;
             let (u, v) = if mono {
-                (0, 0)
+                (128, 128)
             } else {
                 let cx = x >> sx;
-                (
-                    (p.u[uv_off + cx].into() >> shift) as i32 - 128,
-                    (p.v[uv_off + cx].into() >> shift) as i32 - 128,
-                )
+                ((p.u[uv_off + cx].into() >> shift) as i32, (p.v[uv_off + cx].into() >> shift) as i32)
             };
-            let yy = yv * m.y;
-            let r = (yy + m.rv * v + 8192) >> 14;
-            let g = (yy - m.gu * u - m.gv * v + 8192) >> 14;
-            let b = (yy + m.bu * u + 8192) >> 14;
-            let px = &mut line[x * 4..x * 4 + 4];
-            px[0] = clamp8(b);
-            px[1] = clamp8(g);
-            px[2] = clamp8(r);
-            px[3] = 255;
+            pixel(&m, y, u, v, &mut line[x * 4..x * 4 + 4]);
         }
     });
     out
