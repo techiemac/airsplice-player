@@ -3,7 +3,7 @@ name = "media-play"
 version = "0.1.0"
 edition = "2024"
 description = "A cross-platform media player with a Zed-style UI, built on GPUI and pure-Rust decoders"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [dependencies]
 # UI: Zed's own GPU-accelerated UI framework.

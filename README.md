@@ -202,3 +202,16 @@ timestamp.
   - `opus-decoder` 0.1.1 was rejected: its multistream framing does not
     follow RFC 6716 Appendix B, and a `u8` shift in its CELT collapse mask
     overflows on real hybrid stereo frames.
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+The patched crates in `vendor/` keep their own licenses. In particular,
+`vendor/symphonia-format-isomp4` is MPL-2.0: changes to its files stay under
+MPL-2.0. Dependencies pulled from crates.io are under their own (all
+permissive or file-level copyleft) licenses.
+
+The license covers this code, not codec patents. H.264 and HEVC are patented;
+OpenH264 is built from source here, so Cisco's patent coverage for its own
+binaries does not apply to these builds.

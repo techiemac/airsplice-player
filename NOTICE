@@ -1,0 +1,8 @@
+media-play
+Copyright 2026 techiemac
+
+This product includes software developed by third parties under their own
+licenses. The vendored crates in vendor/ keep their original licenses:
+  vendor/symphonia-format-isomp4  MPL-2.0 (modified; see PATCHED.md)
+  vendor/cros-codecs              BSD-3-Clause (modified; see PATCHED.md)
+  vendor/xattr                    MIT OR Apache-2.0 (modified; see PATCHED.md)
