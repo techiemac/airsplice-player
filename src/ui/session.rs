@@ -16,6 +16,17 @@ pub struct Session {
     pub repeat: String,
     pub sidebar_open: bool,
     pub info_open: bool,
+    /// Open tabs, left to right. Empty in sessions saved before tabs
+    /// existed; `current` and `position` then describe the one file open.
+    pub tabs: Vec<TabState>,
+    pub active_tab: Option<usize>,
+}
+
+/// One open tab: its file and where it was left.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TabState {
+    pub path: PathBuf,
+    pub position: f64,
 }
 
 impl Default for Session {
@@ -29,14 +40,28 @@ impl Default for Session {
             repeat: "off".into(),
             sidebar_open: true,
             info_open: false,
+            tabs: Vec::new(),
+            active_tab: None,
         }
     }
 }
 
 impl Session {
-    /// Drop playlist entries that no longer exist, keeping `current`
-    /// pointing at the same file (or clearing it if that file is gone).
+    /// Drop playlist entries and tabs whose files no longer exist, keeping
+    /// `current` and `active_tab` pointing at the same file (or clearing
+    /// them if that file is gone).
     pub fn without_missing_files(mut self) -> Self {
+        let active_path = self.active_tab.and_then(|i| self.tabs.get(i)).map(|t| t.path.clone());
+        self.tabs.retain(|t| t.path.exists());
+        for t in &mut self.tabs {
+            if !t.position.is_finite() || t.position < 0.0 {
+                t.position = 0.0;
+            }
+        }
+        self.active_tab = active_path.and_then(|a| self.tabs.iter().position(|t| t.path == a));
+        if self.active_tab.is_none() && !self.tabs.is_empty() {
+            self.active_tab = Some(0);
+        }
         let current_path = self.current.and_then(|i| self.playlist.get(i).cloned());
         self.playlist.retain(|p| p.exists());
         self.current = current_path.and_then(|c| self.playlist.iter().position(|p| *p == c));
@@ -129,7 +154,7 @@ mod tests {
         let track = dir.join("a.mp3");
         std::fs::write(&track, b"x").unwrap();
         let session = Session {
-            playlist: vec![track],
+            playlist: vec![track.clone()],
             current: Some(0),
             position: 12.5,
             volume: 0.3,
@@ -137,6 +162,8 @@ mod tests {
             repeat: "all".into(),
             sidebar_open: false,
             info_open: true,
+            tabs: vec![TabState { path: track, position: 12.5 }],
+            active_tab: Some(0),
         };
         store.save(&session).unwrap();
         assert_eq!(store.load(), session);
@@ -182,6 +209,23 @@ mod tests {
         assert!(!SessionStore::in_config_dir(&fresh).path().exists());
         let _ = std::fs::remove_dir_all(config);
         let _ = std::fs::remove_dir_all(fresh);
+    }
+
+    #[test]
+    fn tabs_whose_files_are_gone_are_dropped_and_the_active_tab_follows() {
+        let dir = temp_dir("tabs");
+        let (a, gone, c) = (dir.join("a.mp4"), dir.join("gone.mp4"), dir.join("c.mp4"));
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&c, b"x").unwrap();
+        let tab = |path: &PathBuf, position: f64| TabState { path: path.clone(), position };
+        let s = Session { tabs: vec![tab(&a, 1.0), tab(&gone, 2.0), tab(&c, f64::NAN)], active_tab: Some(2), ..Default::default() }
+            .without_missing_files();
+        assert_eq!(s.tabs, vec![tab(&a, 1.0), tab(&c, 0.0)], "missing file dropped, bad position reset");
+        assert_eq!(s.active_tab, Some(1), "still the same file");
+
+        let s = Session { tabs: vec![tab(&a, 1.0), tab(&gone, 2.0)], active_tab: Some(1), ..Default::default() }.without_missing_files();
+        assert_eq!(s.active_tab, Some(0), "the active tab's file is gone: the first tab instead");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

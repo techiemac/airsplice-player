@@ -13,11 +13,13 @@ the Raspberry Pi 5. The Windows build has not been tested yet.
 
 - Playlist with tag titles, durations and total length; drop files or
   folders anywhere in the window
+- Tabs: open files in background tabs, each loaded and paused on its first
+  frame, then cut between them instantly
 - Command palette and fuzzy file finder, keyboard-first controls
 - Hardware media keys and the system Now Playing view (macOS Control
   Center, Windows media overlay, Linux MPRIS)
-- Session restore: playlist, track, position, volume, repeat mode and panel
-  layout come back (paused) on the next launch
+- Session restore: playlist, open tabs and their positions, volume, repeat
+  mode and panel layout come back (paused) on the next launch
 - Hardware video decoding on macOS and Raspberry Pi
 - Surround Opus; AAC encoder delay trimmed using MP4 edit lists
 - Seeks land on the requested time, decoding forward from the previous
@@ -158,7 +160,16 @@ same decoder and may work.
 | Command palette | Cmd+Shift+P | Ctrl+Shift+P |
 | Find in playlist | Cmd+P | Ctrl+P |
 | Toggle playlist / info panel | Cmd+B / Cmd+R | Ctrl+B / Ctrl+R |
-| Stop | Cmd+. | Ctrl+. |
+| Stop (closes the tab) | Cmd+. | Ctrl+. |
+| Open in new tab | Cmd+click a playlist entry, or Cmd+Enter in the finder | Ctrl+click, or Ctrl+Enter |
+| Next / previous tab | Cmd+Shift+] / [, or Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Shift+] / [, or Ctrl+Tab / Ctrl+Shift+Tab |
+| Close tab | Cmd+W | Ctrl+W |
+
+Opening a file from the playlist plays it in the current tab. Opening it in
+a new tab (also the + button on each entry) loads it in the background,
+paused on its first frame; up to 8 tabs can be open. Switching tabs while
+playing cuts to the new tab and keeps playing; the tab you leave pauses where
+it was.
 
 Files passed on the command line replace the saved playlist. The session is
 stored in `airsplice-player/session.json` under the platform's config directory

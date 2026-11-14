@@ -18,7 +18,7 @@ use gpui::{
 use super::fuzzy::fuzzy_match;
 use super::icons::Icon;
 use super::os_media::{NowPlaying, OsMedia, PlayState};
-use super::session::{Session, SessionStore};
+use super::session::{Session, SessionStore, TabState};
 use super::theme::{Theme, mono_font};
 use crate::media::{Image, Player, Summary, is_media_file, probe};
 
@@ -43,9 +43,13 @@ actions!(
         ClearPlaylist,
         Stop,
         Quit,
+        CloseTab,
+        NextTab,
+        PreviousTab,
         PickerUp,
         PickerDown,
         PickerConfirm,
+        PickerConfirmInNewTab,
         PickerDismiss,
     ]
 );
@@ -54,6 +58,8 @@ const PLAYER_CONTEXT: &str = "Player";
 const PICKER_CONTEXT: &str = "Picker";
 const SEEK_STEP: f64 = 5.0;
 const VOLUME_STEP: f32 = 0.05;
+/// Each open tab keeps a decoder, an audio stream and a few frames alive.
+const MAX_TABS: usize = 8;
 
 pub fn bind_keys(cx: &mut App) {
     let player = Some(PLAYER_CONTEXT);
@@ -81,9 +87,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-p", FileFinder, None),
         KeyBinding::new("secondary-.", Stop, None),
         KeyBinding::new("secondary-q", Quit, None),
+        KeyBinding::new("secondary-w", CloseTab, None),
+        KeyBinding::new("secondary-shift-]", NextTab, None),
+        KeyBinding::new("secondary-shift-[", PreviousTab, None),
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
         KeyBinding::new("up", PickerUp, picker),
         KeyBinding::new("down", PickerDown, picker),
         KeyBinding::new("enter", PickerConfirm, picker),
+        KeyBinding::new("secondary-enter", PickerConfirmInNewTab, picker),
         KeyBinding::new("escape", PickerDismiss, picker),
     ]);
 }
@@ -151,6 +163,36 @@ struct PickerItem {
     target: PickerTarget,
 }
 
+/// One open file, ready to play: tabs keep several cued at once so the next
+/// one starts without loading.
+struct Tab {
+    path: PathBuf,
+    /// Its playlist entry, while that entry exists. For the active tab,
+    /// `MediaPlayer::current` is authoritative.
+    track: Option<usize>,
+    /// Playback state of every tab except the active one, whose state lives
+    /// in the `MediaPlayer` fields the rest of the UI reads.
+    parked: Option<Loaded>,
+}
+
+/// A file's playback state, whether on screen or parked in a tab.
+#[derive(Default)]
+struct Loaded {
+    player: Option<Player>,
+    frame: Option<Arc<RenderImage>>,
+    cover: Option<Arc<RenderImage>>,
+    error: Option<String>,
+    ended: bool,
+}
+
+impl Loaded {
+    fn release(self, window: &mut Window) {
+        for image in [self.frame, self.cover].into_iter().flatten() {
+            let _ = window.drop_image(image);
+        }
+    }
+}
+
 enum PickerTarget {
     Action(Box<dyn Action>),
     Track(usize),
@@ -173,6 +215,9 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Toggle Full Screen", Box::new(ToggleFullscreen)),
         ("Find in Playlist", Box::new(FileFinder)),
         ("Stop", Box::new(Stop)),
+        ("Close Tab", Box::new(CloseTab)),
+        ("Next Tab", Box::new(NextTab)),
+        ("Previous Tab", Box::new(PreviousTab)),
         ("Clear Playlist", Box::new(ClearPlaylist)),
         ("Quit", Box::new(Quit)),
     ]
@@ -182,6 +227,12 @@ pub struct MediaPlayer {
     focus: FocusHandle,
     picker_focus: FocusHandle,
     playlist: Vec<PathBuf>,
+    /// Open tabs, left to right; `active` is `None` exactly when there are
+    /// none. The active tab's state is in `current`, `player`, `frame`...
+    tabs: Vec<Tab>,
+    active: Option<usize>,
+    /// A short message about the last command (e.g. the tab limit).
+    notice: Option<String>,
     current: Option<usize>,
     player: Option<Player>,
     ended: bool,
@@ -234,6 +285,9 @@ impl MediaPlayer {
             focus,
             picker_focus: cx.focus_handle(),
             playlist: Vec::new(),
+            tabs: Vec::new(),
+            active: None,
+            notice: None,
             current: None,
             player: None,
             ended: false,
@@ -268,7 +322,9 @@ impl MediaPlayer {
         if files.is_empty() {
             this.playlist = session.playlist;
             this.probe_new(cx);
-            if let Some(ix) = session.current {
+            if !session.tabs.is_empty() {
+                this.restore_tabs(&session.tabs, session.active_tab, window, cx);
+            } else if let Some(ix) = session.current {
                 this.open_index(ix, false, session.position, window, cx);
             }
             this.saved = Some(this.snapshot(false));
@@ -352,14 +408,28 @@ impl MediaPlayer {
     // ---- session ----------------------------------------------------------
 
     fn snapshot(&self, exact: bool) -> Session {
-        let position = match &self.player {
-            Some(_) if self.ended => 0.0,
+        let saved_position = |player: Option<&Player>, ended: bool| match player {
+            Some(_) if ended => 0.0,
             Some(p) if exact => p.position(),
             // Whole seconds, so steady playback saves every few seconds
             // rather than on every tick.
             Some(p) => p.position().floor(),
             None => 0.0,
         };
+        let position = saved_position(self.player.as_ref(), self.ended);
+        let tabs = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(ix, tab)| TabState {
+                path: tab.path.clone(),
+                position: if self.active == Some(ix) {
+                    position
+                } else {
+                    tab.parked.as_ref().map_or(0.0, |l| saved_position(l.player.as_ref(), l.ended))
+                },
+            })
+            .collect();
         Session {
             playlist: self.playlist.clone(),
             current: self.current,
@@ -369,6 +439,8 @@ impl MediaPlayer {
             repeat: self.repeat.key().into(),
             sidebar_open: self.sidebar_open,
             info_open: self.info_open,
+            tabs,
+            active_tab: self.active,
         }
     }
 
@@ -404,6 +476,15 @@ impl MediaPlayer {
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_session(false);
         self.sync_os_media(window, cx);
+        // Background tabs are paused; this picks up the frame each one is
+        // cued on, so switching to it shows a picture at once.
+        for loaded in self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()) {
+            if let Some(frame) = loaded.player.as_ref().and_then(Player::take_frame)
+                && let Some(old) = loaded.frame.replace(to_render_image(frame.width, frame.height, frame.bgra))
+            {
+                let _ = window.drop_image(old);
+            }
+        }
         let Some(player) = &self.player else { return };
         // Video is never shown larger than the window: decoders that convert
         // on the CPU can skip pixels nobody would see.
@@ -443,7 +524,18 @@ impl MediaPlayer {
 
     fn on_track_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let len = self.playlist.len();
-        let Some(ix) = self.current else { return };
+        let Some(ix) = self.current.filter(|_| self.repeat != Repeat::One) else {
+            // Repeat one, or a tab whose file has left the playlist.
+            match self.player.as_mut() {
+                Some(p) if self.repeat == Repeat::One => p.seek(0.0),
+                Some(p) => {
+                    self.ended = true;
+                    p.set_paused(true);
+                }
+                None => {}
+            }
+            return;
+        };
         match self.repeat {
             Repeat::One => {
                 if let Some(p) = self.player.as_mut() {
@@ -465,30 +557,207 @@ impl MediaPlayer {
         self.open_index(ix, true, 0.0, window, cx);
     }
 
+    /// Open playlist entry `ix` in the active tab (a new one if none is
+    /// open), replacing what it showed.
     fn open_index(&mut self, ix: usize, autoplay: bool, start_at: f64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = self.playlist.get(ix).cloned() else { return };
         self.unload(window);
+        let loaded = self.load(&path, autoplay, start_at);
+        self.install(loaded);
         self.current = Some(ix);
-        match Player::open(&path, self.volume, self.muted) {
-            Ok(player) => {
-                self.cover = player.info.cover.as_ref().map(image_to_render);
-                self.error = player.info.video_unsupported.clone().map(|why| format!("Playing audio only: {why}"));
-                window.set_window_title(&format!("{} - airsplice-player", player.info.title));
-                let mut player = player;
+        match self.active {
+            Some(a) => self.tabs[a].path = path,
+            None => {
+                self.tabs.push(Tab { path, track: Some(ix), parked: None });
+                self.active = Some(self.tabs.len() - 1);
+            }
+        }
+        self.notice = None;
+        self.update_title(window);
+        cx.notify();
+    }
+
+    fn load(&self, path: &Path, autoplay: bool, start_at: f64) -> Loaded {
+        match Player::open(path, self.volume, self.muted) {
+            Ok(mut player) => {
+                let cover = player.info.cover.as_ref().map(image_to_render);
+                let error = player.info.video_unsupported.clone().map(|why| format!("Playing audio only: {why}"));
                 if !autoplay {
                     player.set_paused(true);
                 }
                 if start_at > 0.0 {
                     player.seek(start_at);
                 }
-                self.player = Some(player);
+                Loaded { player: Some(player), cover, error, ..Default::default() }
             }
-            Err(e) => {
-                self.error = Some(format!("Can't play {}: {e:#}", file_name(&path)));
-                window.set_window_title("airsplice-player");
+            Err(e) => Loaded { error: Some(format!("Can't play {}: {e:#}", file_name(path))), ..Default::default() },
+        }
+    }
+
+    /// Load a file for a tab that is not on screen: paused, keeping only the
+    /// frame it is cued on (and one more) decoded.
+    fn load_in_background(&self, path: &Path, start_at: f64) -> Loaded {
+        let mut loaded = self.load(path, false, start_at);
+        if let Some(p) = loaded.player.as_mut() {
+            p.set_background(true);
+        }
+        loaded
+    }
+
+    /// Make `loaded` the state on screen.
+    fn install(&mut self, loaded: Loaded) {
+        self.player = loaded.player;
+        self.frame = loaded.frame;
+        self.cover = loaded.cover;
+        self.error = loaded.error;
+        self.ended = loaded.ended;
+        self.drawn_position = -1.0;
+    }
+
+    fn take_installed(&mut self) -> Loaded {
+        Loaded {
+            player: self.player.take(),
+            frame: self.frame.take(),
+            cover: self.cover.take(),
+            error: self.error.take(),
+            ended: std::mem::take(&mut self.ended),
+        }
+    }
+
+    fn update_title(&self, window: &mut Window) {
+        match &self.player {
+            Some(p) => window.set_window_title(&format!("{} - airsplice-player", p.info.title)),
+            None => window.set_window_title("airsplice-player"),
+        }
+    }
+
+    // ---- tabs ---------------------------------------------------------------
+
+    /// Open playlist entry `ix` in a new background tab, paused on its first
+    /// frame, without leaving the current one.
+    fn open_in_new_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.playlist.get(ix).cloned() else { return };
+        if self.active.is_none() {
+            self.open_index(ix, false, 0.0, window, cx);
+            return;
+        }
+        if self.tabs.len() >= MAX_TABS {
+            self.notice = Some(format!("{MAX_TABS} tabs are open; close one to open another"));
+            cx.notify();
+            return;
+        }
+        let loaded = self.load_in_background(&path, 0.0);
+        self.tabs.push(Tab { path, track: Some(ix), parked: Some(loaded) });
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// Show tab `ix`. If the tab being left was playing, the new one starts
+    /// playing (a cut); the old one pauses where it was.
+    fn activate_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() || self.active == Some(ix) {
+            return;
+        }
+        let mut was_playing = false;
+        if let Some(a) = self.active {
+            was_playing = !self.ended && self.player.as_ref().is_some_and(|p| !p.is_paused());
+            if let Some(p) = self.player.as_mut() {
+                p.set_paused(true);
+                p.set_background(true);
+            }
+            self.tabs[a].track = self.current;
+            self.tabs[a].parked = Some(self.take_installed());
+        }
+        let loaded = self.tabs[ix].parked.take().unwrap_or_default();
+        self.install(loaded);
+        self.current = self.tabs[ix].track;
+        self.active = Some(ix);
+        if let Some(p) = self.player.as_mut() {
+            p.set_background(false);
+            p.set_volume(self.volume, self.muted);
+            if was_playing && !self.ended {
+                p.set_paused(false);
             }
         }
+        self.drag = None;
+        self.notice = None;
+        self.update_title(window);
         cx.notify();
+    }
+
+    /// Close tab `ix`. Closing the active tab shows its neighbour, paused.
+    fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(ix);
+        match self.active {
+            Some(a) if a == ix => {
+                self.unload(window);
+                self.error = None;
+                self.current = None;
+                self.active = None;
+                if self.tabs.is_empty() {
+                    self.update_title(window);
+                } else {
+                    self.activate_tab(ix.min(self.tabs.len() - 1), window, cx);
+                }
+            }
+            Some(a) => {
+                if let Some(loaded) = tab.parked {
+                    loaded.release(window);
+                }
+                if ix < a {
+                    self.active = Some(a - 1);
+                }
+            }
+            None => {}
+        }
+        self.notice = None;
+        cx.notify();
+    }
+
+    fn close_all_tabs(&mut self, window: &mut Window) {
+        self.unload(window);
+        for loaded in self.tabs.drain(..).filter_map(|t| t.parked) {
+            loaded.release(window);
+        }
+        self.active = None;
+        self.current = None;
+        self.error = None;
+        self.update_title(window);
+    }
+
+    /// Reopen the tabs of a saved session, each paused where it was left.
+    fn restore_tabs(&mut self, tabs: &[TabState], active: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        for tab in tabs.iter().take(MAX_TABS) {
+            let loaded = self.load_in_background(&tab.path, tab.position);
+            let track = self.playlist.iter().position(|p| *p == tab.path);
+            self.tabs.push(Tab { path: tab.path.clone(), track, parked: Some(loaded) });
+        }
+        let active = active.filter(|a| *a < self.tabs.len()).or((!self.tabs.is_empty()).then_some(0));
+        if let Some(a) = active {
+            self.activate_tab(a, window, cx);
+        }
+    }
+
+    fn close_active_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(a) = self.active {
+            self.close_tab(a, window, cx);
+        }
+    }
+
+    fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(a) = self.active {
+            self.activate_tab((a + 1) % self.tabs.len(), window, cx);
+        }
+    }
+
+    fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(a) = self.active {
+            let len = self.tabs.len();
+            self.activate_tab((a + len - 1) % len, window, cx);
+        }
     }
 
     fn unload(&mut self, window: &mut Window) {
@@ -558,15 +827,15 @@ impl MediaPlayer {
             return;
         }
         self.playlist.remove(ix);
-        match self.current {
-            Some(c) if c == ix => {
-                self.unload(window);
-                self.current = None;
-                self.error = None;
-                window.set_window_title("airsplice-player");
+        // Tabs showing the removed entry close; later entries shift down.
+        for t in (0..self.tabs.len()).rev() {
+            let active = self.active == Some(t);
+            match if active { self.current } else { self.tabs[t].track } {
+                Some(c) if c == ix => self.close_tab(t, window, cx),
+                Some(c) if c > ix && active => self.current = Some(c - 1),
+                Some(c) if c > ix => self.tabs[t].track = Some(c - 1),
+                _ => {}
             }
-            Some(c) if c > ix => self.current = Some(c - 1),
-            _ => {}
         }
         cx.notify();
     }
@@ -699,19 +968,14 @@ impl MediaPlayer {
         window.toggle_fullscreen();
     }
 
+    /// Stop: the file is closed along with its tab.
     fn stop(&mut self, _: &Stop, window: &mut Window, cx: &mut Context<Self>) {
-        self.unload(window);
-        self.error = None;
-        window.set_window_title("airsplice-player");
-        cx.notify();
+        self.close_active_tab(&CloseTab, window, cx);
     }
 
     fn clear_playlist(&mut self, _: &ClearPlaylist, window: &mut Window, cx: &mut Context<Self>) {
-        self.unload(window);
+        self.close_all_tabs(window);
         self.playlist.clear();
-        self.current = None;
-        self.error = None;
-        window.set_window_title("airsplice-player");
         cx.notify();
     }
 
@@ -791,13 +1055,20 @@ impl MediaPlayer {
     fn picker_confirm(&mut self, _: &PickerConfirm, window: &mut Window, cx: &mut Context<Self>) {
         let selected = self.picker.as_ref().map_or(0, |p| p.selected);
         let item = self.picker_items(window).into_iter().nth(selected);
-        self.run_picker_item(item, window, cx);
+        self.run_picker_item(item, false, window, cx);
     }
 
-    fn run_picker_item(&mut self, item: Option<PickerItem>, window: &mut Window, cx: &mut Context<Self>) {
+    fn picker_confirm_in_new_tab(&mut self, _: &PickerConfirmInNewTab, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.picker.as_ref().map_or(0, |p| p.selected);
+        let item = self.picker_items(window).into_iter().nth(selected);
+        self.run_picker_item(item, true, window, cx);
+    }
+
+    fn run_picker_item(&mut self, item: Option<PickerItem>, new_tab: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.close_picker(window, cx);
         match item.map(|i| i.target) {
             Some(PickerTarget::Action(action)) => window.dispatch_action(action, cx),
+            Some(PickerTarget::Track(ix)) if new_tab => self.open_in_new_tab(ix, window, cx),
             Some(PickerTarget::Track(ix)) => self.play_index(ix, window, cx),
             None => {}
         }
@@ -995,7 +1266,13 @@ impl MediaPlayer {
                         .when(active, |el| el.bg(Theme::selected()))
                         .hover(|s| s.bg(Theme::hover()))
                         .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, window, cx| this.play_index(ix, window, cx)))
+                        .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
+                            if e.modifiers().secondary() {
+                                this.open_in_new_tab(ix, window, cx);
+                            } else {
+                                this.play_index(ix, window, cx);
+                            }
+                        }))
                         .child(icon(row_icon, px(14.), if active { Theme::accent() } else { Theme::text_muted() }))
                         .child(
                             div()
@@ -1021,8 +1298,13 @@ impl MediaPlayer {
                             div()
                                 .absolute()
                                 .right(px(4.))
+                                .flex()
                                 .invisible()
                                 .group_hover("track", |s| s.visible())
+                                .child(icon_button(("new-tab", ix), Icon::Plus, false, cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_in_new_tab(ix, window, cx);
+                                })))
                                 .child(icon_button(("remove", ix), Icon::Close, false, cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.remove_track(ix, window, cx);
@@ -1046,44 +1328,64 @@ impl MediaPlayer {
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let tab = self.current.and_then(|ix| self.playlist.get(ix)).map(|path| {
+        let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
+            let active = self.active == Some(ix);
+            let (player, ended) = if active {
+                (self.player.as_ref(), self.ended)
+            } else {
+                tab.parked.as_ref().map_or((None, false), |l| (l.player.as_ref(), l.ended))
+            };
+            let playing = active && !ended && player.is_some_and(|p| !p.is_paused());
+            let glyph = if playing {
+                Icon::Play
+            } else if player.is_some_and(|p| p.info.video.is_some()) {
+                Icon::Film
+            } else {
+                Icon::Music
+            };
+            let group = SharedString::from(format!("tab-{ix}"));
             div()
-                .id("tab")
-                .group("tab")
+                .id(("tab", ix))
+                .group(group.clone())
                 .h_full()
+                .max_w(px(220.))
                 .flex()
+                .flex_none()
                 .items_center()
                 .gap(px(6.))
                 .pl(px(12.))
                 .pr(px(6.))
-                .bg(Theme::tab_active_bg())
                 .border_r_1()
                 .border_color(Theme::border())
                 .text_sm()
-                .text_color(Theme::text())
-                .child(icon(
-                    if self.player.as_ref().is_some_and(|p| p.info.video.is_some()) { Icon::Film } else { Icon::Music },
-                    px(14.),
-                    Theme::text_muted(),
-                ))
-                .child(file_name(path))
+                .cursor_pointer()
+                .when(active, |el| el.bg(Theme::tab_active_bg()).text_color(Theme::text()))
+                .when(!active, |el| el.text_color(Theme::text_muted()).hover(|s| s.bg(Theme::hover())))
+                .on_click(cx.listener(move |this, _, window, cx| this.activate_tab(ix, window, cx)))
+                .child(icon(glyph, px(14.), if playing { Theme::accent() } else { Theme::text_muted() }))
+                .child(div().min_w_0().truncate().child(self.display_name(&tab.path)))
                 .child(
-                    div().invisible().group_hover("tab", |s| s.visible()).child(icon_button(
-                        "tab-close",
+                    div().when(!active, |el| el.invisible().group_hover(group, |s| s.visible())).child(icon_button(
+                        ("tab-close", ix),
                         Icon::Close,
                         false,
-                        cx.listener(|this, _, window, cx| this.stop(&Stop, window, cx)),
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.close_tab(ix, window, cx);
+                        }),
                     )),
                 )
         });
         div()
+            .id("tab-bar")
             .h(px(32.))
             .flex_none()
             .flex()
+            .overflow_x_scroll()
             .bg(Theme::tab_bar_bg())
             .border_b_1()
             .border_color(Theme::border())
-            .children(tab)
+            .children(tabs)
             .into_any_element()
     }
 
@@ -1408,7 +1710,8 @@ impl MediaPlayer {
                     })))
                     .child(div().text_color(Theme::text()).child(state))
                     .when_some(summary, |el, s| el.child(div().truncate().child(s)))
-                    .when_some(self.error.clone(), |el, e| el.child(div().truncate().text_color(Theme::error()).child(e))),
+                    .when_some(self.error.clone(), |el, e| el.child(div().truncate().text_color(Theme::error()).child(e)))
+                    .when_some(self.notice.clone(), |el, n| el.child(div().truncate().text_color(Theme::warning()).child(n))),
             )
             .child(
                 div()
@@ -1478,7 +1781,9 @@ impl MediaPlayer {
                     .when(ix == selected, |el| el.bg(Theme::selected()))
                     .hover(|s| s.bg(Theme::hover()))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| this.run_picker_item(item.take(), window, cx)))
+                    .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
+                        this.run_picker_item(item.take(), e.modifiers().secondary(), window, cx)
+                    }))
                     .child(div().min_w_0().truncate().child(label))
                     .when_some(detail, |el, d| {
                         el.child(div().flex_none().max_w(px(220.)).truncate().text_xs().text_color(Theme::text_placeholder()).child(d))
@@ -1503,6 +1808,7 @@ impl MediaPlayer {
                         .on_action(cx.listener(Self::picker_up))
                         .on_action(cx.listener(Self::picker_down))
                         .on_action(cx.listener(Self::picker_confirm))
+                        .on_action(cx.listener(Self::picker_confirm_in_new_tab))
                         .on_action(cx.listener(|this, _: &PickerDismiss, window, cx| this.close_picker(window, cx)))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .occlude()
@@ -1585,6 +1891,9 @@ impl Render for MediaPlayer {
             .on_action(cx.listener(Self::toggle_info))
             .on_action(cx.listener(Self::toggle_fullscreen))
             .on_action(cx.listener(Self::stop))
+            .on_action(cx.listener(Self::close_active_tab))
+            .on_action(cx.listener(Self::next_tab))
+            .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::clear_playlist))
             .on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.open_picker(PickerKind::Commands, window, cx)))
             .on_action(cx.listener(|this, _: &FileFinder, window, cx| this.open_picker(PickerKind::Files, window, cx)))
@@ -1958,5 +2267,154 @@ mod tests {
             assert!(v.playlist[0].is_absolute(), "{:?}", v.playlist[0]);
             assert!(v.player.is_some());
         });
+    }
+
+    /// Run the view's tick until `done` holds, within a bounded budget.
+    fn tick_until(view: &gpui::Entity<MediaPlayer>, cx: &mut gpui::VisualTestContext, what: &str, done: impl Fn(&MediaPlayer) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !view.read_with(cx, |v, _| done(v)) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            view.update_in(cx, |v, window, cx| v.tick(window, cx));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn parked(v: &MediaPlayer, ix: usize) -> &Loaded {
+        v.tabs[ix].parked.as_ref().expect("a background tab")
+    }
+
+    #[gpui::test]
+    fn tabs_cue_files_in_the_background_and_cut_between_them(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        // Video-only files, so this runs without an audio device.
+        let files = vec![fixture("video_only.mp4"), fixture("bframes_h264.mp4")];
+        let (view, cx) = cx.add_window_view(|window, cx| MediaPlayer::new(files, None, window, cx));
+        assert_eq!(view.read_with(cx, |v, _| (v.tabs.len(), v.active)), (1, Some(0)), "the first file opens in a tab");
+
+        // Open in a new tab: cued paused in the background, nothing else changes.
+        view.update_in(cx, |v, window, cx| v.open_in_new_tab(1, window, cx));
+        view.read_with(cx, |v, _| {
+            assert_eq!((v.tabs.len(), v.active, v.current), (2, Some(0), Some(0)));
+            assert!(!v.player.as_ref().unwrap().is_paused(), "the current tab keeps playing");
+            assert!(parked(v, 1).player.as_ref().unwrap().is_paused(), "the new tab waits, paused");
+        });
+        tick_until(&view, cx, "the cued frame", |v| parked(v, 1).frame.is_some());
+
+        // Switching while playing cuts: the new tab plays at once, showing its
+        // cued frame, and the old one pauses where it was.
+        cx.simulate_keystrokes("secondary-shift-]");
+        let left_at = view.read_with(cx, |v, _| {
+            assert_eq!((v.active, v.current), (Some(1), Some(1)));
+            assert!(v.frame.is_some(), "a picture straight away");
+            assert!(!v.player.as_ref().unwrap().is_paused(), "a cut keeps playing");
+            let old = parked(v, 0).player.as_ref().unwrap();
+            assert!(old.is_paused());
+            old.position()
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        let still = view.read_with(cx, |v, _| parked(v, 0).player.as_ref().unwrap().position());
+        assert_eq!(still, left_at, "a background tab holds its position");
+
+        // Switching while paused stays paused.
+        cx.simulate_keystrokes("space secondary-shift-[");
+        view.read_with(cx, |v, _| {
+            assert_eq!((v.active, v.current), (Some(0), Some(0)));
+            assert!(v.player.as_ref().unwrap().is_paused());
+            assert_eq!(v.player.as_ref().unwrap().position(), left_at, "back where it was left");
+        });
+
+        // Closing the active tab shows its neighbour, paused; closing the last
+        // leaves nothing open.
+        cx.simulate_keystrokes("secondary-w");
+        view.read_with(cx, |v, _| {
+            assert_eq!((v.tabs.len(), v.active, v.current), (1, Some(0), Some(1)));
+            assert!(v.player.as_ref().unwrap().is_paused());
+        });
+        cx.simulate_keystrokes("secondary-w");
+        view.read_with(cx, |v, _| assert_eq!((v.tabs.len(), v.active, v.current, v.player.is_some()), (0, None, None, false)));
+    }
+
+    #[gpui::test]
+    fn tabs_stop_at_the_limit_and_the_file_finder_opens_into_them(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let files = vec![fixture("video_only.mp4"), fixture("bframes_h264.mp4")];
+        let (view, cx) = cx.add_window_view(|window, cx| MediaPlayer::new(files, None, window, cx));
+        // Cmd+Enter in the file finder opens the match in a new tab.
+        cx.simulate_keystrokes("secondary-p b f r a secondary-enter");
+        view.read_with(cx, |v, _| {
+            assert_eq!((v.tabs.len(), v.active), (2, Some(0)));
+            assert_eq!(v.tabs[1].path, fixture("bframes_h264.mp4"));
+        });
+        for _ in 2..MAX_TABS {
+            view.update_in(cx, |v, window, cx| v.open_in_new_tab(0, window, cx));
+        }
+        assert_eq!(view.read_with(cx, |v, _| (v.tabs.len(), v.notice.is_none())), (MAX_TABS, true));
+        view.update_in(cx, |v, window, cx| v.open_in_new_tab(0, window, cx));
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.tabs.len(), MAX_TABS, "no tab past the limit");
+            assert!(v.notice.as_deref().is_some_and(|n| n.contains("close one")), "{:?}", v.notice);
+        });
+        // Clearing the playlist closes every tab.
+        view.update_in(cx, |v, window, cx| v.clear_playlist(&ClearPlaylist, window, cx));
+        assert_eq!(view.read_with(cx, |v, _| (v.tabs.len(), v.active, v.player.is_some())), (0, None, false));
+    }
+
+    #[gpui::test]
+    fn removing_a_playlist_entry_closes_its_tabs_and_renumbers_the_rest(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (a, b, c) = (fixture("video_only.mp4"), fixture("bframes_h264.mp4"), fixture("ctts_v0_negative.mov"));
+        let (view, cx) = cx.add_window_view({
+            let files = vec![a.clone(), b.clone(), c.clone()];
+            |window, cx| MediaPlayer::new(files, None, window, cx)
+        });
+        view.update_in(cx, |v, window, cx| {
+            v.open_in_new_tab(2, window, cx);
+            v.open_in_new_tab(1, window, cx);
+        });
+        view.update_in(cx, |v, window, cx| v.remove_track(1, window, cx));
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.tabs.iter().map(|t| t.path.clone()).collect::<Vec<_>>(), vec![a.clone(), c.clone()], "b's tab closed");
+            assert_eq!((v.active, v.current, v.tabs[1].track), (Some(0), Some(0), Some(1)), "c moved up to entry 1");
+        });
+        view.update_in(cx, |v, window, cx| v.remove_track(0, window, cx));
+        view.read_with(cx, |v, _| {
+            assert_eq!((v.tabs.len(), v.active, v.current), (1, Some(0), Some(0)));
+            assert_eq!(v.playlist[0], c);
+            assert_eq!(v.player.as_ref().unwrap().info.path, c, "c's tab is now on screen");
+        });
+    }
+
+    #[gpui::test]
+    fn open_tabs_are_restored_with_their_positions(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let dir = std::env::temp_dir().join(format!("airsplice-player-tabs-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::new(dir.join("session.json"));
+        let files = vec![fixture("video_only.mp4"), fixture("bframes_h264.mp4")];
+        let (view, vcx) = cx.add_window_view({
+            let store = store.clone();
+            |window, cx| MediaPlayer::new(files, Some(store), window, cx)
+        });
+        view.update_in(vcx, |v, window, cx| {
+            v.player.as_mut().unwrap().seek(1.5);
+            v.open_in_new_tab(1, window, cx);
+            v.activate_tab(1, window, cx);
+            v.player.as_mut().unwrap().seek(0.8);
+            v.save_session(true);
+        });
+
+        let (view, vcx) = cx.add_window_view({
+            let store = store.clone();
+            |window, cx| MediaPlayer::new(Vec::new(), Some(store), window, cx)
+        });
+        view.read_with(vcx, |v, _| {
+            assert_eq!((v.tabs.len(), v.active, v.current), (2, Some(1), Some(1)));
+            let p = v.player.as_ref().unwrap();
+            assert!(p.is_paused(), "restored paused");
+            assert!((p.position() - 0.8).abs() < 0.01, "active tab at {}", p.position());
+            let other = parked(v, 0).player.as_ref().unwrap();
+            assert!((other.position() - 1.5).abs() < 0.01, "background tab at {}", other.position());
+        });
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
