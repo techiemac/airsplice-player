@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libfontconfig-dev libfreetype-dev libwayland-dev \
+            libx11-xcb-dev libxkbcommon-x11-dev libxcb1-dev libvulkan-dev
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        # Runners have no audio device: playback tests on files with audio
+        # skip and say so; decode and video-only playback tests still run.
+        run: cargo test -- --nocapture

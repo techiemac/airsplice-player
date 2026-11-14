@@ -1,0 +1,56 @@
+[package]
+name = "media-play"
+version = "0.1.0"
+edition = "2024"
+description = "A cross-platform media player with a Zed-style UI, built on GPUI and pure-Rust decoders"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# UI: Zed's own GPU-accelerated UI framework.
+gpui = "0.2.2"
+# Demuxing (MP4, MKV/WebM, OGG, WAV, AIFF, CAF) and audio decoding (MP3, AAC,
+# FLAC, Vorbis, ALAC, PCM, ADPCM), all pure Rust.
+symphonia = { version = "0.6.1", features = ["all", "exp-video-codecs"] }
+# Audio output (CoreAudio, WASAPI, ALSA/PulseAudio/PipeWire).
+cpal = "0.18.2"
+# Sample-rate conversion.
+rubato = "5.1.0"
+# AV1 video: Rust port of dav1d. Built without its assembly: the published
+# 1.1.0 crate omits src/arm/asm-offsets.h, and pure Rust needs no nasm on x86.
+rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+# H.264 video: Cisco's BSD-licensed decoder, built from bundled source.
+# There is no production-quality pure-Rust H.264 decoder.
+openh264 = "0.9.10"
+openh264-sys2 = "0.9.10"
+# Cover art decoding and the frame type GPUI renders.
+image = { version = "0.25.1", default-features = false, features = ["png", "jpeg"] }
+rayon = "1.10"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2.191"
+ropus = "0.12.18"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+dirs = "7.0.0"
+souvlaki = { version = "0.9.3", default-features = false, features = ["use_zbus"] }
+
+[profile.dev.package."*"]
+# Decoders are unusably slow without optimisation, even in debug builds.
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# The window handle souvlaki needs for Windows media controls.
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Compile GPUI's Metal shaders at launch so building needs no separate Metal
+# Toolchain download (Xcode 26 no longer bundles it).
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
+usvg = "0.45"
