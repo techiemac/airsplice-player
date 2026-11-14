@@ -968,6 +968,18 @@ mod tests {
     }
 
     #[test]
+    fn surround_aac_puts_each_channel_in_its_place() {
+        // Each channel carries its own tone; output is in Symphonia's
+        // order (FL, FR, FC, LFE, RL, RR), not AAC's (C, L R, Ls Rs, LFE).
+        let (rate, channels, samples, _) = decode_audio("aac_51.m4a");
+        assert_eq!((rate, channels), (48_000, 6));
+        for (ch, (label, want)) in [("FL", 300.0), ("FR", 500.0), ("FC", 700.0), ("LFE", 80.0), ("RL", 900.0), ("RR", 1100.0)].into_iter().enumerate() {
+            let got = frequency(&samples, channels, ch, rate);
+            assert!((got - want).abs() < want * 0.03, "{label}: {got:.0} Hz, expected {want} Hz");
+        }
+    }
+
+    #[test]
     fn every_audio_codec_decodes_a_440_hz_tone() {
         let cases = [
             ("tagged.mp3", 44_100, 2, 2.0, "MP3"),

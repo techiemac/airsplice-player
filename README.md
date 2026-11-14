@@ -65,8 +65,8 @@ crates are young; the workarounds this project carries are listed under
 
 **Containers:** MP4/MOV, Matroska/WebM, Ogg, WAV, AIFF, CAF, MP3, FLAC.
 
-**Audio:** AAC, MP3, FLAC, Opus (up to 7.1), Vorbis, ALAC, PCM, ADPCM, on
-every platform.
+**Audio:** AAC-LC (up to 5.1), MP3, FLAC, Opus (up to 7.1), Vorbis, ALAC,
+PCM, ADPCM, on every platform. HE-AAC is not supported yet.
 
 **Video:**
 
@@ -224,6 +224,9 @@ These are worth fixing upstream; each workaround can go once they are.
   off when there is none, and reopens the file after end of stream.
 - cros-codecs 0.0.6 panics on HEVC slices with more than 32 entry points
   (common in 4K). Patched in `vendor/cros-codecs`.
+- Symphonia's AAC decoder rejects more than two channels. Patched in
+  `vendor/symphonia-codec-aac`, which maps AAC's channel order (centre
+  first, LFE last) to the output's.
 - xattr 0.2.3 (via GPUI) does not build against current libc on Linux.
   Patched in `vendor/xattr`.
 - The published rav1d 1.1.0 crate is missing a header its ARM assembly

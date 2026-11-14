@@ -70,6 +70,8 @@ usvg = "0.45"
 [patch.crates-io]
 # Lifts a 1 KiB limit on avcC/hvcC records; see vendor/symphonia-format-isomp4/PATCHED.md.
 symphonia-format-isomp4 = { path = "vendor/symphonia-format-isomp4" }
+# Decodes 5.1 and 7.1 AAC-LC; see vendor/symphonia-codec-aac/PATCHED.md.
+symphonia-codec-aac = { path = "vendor/symphonia-codec-aac" }
 # Builds on Linux with current libc; see vendor/xattr/PATCHED.md.
 xattr = { path = "vendor/xattr" }
 # Parses 4K wavefront HEVC streams; see vendor/cros-codecs/PATCHED.md.

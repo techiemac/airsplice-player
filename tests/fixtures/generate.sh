@@ -47,3 +47,24 @@ ffmpeg "${q[@]}" -f lavfi -i "testsrc2=s=160x120:r=25:d=2" -c:v libx265 -x265-pa
 ffmpeg "${q[@]}" -f lavfi -i "testsrc2=s=160x120:r=25:d=10" -f lavfi -i "sine=f=440:r=44100:d=10" \
   -c:v libx265 -x265-params log-level=error:info=0:bframes=3:b-adapt=0:keyint=50:min-keyint=50:scenecut=0 \
   -tag:v hvc1 -pix_fmt yuv420p -c:a aac -b:a 32k seek_hevc.mp4
+
+# 5.1 AAC-LC (channel configuration 6) with a different tone per channel:
+# FL 300, FR 500, FC 700, LFE 80, RL 900, RR 1100 Hz.
+ffmpeg "${q[@]}" -f lavfi -i "sine=f=300:r=48000:d=2" -f lavfi -i "sine=f=500:r=48000:d=2" \
+  -f lavfi -i "sine=f=700:r=48000:d=2" -f lavfi -i "sine=f=80:r=48000:d=2" \
+  -f lavfi -i "sine=f=900:r=48000:d=2" -f lavfi -i "sine=f=1100:r=48000:d=2" \
+  -filter_complex "[0][1][2][3][4][5]join=inputs=6:channel_layout=5.1:map=0.0-FL|1.0-FR|2.0-FC|3.0-LFE|4.0-BL|5.0-BR" \
+  -c:a aac -b:a 192k aac_51.m4a
+
+# QuickTime-style MOV: negative composition offsets in a version 0 ctts box
+# (the spec says version 0 is unsigned; QuickTime writes signed values).
+# ffmpeg writes them as version 1, so flip the version byte.
+ffmpeg "${q[@]}" -f lavfi -i "testsrc2=s=160x120:r=25:d=1" -c:v libx264 -bf 2 -g 25 -pix_fmt yuv420p \
+  -movflags negative_cts_offsets ctts_v0_negative.mov
+python3 -I -c '
+d = bytearray(open("ctts_v0_negative.mov", "rb").read())
+i = d.find(b"ctts")
+assert d[i + 4] == 1, "expected a version 1 ctts"
+d[i + 4] = 0
+open("ctts_v0_negative.mov", "wb").write(d)
+'
