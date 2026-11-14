@@ -6,9 +6,6 @@ behind the Zed editor, and uses Zed's One Dark look. Decoding uses Rust
 libraries and the operating system's hardware decoders; there is no
 FFmpeg, GStreamer or libVLC underneath.
 
-It plays local files only. The player has no network code paths: no
-streaming URLs, no metadata lookups, no update checks, no telemetry.
-
 **Status:** early (0.1). Developed and tested on macOS and Linux, including
 the Raspberry Pi 5. The Windows build has not been tested yet.
 
@@ -49,8 +46,7 @@ player says why. The info panel (Cmd/Ctrl+R) shows which decoder is in use.
 Software decoders: [rav1d](https://github.com/memorysafety/rav1d) for AV1
 and Cisco's [OpenH264](https://github.com/cisco/openh264) for H.264
 (compiled from bundled source; it is the one C++ component, since there is
-no production-ready Rust H.264 decoder). Encrypted (DRM) content is not
-supported.
+no production-ready Rust H.264 decoder).
 
 ### Performance
 
