@@ -41,3 +41,9 @@ ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=48000:d=3" -filter_complex "$V" -map 
 # Moving content with B-frames, to check decoders emit display order.
 ffmpeg "${q[@]}" -f lavfi -i "testsrc2=s=160x120:r=25:d=2" -c:v libx264 -bf 3 -b_strategy 0 -g 25 -pix_fmt yuv420p bframes_h264.mp4
 ffmpeg "${q[@]}" -f lavfi -i "testsrc2=s=160x120:r=25:d=2" -c:v libx265 -x265-params log-level=error:info=0:bframes=3:b-adapt=0:keyint=25 -pix_fmt yuv420p bframes_hevc.mkv
+
+# Seeking: HEVC in MP4 with B-frames, a keyframe every 2 s and audio. The
+# keyframes fall on whole seconds, where a seek lands one packet past them.
+ffmpeg "${q[@]}" -f lavfi -i "testsrc2=s=160x120:r=25:d=10" -f lavfi -i "sine=f=440:r=44100:d=10" \
+  -c:v libx265 -x265-params log-level=error:info=0:bframes=3:b-adapt=0:keyint=50:min-keyint=50:scenecut=0 \
+  -tag:v hvc1 -pix_fmt yuv420p -c:a aac -b:a 32k seek_hevc.mp4

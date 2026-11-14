@@ -198,11 +198,16 @@ fn seek_reader(
     }
 }
 
-/// Seek so the first video packet read is a keyframe at or before the
-/// target, backing off 1 s, 2 s, 4 s... when it is not. Containers differ:
-/// Symphonia's MP4 reader ignores sync samples (lands mid-GOP) and its
-/// Matroska reader can land on the next cue point (after the target), so
-/// this checks the result rather than trusting either.
+/// Seek so the first video packet read is the latest keyframe at or before
+/// the target. Containers differ: Symphonia's MP4 reader ignores sync
+/// samples (it lands on the first packet at or after the requested time,
+/// often just past a keyframe) and its Matroska reader can land on the next
+/// cue point, after the target. So this checks the result rather than
+/// trusting either: from where the reader lands, it reads forward through
+/// the keyframes up to the target, and backs off 1 s, 2 s, 4 s... only when
+/// none comes before the target. Video packets ahead of the chosen keyframe
+/// cannot be decoded and are dropped; audio packets are kept (the audio path
+/// skips to the target itself).
 /// Returns packets already read, to be processed before reading more.
 fn seek_to_keyframe(
     format: &mut Box<dyn FormatReader>,
@@ -213,36 +218,70 @@ fn seek_to_keyframe(
     video: Option<&VideoRoute>,
     timestamps: &mut Timestamps,
 ) -> VecDeque<symphonia::core::packet::Packet> {
+    // In decode order, every keyframe at or before the target comes before
+    // any packet shown after the target. Without a keyframe yet, scan a
+    // little further in case the reader's timestamps are slightly off.
+    const SCAN_PAST_TARGET: f64 = 0.5;
+    const MAX_PACKETS: usize = 4096;
     let mut back = 0.0;
     loop {
         let start = (target - back).max(0.0);
         seek_reader(format, path, exhausted, start, seek_track);
         let Some(v) = video else { return VecDeque::new() };
         let mut pending = VecDeque::new();
-        let first_video_is_key = loop {
-            match format.next_packet() {
-                Ok(Some(mut p)) => {
-                    timestamps.fix(&mut p);
-                    let key = (p.track_id == v.track_id).then(|| {
-                        let at = v.time_base.calc_time(p.pts).map_or(0.0, |t| t.as_secs_f64());
-                        (v.is_keyframe)(&p.data) && at <= target + 0.001
-                    });
-                    pending.push_back(p);
-                    if key.is_some() || pending.len() > 4096 {
-                        break key;
-                    }
-                }
-                // End of stream or an error: let the main loop handle it,
-                // and reopen before any further seek.
+        let mut key = None;
+        let mut skipped = 0;
+        let ended = loop {
+            let mut p = match format.next_packet() {
+                Ok(Some(p)) => p,
+                // End of stream or an error. The reader is reopened before
+                // the next seek; from the start, the main loop handles it.
                 _ => {
                     *exhausted = true;
-                    break None;
+                    break true;
                 }
+            };
+            timestamps.fix(&mut p);
+            if p.track_id != v.track_id {
+                pending.push_back(p);
+                if pending.len() > MAX_PACKETS {
+                    break false;
+                }
+                continue;
+            }
+            let at = v.time_base.calc_time(p.pts).map_or(0.0, |t| t.as_secs_f64());
+            let is_key = (v.is_keyframe)(&p.data);
+            if is_key && at <= target + 0.001 {
+                // A keyframe nearer the target: decoding starts here instead.
+                let before = pending.len();
+                pending.retain(|q| q.track_id != v.track_id);
+                skipped += before - pending.len();
+                key = Some(at);
+                pending.push_back(p);
+            } else if key.is_some() {
+                pending.push_back(p);
+                if at > target + 0.001 || pending.len() > MAX_PACKETS {
+                    break false;
+                }
+            } else if is_key || at > target + SCAN_PAST_TARGET {
+                // The next keyframe is after the target: back off.
+                pending.push_back(p);
+                break false;
+            } else {
+                // Before any keyframe: undecodable.
+                skipped += 1;
             }
         };
-        match first_video_is_key {
-            Some(false) if start > 0.0 => back = if back == 0.0 { 1.0 } else { back * 2.0 },
-            _ => return pending,
+        match key {
+            Some(at) => {
+                log::debug!("seek to {target:.3}: keyframe at {at:.3} (reader asked for {start:.3}, {skipped} video packets skipped)");
+                return pending;
+            }
+            None if start > 0.0 => back = if back == 0.0 { 1.0 } else { back * 2.0 },
+            None => {
+                log::debug!("seek to {target:.3}: no keyframe before it (ended: {ended}); starting from the beginning");
+                return pending;
+            }
         }
     }
 }
@@ -953,6 +992,53 @@ mod tests {
             }
             let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
             assert!(peak > 0.05 && peak <= 1.01, "{name}: peak {peak}");
+        }
+    }
+
+    /// Seek the way the demux thread does and return the time of the first
+    /// video packet, which must be a keyframe.
+    fn first_video_after_seek(name: &str, target: f64) -> f64 {
+        let path = fixture(name);
+        let mut format = open_format(&path).unwrap();
+        let track = format.default_track(TrackType::Video).cloned().unwrap();
+        let audio = format.default_track(TrackType::Audio).cloned();
+        let params = track.codec_params.as_ref().and_then(|p| p.video()).unwrap();
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let route = VideoRoute {
+            track_id: track.id,
+            time_base: track.time_base.unwrap(),
+            is_keyframe: video::keyframe_check(params).unwrap(),
+            tx,
+        };
+        let mut timestamps = Timestamps {
+            mp4: if format.format_info().short_name == "isomp4" { super::super::mp4_timing::read(&path) } else { HashMap::new() },
+            declared_delay: audio.as_ref().and_then(|t| Some((t.id, t.delay.filter(|d| *d > 0)? as i64))),
+            delay_shift: None,
+        };
+        let mut exhausted = false;
+        let pending = seek_to_keyframe(&mut format, &path, &mut exhausted, target, Some(track.id), Some(&route), &mut timestamps);
+        let first = pending.iter().find(|p| p.track_id == track.id).unwrap_or_else(|| panic!("{name} @ {target}: no video packet"));
+        assert!((route.is_keyframe)(&first.data), "{name} @ {target}: first video packet is not a keyframe");
+        route.time_base.calc_time(first.pts).unwrap().as_secs_f64()
+    }
+
+    #[test]
+    fn seeks_start_at_the_latest_keyframe_before_the_target() {
+        // Keyframes: seek_hevc.mp4 every 2 s (on whole seconds, where
+        // Symphonia's MP4 reader lands one packet past them); the others
+        // every second.
+        let cases: [(&str, f64, &[f64]); 4] = [
+            ("seek_hevc.mp4", 2.0, &[0.5, 2.0, 3.0, 4.0, 5.0, 6.5, 8.0, 9.5]),
+            ("h264_aac.mp4", 1.0, &[0.5, 1.0, 1.5, 2.0, 2.7]),
+            ("hevc_10bit_opus.mkv", 1.0, &[0.5, 1.0, 1.5, 2.0, 2.7]),
+            ("bframes_hevc.mkv", 1.0, &[0.3, 1.0, 1.6]),
+        ];
+        for (name, interval, targets) in cases {
+            for &target in targets {
+                let expected = (target / interval + 1e-6).floor() * interval;
+                let at = first_video_after_seek(name, target);
+                assert!((at - expected).abs() < 0.02, "{name}: seek to {target} started at {at}, expected the keyframe at {expected}");
+            }
         }
     }
 

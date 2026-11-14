@@ -190,6 +190,8 @@ with a message, when there is none. Fixtures live in `tests/fixtures`;
 
 `examples/` has tools for working on decoders: `bench_decode` and
 `bench_playback` measure throughput and real-time delivery for any file,
+`bench_seek` times how quickly playback resumes after clicking or dragging
+the seek bar,
 `cmp_decoders` compares software and hardware output frame by frame, and
 `dump_frames` writes raw decoded frames to a file for comparing decoders
 across machines.
@@ -215,10 +217,11 @@ These are worth fixing upstream; each workaround can go once they are.
   them.
 - Symphonia's MP4 reader rejects `avcC`/`hvcC` records over 1 KiB, which
   excludes most x265 output. Patched in `vendor/symphonia-format-isomp4`.
-- Symphonia's MP4 and Matroska readers can seek past the target or into the
-  middle of a GOP, and cannot seek after reaching the end. The engine
-  verifies each seek lands on an earlier keyframe and reopens the file after
-  end of stream.
+- Symphonia's MP4 reader ignores keyframes when seeking (it lands on the
+  first packet at or after the requested time), its Matroska reader can
+  land past the target, and neither can seek after reaching the end. The
+  engine reads forward to the latest keyframe before the target, backing
+  off when there is none, and reopens the file after end of stream.
 - cros-codecs 0.0.6 panics on HEVC slices with more than 32 entry points
   (common in 4K). Patched in `vendor/cros-codecs`.
 - xattr 0.2.3 (via GPUI) does not build against current libc on Linux.
