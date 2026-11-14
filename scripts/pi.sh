@@ -5,15 +5,18 @@
 #   scripts/pi.sh release         build the release binary, copy it to the Pi
 #   scripts/pi.sh run [files...]  run the release build on the Pi's desktop
 #
-# PI_HOST (default pi@raspberrypi) and PI_KEY (an SSH private key; default:
-# ssh's own) select the Pi. The container mounts the repository at the path
-# it has on the Pi, so paths compiled into the tests (fixtures) are valid
-# there. Binaries are built on Debian 12 and run on newer Pi OS releases.
+# PI_HOST (user@host; default pi@raspberrypi, Raspberry Pi OS's stock
+# account) and PI_KEY (an SSH private key; default: ssh's own) select the Pi.
+# PI_DIR (default /home/<user>/media-play) is where the project lives there.
+# The container mounts the repository at that same path, so paths compiled
+# into the tests (fixtures) are valid on the Pi. Binaries are built on
+# Debian 12 and run on newer Pi OS releases.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PI_HOST=${PI_HOST:-pi@raspberrypi}
-REMOTE_DIR=/home/pi/media-play
+if [[ "$PI_HOST" == *@* ]]; then pi_user=${PI_HOST%%@*}; else pi_user=$(whoami); fi
+REMOTE_DIR=${PI_DIR:-/home/$pi_user/media-play}
 SSH=(ssh -o BatchMode=yes)
 [[ -n "${PI_KEY:-}" ]] && SSH+=(-i "$PI_KEY" -o IdentitiesOnly=yes)
 

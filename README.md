@@ -97,7 +97,8 @@ runs on the Pi, so the Pi's decoder hardware, PipeWire and display are
 real. On an M5 Max an edit-compile-copy cycle takes about 25 s; the whole
 suite runs on a Pi 5 in about 35 s. `scripts/pi.sh release` and
 `scripts/pi.sh run [files]` build, copy and launch the release binary.
-Set `PI_HOST` and `PI_KEY` to choose the Pi and SSH key.
+Set `PI_HOST` (`user@host`), `PI_KEY` (SSH key) and optionally `PI_DIR` to
+choose the Pi; nothing about a particular machine is stored in the repo.
 
 The Linux script builds in a Debian container with the CI job's packages
 and plays audio into a PulseAudio null sink, so the audio-clock tests run in
