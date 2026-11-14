@@ -68,3 +68,7 @@ assert d[i + 4] == 1, "expected a version 1 ctts"
 d[i + 4] = 0
 open("ctts_v0_negative.mov", "wb").write(d)
 '
+
+# Video that starts after time zero: B-frames and no edit list, so the first
+# frame is stamped 0.08 s (as in many camera and web files).
+ffmpeg "${q[@]}" -filter_complex "$V" -map "[v]" -c:v libx264 -bf 2 -g 25 -use_editlist 0 late_start.mp4

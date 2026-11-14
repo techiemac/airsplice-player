@@ -36,11 +36,16 @@ use super::video::{self, DecodedFrame, VideoDecoder};
 
 /// Decoded frames kept ahead of the clock.
 const MAX_QUEUED_FRAMES: usize = 8;
+/// Frames a background player keeps decoded ahead: enough to start at once
+/// when brought forward, without holding a full queue (a 4K frame is 33 MB).
+const BACKGROUND_QUEUED_FRAMES: usize = 1;
 /// Video packets buffered between the demuxer and the video decoder.
 const VIDEO_PACKET_QUEUE: usize = 96;
 const NO_GENERATION: u64 = u64::MAX;
 /// Pre-roll frames this far before a seek target count as "at" the target.
 const PREROLL_TOLERANCE: f64 = 0.1;
+/// Timestamps this close count as the same instant (container rounding).
+const SAME_TIME: f64 = 0.002;
 /// Longest the clock waits for the first video frame after open or seek.
 const MAX_PREROLL: StdDuration = StdDuration::from_millis(500);
 
@@ -107,6 +112,8 @@ struct Shared {
     stop: AtomicBool,
     /// Largest size video can be shown at, `width << 32 | height`; 0 = unknown.
     output_limit: AtomicU64,
+    /// Decoded frames to keep queued ahead of the one on screen.
+    max_frames: std::sync::atomic::AtomicUsize,
 }
 
 impl Shared {
@@ -345,6 +352,7 @@ impl Player {
             error: Mutex::new(None),
             stop: AtomicBool::new(false),
             output_limit: AtomicU64::new(0),
+            max_frames: std::sync::atomic::AtomicUsize::new(MAX_QUEUED_FRAMES),
         });
 
         let mut audio_out = None;
@@ -477,6 +485,21 @@ impl Player {
         }
     }
 
+    /// A background player (a tab not on screen) keeps only the frame it is
+    /// cued on and one more, instead of a full queue. Going to the
+    /// background while paused re-cues at the current position, which drops
+    /// frames queued beyond that.
+    pub fn set_background(&mut self, background: bool) {
+        let limit = if background { BACKGROUND_QUEUED_FRAMES } else { MAX_QUEUED_FRAMES };
+        if self.shared.max_frames.swap(limit, Ordering::Relaxed) == limit {
+            return;
+        }
+        if background && self.paused && self.shared.frames.lock().unwrap().len() > limit {
+            self.seek(self.position());
+        }
+        self.shared.frames_cv.notify_all();
+    }
+
     /// Tell the decoder the largest size video can currently be shown at.
     pub fn set_output_limit(&self, width: u32, height: u32) {
         self.shared.output_limit.store((width as u64) << 32 | height as u64, Ordering::Relaxed);
@@ -521,14 +544,25 @@ impl Player {
                 break;
             }
         }
-        // Right after a seek the decoder works through pre-roll frames from
-        // the previous keyframe. Show one only if it is provably the frame
-        // on screen at the target (its successor is past the target);
-        // otherwise hold it until that is known.
+        // Right after a seek the decoder works through frames from the
+        // previous keyframe. Show one from before the target only once it is
+        // provably the frame on screen at the target (its successor is past
+        // the target, or there is no successor); otherwise hold it.
+        let video_ended = self.shared.video_done.load(Ordering::Acquire) == generation;
         if let Some(f) = best.take_if(|f| {
-            f.pts < target - PREROLL_TOLERANCE && !frames.front().is_some_and(|next| next.pts > target)
+            f.pts < target - SAME_TIME && !video_ended && !frames.front().is_some_and(|next| next.pts > target)
         }) {
             frames.push_front(f);
+        }
+        // Nothing shown since the open or seek yet: show the first frame at
+        // the target even if its time has not quite come. Video often starts
+        // a little after time zero (B-frames without an edit list), and a
+        // paused clock would otherwise never reach it.
+        if best.is_none()
+            && last_shown.is_none()
+            && frames.front().is_some_and(|f| f.generation == generation && f.pts >= target - SAME_TIME)
+        {
+            best = frames.pop_front();
         }
         drop(frames);
         self.shared.frames_cv.notify_all();
@@ -878,8 +912,22 @@ fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time
     let push = |frames: Vec<DecodedFrame>, generation: u64| {
         for f in frames {
             let pts = time_base.calc_time(Timestamp::new(f.pts)).map_or(0.0, |t| t.as_secs_f64());
+            let target = *shared.seek_target.lock().unwrap();
             let mut q = shared.frames.lock().unwrap();
-            while q.len() >= MAX_QUEUED_FRAMES && shared.current() == generation && !shared.stopped() {
+            // Of the frames at or before the seek target only the latest can
+            // ever be shown (it is the one on screen at the target), so a
+            // newer one replaces older ones instead of waiting behind them.
+            // With a one-frame queue, waiting would never end.
+            let held = |e: &VideoFrame| e.generation == generation && e.pts <= target + SAME_TIME;
+            if pts <= target + SAME_TIME {
+                q.retain(|e| !held(e) || e.pts >= pts);
+            }
+            // The one frame held at or before the target does not count: the
+            // picker needs its successor to know it is the one to show.
+            while q.iter().filter(|e| !held(e)).count() >= shared.max_frames.load(Ordering::Relaxed)
+                && shared.current() == generation
+                && !shared.stopped()
+            {
                 q = shared.frames_cv.wait_timeout(q, StdDuration::from_millis(100)).unwrap().0;
             }
             if shared.current() != generation || shared.stopped() {
@@ -1052,6 +1100,56 @@ mod tests {
                 assert!((at - expected).abs() < 0.02, "{name}: seek to {target} started at {at}, expected the keyframe at {expected}");
             }
         }
+    }
+
+    #[test]
+    fn a_background_player_keeps_one_frame_queued_and_stays_cued() {
+        let queued = |p: &Player| p.shared.frames.lock().unwrap().len();
+        let within = |what: &str, budget_ms: u64, mut done: Box<dyn FnMut() -> bool + '_>| {
+            let deadline = std::time::Instant::now() + StdDuration::from_millis(budget_ms);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+                thread::sleep(StdDuration::from_millis(5));
+            }
+        };
+        // Video only, so no audio device is needed.
+        let mut p = Player::open(&fixture("video_only.mp4"), 0.0, true).unwrap();
+        p.set_paused(true);
+        p.seek(1.2);
+        within("a full queue", 3000, Box::new(|| queued(&p) >= MAX_QUEUED_FRAMES));
+
+        // To the background: re-cued at the same point with one frame queued.
+        p.set_background(true);
+        let mut cued = None;
+        within("the cued frame", 3000, Box::new(|| {
+            cued = cued.take().or_else(|| p.take_frame());
+            cued.is_some()
+        }));
+        let f = cued.unwrap();
+        assert!((f.pts - 1.2).abs() < 0.05, "cued on {:.3}s, not 1.2s", f.pts);
+        assert!((p.position() - 1.2).abs() < 1e-9, "position moved to {}", p.position());
+        let watch_until = std::time::Instant::now() + StdDuration::from_millis(300);
+        while std::time::Instant::now() < watch_until {
+            assert!(queued(&p) <= BACKGROUND_QUEUED_FRAMES, "{} frames queued in the background", queued(&p));
+            thread::sleep(StdDuration::from_millis(5));
+        }
+
+        // A target between frames (1.21 s) shows the frame on screen then
+        // (1.20 s). Knowing that needs the next frame decoded, which the
+        // held frame must not block in a one-frame queue.
+        p.seek(1.21);
+        let mut between = None;
+        within("the frame at 1.21s", 3000, Box::new(|| {
+            between = between.take().or_else(|| p.take_frame());
+            between.is_some()
+        }));
+        let f = between.unwrap();
+        assert!((f.pts - 1.2).abs() < 0.005, "showed {:.3}s for a seek to 1.21s", f.pts);
+
+        // Back on screen it plays on as normal.
+        p.set_background(false);
+        p.set_paused(false);
+        within("playback past 1.5s", 3000, Box::new(|| p.take_frame().is_some_and(|f| f.pts > 1.5)));
     }
 
     #[test]

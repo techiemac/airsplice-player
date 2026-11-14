@@ -264,3 +264,15 @@ fn hardware_decoded_video_plays_in_sync_and_seeks() {
         assert_eq!(colour(&f), "green", "{name}: frame at {:.3}s after seek", f.pts);
     }
 }
+
+#[test]
+fn a_paused_file_shows_its_first_frame_when_video_starts_after_zero() {
+    // No edit list: the first frame is stamped 0.08 s while the clock
+    // starts at 0. Paused there, the picture must still appear.
+    let mut player = open("late_start.mp4").unwrap();
+    player.set_paused(true);
+    let f = wait_for_frame(&player, Duration::from_secs(2), |_| true);
+    assert!((f.pts - 0.08).abs() < 0.01, "first frame at {:.3}s", f.pts);
+    assert_eq!(colour(&f), "red");
+    assert!(player.position() < 0.01, "still at the start: {:.3}s", player.position());
+}
