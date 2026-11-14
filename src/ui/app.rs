@@ -1868,7 +1868,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("media-play-session-ui-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = SessionStore::new(dir.join("session.json"));
-        let files = vec![fixture("video_only.mp4"), fixture("h264_mp3.mkv")];
+        // Video-only files, so this runs without an audio device.
+        let files = vec![fixture("video_only.mp4"), fixture("bframes_h264.mp4")];
 
         let (view, vcx) = cx.add_window_view({
             let store = store.clone();

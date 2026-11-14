@@ -87,8 +87,13 @@ cargo run --release -- [files or folders...]
 ## Tests
 
 ```sh
-cargo test
+cargo test               # this machine
+scripts/test-linux.sh    # Linux, in Docker (clippy + full suite)
 ```
+
+The Linux script builds in a Debian container with the CI job's packages
+and plays audio into a PulseAudio null sink, so the audio-clock tests run in
+real time.
 
 - Unit tests: YUV conversion, avcC/Annex B, H.264 and AV1 keyframe parsing,
   OpusHead and surround channel order, resampling and downmix, fuzzy match.
@@ -113,8 +118,11 @@ timestamp.
 
 ## Engine notes
 
-- **Clock:** audio-driven (frames consumed by the device) when there is
-  audio, otherwise a wall clock that starts when the first frame is ready.
+- **Clock:** audio-driven when there is audio: frames consumed by the
+  device, minus its buffer latency from cpal's callback timestamps (so
+  deep device buffers do not desync video), with ~20 ms buffers requested.
+  Otherwise a wall clock. Either clock holds after open and seek until the
+  first frame is ready (pre-roll).
 - **Seeking** uses a generation counter: the UI bumps it and resets the
   clock at once; every queued sample and frame is tagged and dropped if
   stale, so a seek never waits on a full queue.
@@ -139,6 +147,18 @@ timestamp.
     at or before the target and back off otherwise.
   - Symphonia 0.6.1's MP4 and Matroska readers cannot seek after reaching
     end of stream; the engine reopens the file.
+  - gpui 0.2.2 pulls in xattr 0.2.3, which does not build on Linux with
+    current libc (the deprecated `ENOATTR` alias was removed);
+    `vendor/xattr` is a patched copy (see its `PATCHED.md`).
+
+## Known open items
+
+- Through PulseAudio's ALSA plugin (as in the Docker test setup) the device
+  pulls no audio for about 2 s after a stream opens; the clock holds, so
+  sync is unaffected, but sound starts late. Not yet checked on a Linux
+  desktop with PipeWire.
+- No hardware video backend on Windows (Media Foundation) or Linux
+  (VA-API): HEVC and VP9 play audio only there.
   - The published `rav1d` 1.1.0 crate omits `src/arm/asm-offsets.h`, so its
     assembly is disabled (pure Rust, still faster than real time at 1080p).
   - `opus-decoder` 0.1.1 was rejected: its multistream framing does not

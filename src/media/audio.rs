@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
+use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedBufferSize};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
 
@@ -30,6 +30,9 @@ pub struct AudioState {
     pub muted: bool,
     /// Most recent peak level per channel, for the level meter.
     pub peak: [f32; 2],
+    /// Frames handed to the device but not yet heard (its buffer latency),
+    /// from the callback's timestamps. The clock subtracts it.
+    pub latency_frames: u64,
 }
 
 pub struct AudioOutput {
@@ -49,9 +52,17 @@ impl AudioOutput {
             .default_output_config()
             .context("querying the default audio output config")?;
         let format = supported.sample_format();
-        let config: StreamConfig = supported.into();
+        let buffer_range = *supported.buffer_size();
+        let mut config: StreamConfig = supported.into();
         let rate = config.sample_rate;
         let channels = config.channels as usize;
+        // Ask for ~20 ms device buffers. Some backends default to seconds
+        // (ALSA through PulseAudio: ~2 s), which delays the start and, if
+        // uncompensated, desyncs video.
+        let small = match buffer_range {
+            SupportedBufferSize::Range { min, max } => Some(BufferSize::Fixed((rate / 50).clamp(min, max))),
+            SupportedBufferSize::Unknown => None,
+        };
 
         let state = Arc::new(Mutex::new(AudioState {
             buf: VecDeque::with_capacity(rate as usize * channels),
@@ -63,15 +74,27 @@ impl AudioOutput {
             volume,
             muted,
             peak: [0.0; 2],
+            latency_frames: 0,
         }));
 
-        let stream = match format {
-            SampleFormat::F32 => build::<f32>(&device, &config, state.clone()),
-            SampleFormat::I16 => build::<i16>(&device, &config, state.clone()),
-            SampleFormat::I32 => build::<i32>(&device, &config, state.clone()),
-            SampleFormat::U16 => build::<u16>(&device, &config, state.clone()),
-            SampleFormat::F64 => build::<f64>(&device, &config, state.clone()),
+        let build_with = |config: &StreamConfig| match format {
+            SampleFormat::F32 => build::<f32>(&device, config, state.clone()),
+            SampleFormat::I16 => build::<i16>(&device, config, state.clone()),
+            SampleFormat::I32 => build::<i32>(&device, config, state.clone()),
+            SampleFormat::U16 => build::<u16>(&device, config, state.clone()),
+            SampleFormat::F64 => build::<f64>(&device, config, state.clone()),
             other => Err(anyhow!("unsupported audio device sample format {other:?}")),
+        };
+        let stream = match small {
+            Some(size) => {
+                let default_size = std::mem::replace(&mut config.buffer_size, size);
+                build_with(&config).or_else(|e| {
+                    log::info!("audio device refused a small buffer ({e:#}); using its default");
+                    config.buffer_size = default_size;
+                    build_with(&config)
+                })
+            }
+            None => build_with(&config),
         }?;
         stream.play().context("starting audio output")?;
 
@@ -89,10 +112,14 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let channels = config.channels as usize;
+    let rate = config.sample_rate as f64;
     let stream = device.build_output_stream(
         *config,
-        move |out: &mut [T], _| {
+        move |out: &mut [T], info: &cpal::OutputCallbackInfo| {
+            let ts = info.timestamp();
+            let latency = ts.playback.duration_since(ts.callback).as_secs_f64();
             let mut st = state.lock().unwrap();
+            st.latency_frames = (latency * rate) as u64;
             let gain = if st.muted { 0.0 } else { st.volume * st.volume };
             let silence = T::from_sample(0.0f32);
             if st.paused || !st.primed {
@@ -150,7 +177,8 @@ impl Clock {
         match self {
             Clock::Audio { state, rate, .. } => {
                 let st = state.lock().unwrap();
-                st.base_secs + st.consumed_frames as f64 / *rate as f64
+                // Frames still in the device buffer have not been heard yet.
+                st.base_secs + st.consumed_frames.saturating_sub(st.latency_frames) as f64 / *rate as f64
             }
             Clock::Wall(w) => {
                 let w = w.lock().unwrap();

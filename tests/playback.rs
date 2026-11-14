@@ -197,10 +197,21 @@ fn audio_only_files_play_to_the_end() {
     for name in ["tagged.mp3", "mono_96k.flac", "stereo.opus", "stereo.ogg", "stereo_22k.wav"] {
         let Some(player) = open(name) else { return };
         assert!(player.info.video.is_none());
+        // Measure speed from when sound starts: how long a device takes to
+        // start pulling audio varies (about 2 s through PulseAudio's ALSA
+        // plugin), and the clock correctly holds until it does.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while player.position() < 0.1 {
+            assert!(Instant::now() < deadline, "{name}: playback never started");
+            thread::sleep(Duration::from_millis(5));
+        }
         let started = Instant::now();
+        let from = player.position();
         play_to_end(&player, Duration::from_secs(6));
-        let elapsed = started.elapsed().as_secs_f64();
-        assert!((1.7..3.5).contains(&elapsed), "{name}: 2 s of audio took {elapsed:.2}s");
+        let (elapsed, played) = (started.elapsed().as_secs_f64(), player.position() - from);
+        assert!((played - (2.0 - from)).abs() < 0.1, "{name}: ended at {:.3}s", player.position());
+        let speed = played / elapsed;
+        assert!((0.9..1.1).contains(&speed), "{name}: played {played:.2}s of audio in {elapsed:.2}s");
     }
 }
 
