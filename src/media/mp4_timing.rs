@@ -148,7 +148,6 @@ fn track_timing(trak: &[u8], movie_timescale: u32) -> Option<(u32, TrackTiming)>
 
     let mut composition = HashMap::new();
     if let Some(ctts) = child(stbl, b"ctts") {
-        let signed = ctts.first()? == &1;
         let stts = child(stbl, b"stts")?;
         // Raw decode time of each sample, from the stts run lengths.
         let mut dts = Vec::new();
@@ -163,8 +162,11 @@ fn track_timing(trak: &[u8], movie_timescale: u32) -> Option<(u32, TrackTiming)>
         let mut sample = 0usize;
         for i in 0..be_u32(ctts, 4)? as usize {
             let count = be_u32(ctts, 8 + i * 8)?;
-            let raw = be_u32(ctts, 12 + i * 8)?;
-            let offset = if signed { raw as i32 as i64 } else { raw as i64 };
+            // Signed whatever the version: the spec makes version 0
+            // unsigned, but QuickTime writes negative offsets there, and
+            // an unsigned offset past 2^31 would mean a frame shown hours
+            // after it is decoded. FFmpeg reads them the same way.
+            let offset = be_u32(ctts, 12 + i * 8)? as i32 as i64;
             for _ in 0..count {
                 if let Some(&d) = dts.get(sample) {
                     composition.insert(d, offset);
@@ -192,6 +194,18 @@ mod tests {
         let video = timing.get(&1).expect("video track timing");
         let pts: Vec<i64> = [0, 512, 1024, 1536, 2048].iter().map(|&r| video.pts(r)).collect();
         assert_eq!(pts, vec![0, 2048, 1024, 512, 1536]);
+    }
+
+    #[test]
+    fn negative_offsets_in_a_version_0_ctts_are_signed() {
+        // QuickTime stores negative composition offsets in version 0 boxes.
+        // ffprobe: PTS 0, 1536, 512, 1024, 3072 for raw decode times 0, 512,
+        // 1024, 1536, 2048. Read as unsigned, B-frames land 2^32 ticks
+        // (about two days) in the future and are never shown.
+        let timing = read(&fixture("ctts_v0_negative.mov"));
+        let video = timing.get(&1).expect("video track timing");
+        let pts: Vec<i64> = [0, 512, 1024, 1536, 2048].iter().map(|&r| video.pts(r)).collect();
+        assert_eq!(pts, vec![0, 1536, 512, 1024, 3072]);
     }
 
     #[test]
