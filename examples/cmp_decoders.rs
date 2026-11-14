@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 
-use media_play::media::video::{make_hardware_decoder, make_software_decoder};
+use airsplice_player::media::video::{make_hardware_decoder, make_software_decoder};
 use symphonia::core::formats::{FormatOptions, TrackType, probe::Hint};
 use symphonia::core::io::MediaSourceStream;
 
@@ -14,7 +14,7 @@ fn decode(path: &str, hw: bool) -> (Vec<i64>, BTreeMap<i64, Vec<u8>>) {
     let t = f.default_track(TrackType::Video).unwrap().clone();
     let p = t.codec_params.as_ref().unwrap().video().unwrap();
     let mut d = if hw { make_hardware_decoder(p).unwrap().unwrap() } else { make_software_decoder(p).unwrap() };
-    let timing = media_play::media::mp4_timing::read(std::path::Path::new(path)).remove(&t.id).unwrap_or_default();
+    let timing = airsplice_player::media::mp4_timing::read(std::path::Path::new(path)).remove(&t.id).unwrap_or_default();
     let (mut order, mut map, mut fed) = (Vec::new(), BTreeMap::new(), Vec::new());
     while let Some(pk) = f.next_packet().unwrap() {
         if pk.track_id != t.id { continue; }

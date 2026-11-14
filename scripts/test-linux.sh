@@ -6,12 +6,12 @@
 # Desktop's default 8 GB VM and the linker gets OOM-killed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-docker build -q -t media-play-linux -f scripts/linux.Dockerfile scripts >/dev/null
+docker build -q -t airsplice-player-linux -f scripts/linux.Dockerfile scripts >/dev/null
 docker run --rm \
   -v "$PWD":/src -w /src \
-  -v media-play-linux-target:/target -e CARGO_TARGET_DIR=/target \
-  -v media-play-linux-cargo:/usr/local/cargo/registry \
+  -v airsplice-player-linux-target:/target -e CARGO_TARGET_DIR=/target \
+  -v airsplice-player-linux-cargo:/usr/local/cargo/registry \
   -e CARGO_PROFILE_DEV_DEBUG=0 -e CARGO_BUILD_JOBS=4 \
-  media-play-linux \
+  airsplice-player-linux \
   bash -c 'pulseaudio --daemonize --exit-idle-time=-1 --load=module-null-sink >/dev/null 2>&1 \
     && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked -- --nocapture'

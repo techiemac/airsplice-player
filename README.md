@@ -1,4 +1,4 @@
-# media-play
+# airsplice-player
 
 A desktop video and music player written in Rust. The interface is built
 with [GPUI](https://crates.io/crates/gpui), the GPU-rendered UI framework
@@ -130,9 +130,9 @@ the Pi itself works but takes close to an hour, so `scripts/pi.sh`
 cross-builds in Docker on another machine and copies the result over SSH:
 
 ```sh
-export PI_HOST=user@raspberrypi      # required
+export PI_HOST=user@raspberrypi      # optional: default pi@raspberrypi
 export PI_KEY=~/.ssh/id_ed25519      # optional: SSH key to use
-export PI_DIR=/home/user/media-play  # optional: install directory on the Pi
+export PI_DIR=/home/user/airsplice-player  # optional: install directory on the Pi
 
 scripts/pi.sh release                # build and copy the release binary
 scripts/pi.sh run [files...]         # build, copy and launch it
@@ -161,14 +161,14 @@ same decoder and may work.
 | Stop | Cmd+. | Ctrl+. |
 
 Files passed on the command line replace the saved playlist. The session is
-stored in `media-play/session.json` under the platform's config directory
+stored in `airsplice-player/session.json` under the platform's config directory
 (`~/Library/Application Support` on macOS, `~/.config` on Linux,
 `%APPDATA%` on Windows).
 
 Environment variables:
 
-- `MEDIA_PLAY_SOFTWARE_VIDEO=1` disables hardware video decoding.
-- `RUST_LOG=media_play=debug` logs why hardware decoding was skipped, decode
+- `AIRSPLICE_PLAYER_SOFTWARE_VIDEO=1` disables hardware video decoding.
+- `RUST_LOG=airsplice_player=debug` logs why hardware decoding was skipped, decode
   errors, and the presented frame rate.
 
 ## Development

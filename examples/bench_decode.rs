@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::time::Instant;
 
-use media_play::media::video::make_decoder;
+use airsplice_player::media::video::make_decoder;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;

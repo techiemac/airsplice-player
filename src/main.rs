@@ -4,9 +4,9 @@ use gpui::{
     App, Application, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*,
     px, size,
 };
-use media_play::ui::app::{self, MediaPlayer, OpenFiles, Quit};
-use media_play::ui::icons::Assets;
-use media_play::ui::session::SessionStore;
+use airsplice_player::ui::app::{self, MediaPlayer, OpenFiles, Quit};
+use airsplice_player::ui::icons::Assets;
+use airsplice_player::ui::session::SessionStore;
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,symphonia_core=error")).init();
@@ -17,7 +17,7 @@ fn main() {
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus(vec![
-            Menu { name: "media-play".into(), items: vec![MenuItem::action("Quit", Quit)] },
+            Menu { name: "airsplice-player".into(), items: vec![MenuItem::action("Quit", Quit)] },
             Menu { name: "File".into(), items: vec![MenuItem::action("Open…", OpenFiles)] },
         ]);
 
@@ -27,14 +27,14 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("media-play".into()),
+                        title: Some("airsplice-player".into()),
                         // macOS draws the traffic lights over our own title bar,
                         // like Zed. Elsewhere the system title bar is kept.
                         appears_transparent: cfg!(target_os = "macos"),
                         traffic_light_position: Some(point(px(12.), px(11.))),
                     }),
                     window_min_size: Some(size(px(720.), px(440.))),
-                    app_id: Some("media-play".into()),
+                    app_id: Some("airsplice-player".into()),
                     focus: true,
                     ..Default::default()
                 },

@@ -23,7 +23,7 @@ use super::theme::{Theme, mono_font};
 use crate::media::{Image, Player, Summary, is_media_file, probe};
 
 actions!(
-    media_play,
+    airsplice_player,
     [
         PlayPause,
         NextTrack,
@@ -200,7 +200,7 @@ pub struct MediaPlayer {
     drag_fraction: f64,
     last_drag_seek: Instant,
     drawn_position: f64,
-    /// Frames shown since `fps_since`, for the `RUST_LOG=media_play=debug`
+    /// Frames shown since `fps_since`, for the `RUST_LOG=airsplice_player=debug`
     /// presentation-rate log.
     fps_count: u32,
     fps_since: Instant,
@@ -473,7 +473,7 @@ impl MediaPlayer {
             Ok(player) => {
                 self.cover = player.info.cover.as_ref().map(image_to_render);
                 self.error = player.info.video_unsupported.clone().map(|why| format!("Playing audio only: {why}"));
-                window.set_window_title(&format!("{} - media-play", player.info.title));
+                window.set_window_title(&format!("{} - airsplice-player", player.info.title));
                 let mut player = player;
                 if !autoplay {
                     player.set_paused(true);
@@ -485,7 +485,7 @@ impl MediaPlayer {
             }
             Err(e) => {
                 self.error = Some(format!("Can't play {}: {e:#}", file_name(&path)));
-                window.set_window_title("media-play");
+                window.set_window_title("airsplice-player");
             }
         }
         cx.notify();
@@ -563,7 +563,7 @@ impl MediaPlayer {
                 self.unload(window);
                 self.current = None;
                 self.error = None;
-                window.set_window_title("media-play");
+                window.set_window_title("airsplice-player");
             }
             Some(c) if c > ix => self.current = Some(c - 1),
             _ => {}
@@ -702,7 +702,7 @@ impl MediaPlayer {
     fn stop(&mut self, _: &Stop, window: &mut Window, cx: &mut Context<Self>) {
         self.unload(window);
         self.error = None;
-        window.set_window_title("media-play");
+        window.set_window_title("airsplice-player");
         cx.notify();
     }
 
@@ -711,7 +711,7 @@ impl MediaPlayer {
         self.playlist.clear();
         self.current = None;
         self.error = None;
-        window.set_window_title("media-play");
+        window.set_window_title("airsplice-player");
         cx.notify();
     }
 
@@ -895,7 +895,7 @@ impl MediaPlayer {
                     .gap(px(6.))
                     .text_sm()
                     .min_w_0()
-                    .child(div().text_color(Theme::text()).font_weight(FontWeight::MEDIUM).child("media-play"))
+                    .child(div().text_color(Theme::text()).font_weight(FontWeight::MEDIUM).child("airsplice-player"))
                     .when_some(title, |el, title| {
                         el.child(icon(Icon::ChevronRight, px(12.), Theme::text_placeholder()))
                             .child(div().text_color(Theme::text_muted()).truncate().child(title))
@@ -1164,7 +1164,7 @@ impl MediaPlayer {
             .flex_col()
             .gap(px(6.))
             .w(px(340.))
-            .child(div().text_2xl().text_color(Theme::text()).mb(px(2.)).child("media-play"))
+            .child(div().text_2xl().text_color(Theme::text()).mb(px(2.)).child("airsplice-player"))
             .child(div().text_sm().text_color(Theme::text_placeholder()).mb(px(16.)).child("Drop audio or video files anywhere in the window."))
             .child(row("Open Files", format!("{cmd}O")))
             .child(row("Command Palette", format!("{shift}{cmd}P")))
@@ -1869,12 +1869,12 @@ mod tests {
     #[gpui::test]
     fn an_unplayable_file_shows_an_error_and_keeps_the_app_usable(cx: &mut gpui::TestAppContext) {
         cx.update(bind_keys);
-        let bogus = std::env::temp_dir().join("media-play-not-media.mp3");
+        let bogus = std::env::temp_dir().join("airsplice-player-not-media.mp3");
         std::fs::write(&bogus, b"this is not audio").unwrap();
         let files = vec![bogus.clone(), fixture("video_only.mp4")];
         let (view, cx) = cx.add_window_view(|window, cx| MediaPlayer::new(files, None, window, cx));
         let error = view.read_with(cx, |v, _| v.error.clone()).expect("error shown");
-        assert!(error.contains("media-play-not-media.mp3"), "{error}");
+        assert!(error.contains("airsplice-player-not-media.mp3"), "{error}");
         cx.simulate_keystrokes("n");
         assert!(view.read_with(cx, |v, _| v.player.is_some() && v.error.is_none()));
         let _ = std::fs::remove_file(bogus);
@@ -1883,7 +1883,7 @@ mod tests {
     #[gpui::test]
     fn the_session_is_restored_paused_where_it_was_left(cx: &mut gpui::TestAppContext) {
         cx.update(bind_keys);
-        let dir = std::env::temp_dir().join(format!("media-play-session-ui-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("airsplice-player-session-ui-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = SessionStore::new(dir.join("session.json"));
         // Video-only files, so this runs without an audio device.

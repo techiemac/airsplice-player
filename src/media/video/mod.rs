@@ -86,7 +86,7 @@ pub fn codec_name(id: VideoCodecId) -> &'static str {
 }
 
 /// Set to force the software decoders (diagnostics, and their tests).
-pub const FORCE_SOFTWARE_ENV: &str = "MEDIA_PLAY_SOFTWARE_VIDEO";
+pub const FORCE_SOFTWARE_ENV: &str = "AIRSPLICE_PLAYER_SOFTWARE_VIDEO";
 
 /// The best available decoder: hardware first, then software.
 pub fn make_decoder(params: &VideoCodecParameters) -> Result<Box<dyn VideoDecoder>> {

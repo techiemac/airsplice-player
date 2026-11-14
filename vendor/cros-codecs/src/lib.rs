@@ -1,4 +1,4 @@
-// media-play: silence upstream lint warnings in this vendored copy.
+// airsplice-player: silence upstream lint warnings in this vendored copy.
 #![allow(warnings)]
 // Copyright 2022 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be

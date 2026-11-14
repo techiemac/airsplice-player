@@ -4083,7 +4083,7 @@ impl Parser {
                 hdr.offset_len_minus1 = r.read_ue_max(31)?;
                 for i in 0..hdr.num_entry_point_offsets as usize {
                     let num_bits = usize::from(hdr.offset_len_minus1 + 1);
-                    // media-play: streams may carry more offsets than the
+                    // airsplice-player: streams may carry more offsets than the
                     // 32 this array holds (one per CTB row with wavefront
                     // parallelism, so 33+ at 4K); read past the extras.
                     let offset = r.read_bits(num_bits)?;

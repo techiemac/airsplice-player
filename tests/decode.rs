@@ -4,8 +4,8 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use media_play::media::mp4_timing;
-use media_play::media::video::{DecodedFrame, VideoDecoder, make_hardware_decoder, make_software_decoder};
+use airsplice_player::media::mp4_timing;
+use airsplice_player::media::video::{DecodedFrame, VideoDecoder, make_hardware_decoder, make_software_decoder};
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;

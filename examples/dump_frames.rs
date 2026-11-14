@@ -5,8 +5,8 @@
 use std::fs::File;
 use std::io::Write;
 
-use media_play::media::mp4_timing;
-use media_play::media::video::make_decoder;
+use airsplice_player::media::mp4_timing;
+use airsplice_player::media::video::make_decoder;
 use symphonia::core::formats::{FormatOptions, TrackType, probe::Hint};
 use symphonia::core::io::MediaSourceStream;
 

@@ -1,4 +1,4 @@
-// media-play: silence libc deprecation warnings in this vendored copy.
+// airsplice-player: silence libc deprecation warnings in this vendored copy.
 #![allow(deprecated)]
 //! A pure-Rust library to manage extended attributes.
 //!

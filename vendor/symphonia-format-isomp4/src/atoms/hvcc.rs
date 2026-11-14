@@ -25,7 +25,7 @@ pub struct HvcCAtom {
 
 impl Atom for HvcCAtom {
     fn read<R: ReadAtom>(it: &mut AtomIterator<R>, header: &AtomHeader) -> Result<Self> {
-        // media-play: raised from 1 KiB; x265 embeds its settings (SEI) here.
+        // airsplice-player: raised from 1 KiB; x265 embeds its settings (SEI) here.
         const MAX_HVCC_ATOM_SIZE: u64 = 64 * 1024;
 
         // The HEVCConfiguration atom payload is a single HEVCDecoderConfigurationRecord. This

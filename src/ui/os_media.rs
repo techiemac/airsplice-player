@@ -34,7 +34,7 @@ pub struct OsMedia {
 impl OsMedia {
     /// `hwnd` is required on Windows and ignored elsewhere.
     pub fn new(hwnd: Option<*mut std::ffi::c_void>) -> Option<Self> {
-        let config = PlatformConfig { display_name: "media-play", dbus_name: "media_play", hwnd };
+        let config = PlatformConfig { display_name: "airsplice-player", dbus_name: "airsplice_player", hwnd };
         let mut controls = MediaControls::new(config).map_err(|e| log::warn!("media controls unavailable: {e:?}")).ok()?;
         let (tx, events) = mpsc::channel();
         controls

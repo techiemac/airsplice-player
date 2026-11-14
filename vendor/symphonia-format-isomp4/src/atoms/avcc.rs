@@ -25,7 +25,7 @@ pub struct AvcCAtom {
 impl Atom for AvcCAtom {
     fn read<R: ReadAtom>(it: &mut AtomIterator<R>, header: &AtomHeader) -> Result<Self> {
         // TODO: Validate.
-        // media-play: raised from 1 KiB to match hvcC.
+        // airsplice-player: raised from 1 KiB to match hvcC.
         const MAX_AVCC_ATOM_SIZE: u64 = 64 * 1024;
 
         // The AVCConfiguration atom payload is a single AVCDecoderConfigurationRecord. This record

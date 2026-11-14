@@ -7,28 +7,28 @@
 #
 # PI_HOST (user@host; default pi@raspberrypi, Raspberry Pi OS's stock
 # account) and PI_KEY (an SSH private key; default: ssh's own) select the Pi.
-# PI_DIR (default /home/<user>/media-play) is where the project lives there.
+# PI_DIR (default /home/<user>/airsplice-player) is where the project lives there.
 # The container mounts the repository at that same path, so paths compiled
 # into the tests (fixtures) are valid on the Pi. Binaries are built on
-# Debian 12 and run on newer Pi OS releases.
+# Debian 13 (glibc 2.41, as on current Raspberry Pi OS).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PI_HOST=${PI_HOST:-pi@raspberrypi}
 if [[ "$PI_HOST" == *@* ]]; then pi_user=${PI_HOST%%@*}; else pi_user=$(whoami); fi
-REMOTE_DIR=${PI_DIR:-/home/$pi_user/media-play}
+REMOTE_DIR=${PI_DIR:-/home/$pi_user/airsplice-player}
 SSH=(ssh -o BatchMode=yes)
 [[ -n "${PI_KEY:-}" ]] && SSH+=(-i "$PI_KEY" -o IdentitiesOnly=yes)
 
 build() {
-  docker build -q -t media-play-linux -f scripts/linux.Dockerfile scripts >/dev/null
+  docker build -q -t airsplice-player-linux -f scripts/linux.Dockerfile scripts >/dev/null
   docker run --rm \
     -v "$PWD":"$REMOTE_DIR" -w "$REMOTE_DIR" \
-    -v media-play-pi-target:/target -e CARGO_TARGET_DIR=/target \
-    -v media-play-linux-cargo:/usr/local/cargo/registry \
+    -v airsplice-player-pi-target:/target -e CARGO_TARGET_DIR=/target \
+    -v airsplice-player-linux-cargo:/usr/local/cargo/registry \
     -v "$PWD/target/pi":/out \
     -e CARGO_PROFILE_DEV_DEBUG=0 -e CARGO_PROFILE_DEV_STRIP=debuginfo \
-    media-play-linux bash -c "$1"
+    airsplice-player-linux bash -c "$1"
 }
 
 sync_sources() {
@@ -66,14 +66,14 @@ case "${1:-}" in
     exit $status
     ;;
   release)
-    build "cargo build --locked --release && cp /target/release/media-play /out/media-play"
+    build "cargo build --locked --release && cp /target/release/airsplice-player /out/airsplice-player"
     "${SSH[@]}" "$PI_HOST" "mkdir -p $REMOTE_DIR/bin"
-    rsync -az -e "${SSH[*]}" target/pi/media-play "$PI_HOST:$REMOTE_DIR/bin/media-play"
-    echo "copied to $PI_HOST:$REMOTE_DIR/bin/media-play"
+    rsync -az -e "${SSH[*]}" target/pi/airsplice-player "$PI_HOST:$REMOTE_DIR/bin/airsplice-player"
+    echo "copied to $PI_HOST:$REMOTE_DIR/bin/airsplice-player"
     ;;
   run)
     shift
-    on_pi "bin/media-play $*"
+    on_pi "bin/airsplice-player $*"
     ;;
   *)
     sed -n '2,12p' "$0"

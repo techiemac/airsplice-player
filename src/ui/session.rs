@@ -62,10 +62,25 @@ impl SessionStore {
         Self { path }
     }
 
-    /// `<config dir>/media-play/session.json` (e.g. `~/Library/Application
+    /// `<config dir>/airsplice-player/session.json` (e.g. `~/Library/Application
     /// Support` on macOS, `~/.config` on Linux, `%APPDATA%` on Windows).
     pub fn default_location() -> Option<Self> {
-        Some(Self::new(dirs::config_dir()?.join("media-play").join("session.json")))
+        Some(Self::in_config_dir(&dirs::config_dir()?))
+    }
+
+    /// The session file under `config`. A session saved under the player's
+    /// former name (`media-play`) is copied over the first time, so renaming
+    /// the app does not lose the user's playlist. The old file is left alone.
+    fn in_config_dir(config: &Path) -> Self {
+        let store = Self::new(config.join("airsplice-player").join("session.json"));
+        let legacy = config.join("media-play").join("session.json");
+        if !store.path.exists() && legacy.is_file() {
+            let copied = store.path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::copy(&legacy, &store.path));
+            if let Err(e) = copied {
+                log::warn!("could not copy session from {}: {e}", legacy.display());
+            }
+        }
+        store
     }
 
     pub fn path(&self) -> &Path {
@@ -101,7 +116,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("media-play-test-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("airsplice-player-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -143,6 +158,30 @@ mod tests {
         let s = Session { playlist: vec![a, b, c], current: Some(1), position: 40.0, ..Default::default() }.without_missing_files();
         assert_eq!((s.current, s.position), (None, 0.0), "the current file itself is gone");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_session_under_the_former_name_is_carried_over_once() {
+        let config = temp_dir("legacy");
+        let legacy = config.join("media-play").join("session.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, br#"{"volume": 0.25}"#).unwrap();
+
+        let store = SessionStore::in_config_dir(&config);
+        assert_eq!(store.path(), config.join("airsplice-player").join("session.json"));
+        assert_eq!(store.load().volume, 0.25, "copied from the old location");
+        assert!(legacy.exists(), "the old file is left in place");
+
+        // Once the new file exists it wins, even if the old one changes.
+        store.save(&Session { volume: 0.5, ..Default::default() }).unwrap();
+        std::fs::write(&legacy, br#"{"volume": 0.75}"#).unwrap();
+        assert_eq!(SessionStore::in_config_dir(&config).load().volume, 0.5);
+
+        // No old session: nothing is created until the first save.
+        let fresh = temp_dir("fresh");
+        assert!(!SessionStore::in_config_dir(&fresh).path().exists());
+        let _ = std::fs::remove_dir_all(config);
+        let _ = std::fs::remove_dir_all(fresh);
     }
 
     #[test]

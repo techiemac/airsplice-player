@@ -6,7 +6,7 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let path = args.next().expect("file");
     let secs: f64 = args.next().map_or(Ok(5.0), |s| s.parse())?;
-    let player = media_play::media::Player::open(std::path::Path::new(&path), 0.0, true)?;
+    let player = airsplice_player::media::Player::open(std::path::Path::new(&path), 0.0, true)?;
     let start = Instant::now();
     let (mut shown, mut max_late, mut prev_pts) = (0usize, 0.0f64, -1.0f64);
     let mut gaps = Vec::new();

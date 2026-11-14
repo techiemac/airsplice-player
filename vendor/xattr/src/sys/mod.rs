@@ -8,7 +8,7 @@ macro_rules! platforms {
             #[cfg(any($(target_os = $platform),*))]
             pub use self::$module::*;
 
-            // media-play: libc removed its deprecated Linux `ENOATTR` alias
+            // airsplice-player: libc removed its deprecated Linux `ENOATTR` alias
             // (it always equalled ENODATA, which libc says to use instead).
             #[cfg(all(any($(target_os = $platform),*), any(target_os = "linux", target_os = "android")))]
             pub const ENOATTR: ::libc::c_int = ::libc::ENODATA;

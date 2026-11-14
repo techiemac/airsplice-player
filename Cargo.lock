@@ -52,6 +52,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "airsplice-player"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "cros-codecs",
+ "dirs 7.0.0",
+ "env_logger",
+ "gpui",
+ "image",
+ "libc",
+ "log",
+ "nix 0.28.0",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-video-toolbox",
+ "openh264",
+ "openh264-sys2",
+ "rav1d",
+ "raw-window-handle",
+ "rayon",
+ "ropus",
+ "rubato",
+ "serde",
+ "serde_json",
+ "souvlaki",
+ "symphonia",
+ "usvg",
+ "v4l2r",
+]
+
+[[package]]
 name = "aligned"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3559,39 +3592,6 @@ checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
  "cfg-if",
  "digest 0.10.7",
-]
-
-[[package]]
-name = "media-play"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cpal",
- "cros-codecs",
- "dirs 7.0.0",
- "env_logger",
- "gpui",
- "image",
- "libc",
- "log",
- "nix 0.28.0",
- "objc2-core-foundation",
- "objc2-core-media",
- "objc2-core-video",
- "objc2-video-toolbox",
- "openh264",
- "openh264-sys2",
- "rav1d",
- "raw-window-handle",
- "rayon",
- "ropus",
- "rubato",
- "serde",
- "serde_json",
- "souvlaki",
- "symphonia",
- "usvg",
- "v4l2r",
 ]
 
 [[package]]
