@@ -89,7 +89,15 @@ cargo run --release -- [files or folders...]
 ```sh
 cargo test               # this machine
 scripts/test-linux.sh    # Linux, in Docker (clippy + full suite)
+scripts/pi.sh test       # build on this machine, run the tests on a Raspberry Pi
 ```
+
+`scripts/pi.sh` compiles in the same Docker image (64-bit ARM Linux) and
+runs on the Pi, so the Pi's decoder hardware, PipeWire and display are
+real. On an M5 Max an edit-compile-copy cycle takes about 25 s; the whole
+suite runs on a Pi 5 in about 35 s. `scripts/pi.sh release` and
+`scripts/pi.sh run [files]` build, copy and launch the release binary.
+Set `PI_HOST` and `PI_KEY` to choose the Pi and SSH key.
 
 The Linux script builds in a Debian container with the CI job's packages
 and plays audio into a PulseAudio null sink, so the audio-clock tests run in
@@ -155,10 +163,13 @@ timestamp.
 
 - Through PulseAudio's ALSA plugin (as in the Docker test setup) the device
   pulls no audio for about 2 s after a stream opens; the clock holds, so
-  sync is unaffected, but sound starts late. Not yet checked on a Linux
-  desktop with PipeWire.
-- No hardware video backend on Windows (Media Foundation) or Linux
-  (VA-API): HEVC and VP9 play audio only there.
+  sync is unaffected, but sound starts late. On a Raspberry Pi 5 desktop
+  with PipeWire the playback tests show no such delay (inferred from their
+  timing, not measured per stream).
+- No hardware video backend on Windows (Media Foundation) or Linux: HEVC
+  and VP9 play audio only there. On Raspberry Pi the hardware is a V4L2
+  stateless HEVC decoder (`rpi-hevc-dec`) with column-tiled output; a
+  backend is planned on cros-codecs' HEVC parser.
   - The published `rav1d` 1.1.0 crate omits `src/arm/asm-offsets.h`, so its
     assembly is disabled (pure Rust, still faster than real time at 1080p).
   - `opus-decoder` 0.1.1 was rejected: its multistream framing does not
