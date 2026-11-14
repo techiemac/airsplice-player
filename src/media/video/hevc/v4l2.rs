@@ -165,6 +165,16 @@ struct CaptureBuffer {
     planes: [Mapping; 2],
     /// The picture it holds, while that picture may still be referenced.
     tag: Option<u64>,
+    /// Decoded but not yet converted: must not be reused even if the
+    /// picture is not a reference.
+    pinned: bool,
+}
+
+/// A picture submitted to the hardware and not yet collected.
+struct InFlight {
+    target: usize,
+    request: RawFd,
+    tag: u64,
 }
 
 struct Device {
@@ -269,7 +279,7 @@ impl Device {
             .map(|mut planes| {
                 let chroma = planes.remove(1);
                 let luma = planes.remove(0);
-                CaptureBuffer { planes: [luma, chroma], tag: None }
+                CaptureBuffer { planes: [luma, chroma], tag: None, pinned: false }
             })
             .collect();
         for _ in 0..OUTPUT_BUFFERS {
@@ -330,8 +340,9 @@ impl Device {
         Ok(buf)
     }
 
-    /// Decode one picture into a free capture buffer; returns its index.
-    fn decode(&mut self, frame: &FrameControls) -> Result<usize> {
+    /// Queue one picture for decoding into a free capture buffer and return
+    /// without waiting; `complete` collects it.
+    fn submit(&mut self, frame: &FrameControls) -> Result<InFlight> {
         // Pictures no longer referenced free their buffers.
         let live: Vec<u64> = frame.live_tags.clone();
         for c in &mut self.capture {
@@ -342,7 +353,7 @@ impl Device {
         let target = self
             .capture
             .iter()
-            .position(|c| c.tag.is_none())
+            .position(|c| c.tag.is_none() && !c.pinned)
             .ok_or_else(|| anyhow!("no free picture buffer (DPB larger than declared)"))?;
         self.queue_capture(target)?;
 
@@ -395,7 +406,15 @@ impl Device {
         unsafe { ioctl::qbuf(self.video.as_raw_fd(), &mut buf) }.context("queueing picture data")?;
         // SAFETY: valid request fd.
         unsafe { ioctl::media_request_queue(request) }.context("submitting the decode request")?;
+        // Reserve the buffer for this picture now so later submissions skip it.
+        self.capture[target].tag = Some(frame.tag);
+        Ok(InFlight { target, request, tag: frame.tag })
+    }
 
+    /// Wait for a submitted picture; returns its capture buffer, pinned until
+    /// `unpin`.
+    fn complete(&mut self, job: InFlight) -> Result<usize> {
+        let InFlight { target, request, tag } = job;
         let mut pfd = libc::pollfd { fd: request, events: libc::POLLPRI, revents: 0 };
         // SAFETY: one valid pollfd.
         let ready = unsafe { libc::poll(&mut pfd, 1, DECODE_TIMEOUT_MS) };
@@ -412,11 +431,16 @@ impl Device {
         if done.flags & b::V4L2_BUF_FLAG_ERROR != 0 {
             bail!("decoder reported an error for this picture");
         }
-        self.capture[target].tag = Some(frame.tag);
+        debug_assert_eq!(self.capture[target].tag, Some(tag));
+        self.capture[target].pinned = true;
         Ok(target)
     }
 
-    fn picture(&self, index: usize) -> Vec<u8> {
+    fn unpin(&mut self, index: usize) {
+        self.capture[index].pinned = false;
+    }
+
+    fn picture(&self, index: usize, scale: usize) -> (Vec<u8>, usize, usize) {
         let c = &self.capture[index];
         // One sequential copy out of the (typically uncached) mapping; the
         // scattered reads of de-tiling then hit cached memory.
@@ -432,12 +456,13 @@ impl Device {
             column_height: self.column_height,
             ten_bit: self.ten_bit,
         }
-        .to_bgra()
+        .to_bgra_scaled(scale)
     }
 
     fn release_all(&mut self) {
         for c in &mut self.capture {
             c.tag = None;
+            c.pinned = false;
         }
     }
 }
@@ -465,6 +490,7 @@ enum Command {
     Decode { data: Vec<u8>, pts: i64 },
     Flush,
     Reset { discard_before: i64 },
+    Limit(Option<(u32, u32)>),
 }
 
 /// Runs on the worker thread.
@@ -475,6 +501,11 @@ struct Worker {
     /// Display order: the reorder depth comes from the SPS.
     reorder: Reorder,
     discard_before: i64,
+    /// Largest useful output size; frames are downscaled towards it.
+    limit: Option<(u32, u32)>,
+    /// The picture the hardware is decoding while the CPU converts the one
+    /// before it, with its pts and size.
+    in_flight: Option<(InFlight, i64, u32, u32)>,
 }
 
 impl Worker {
@@ -485,7 +516,7 @@ impl Worker {
         let parsed = match parsed {
             Ok(result) => result,
             Err(_) => {
-                self.frames.reset();
+                self.abandon();
                 bail!("HEVC parser failed on this picture; resuming at the next keyframe");
             }
         };
@@ -493,34 +524,96 @@ impl Worker {
         let reconfigure = self.device.as_ref().is_none_or(|d| {
             (d.width, d.height, d.ten_bit) != (frame.width, frame.height, frame.bit_depth > 8)
         });
-        if reconfigure {
-            self.device = None; // close the old one first
-            self.device = Some(Device::open(&self.nodes, &frame)?);
-        }
-        let dev = self.device.as_mut().expect("opened above");
-        let index = match dev.decode(&frame) {
-            Ok(i) => i,
+        // Pipelining: collect the previous picture, start this one on the
+        // hardware, then convert the previous one while it decodes.
+        let previous = match self.collect() {
+            Ok(p) => p,
             Err(e) => {
-                // Buffers may be stuck in the driver and the DPB no longer
-                // matches it: start over from the next IRAP picture.
-                self.device = None;
-                self.frames.reset();
+                self.abandon();
                 return Err(e);
             }
         };
-        if pts < self.discard_before {
-            return Ok(self.reorder.push([]));
+        if reconfigure {
+            // A previous picture from the old configuration is converted first.
+            let mut out = self.convert(previous);
+            self.device = None; // close the old one first
+            self.device = Some(Device::open(&self.nodes, &frame)?);
+            self.start(&frame, pts)?;
+            out.extend(self.reorder.push([]));
+            return Ok(out);
         }
-        let bgra = dev.picture(index);
-        Ok(self.reorder.push([DecodedFrame { pts, width: frame.width, height: frame.height, bgra }]))
+        self.start(&frame, pts)?;
+        Ok(self.convert(previous))
+    }
+
+    /// Wait for the in-flight picture, if any; returns it pinned.
+    fn collect(&mut self) -> Result<Option<(usize, i64, u32, u32)>> {
+        let Some((job, pts, w, h)) = self.in_flight.take() else { return Ok(None) };
+        let dev = self.device.as_mut().expect("a picture in flight has a device");
+        Ok(Some((dev.complete(job)?, pts, w, h)))
+    }
+
+    fn start(&mut self, frame: &FrameControls, pts: i64) -> Result<()> {
+        let dev = self.device.as_mut().expect("device open");
+        match dev.submit(frame) {
+            Ok(job) => {
+                self.in_flight = Some((job, pts, frame.width, frame.height));
+                Ok(())
+            }
+            Err(e) => {
+                self.abandon();
+                Err(e)
+            }
+        }
+    }
+
+    /// Convert a collected picture (unless before the seek target) and
+    /// release its buffer for reuse.
+    fn convert(&mut self, picture: Option<(usize, i64, u32, u32)>) -> Vec<DecodedFrame> {
+        let Some((index, pts, w, h)) = picture else { return self.reorder.push([]) };
+        let dev = self.device.as_mut().expect("device open");
+        let frame = (pts >= self.discard_before).then(|| {
+            let scale = super::col128::scale_for(w, h, self.limit);
+            let (bgra, width, height) = dev.picture(index, scale);
+            DecodedFrame { pts, width: width as u32, height: height as u32, bgra }
+        });
+        dev.unpin(index);
+        self.reorder.push(frame)
+    }
+
+    /// Drop the device and DPB after an error: buffers may be stuck in the
+    /// driver and references no longer match. Resume at the next IRAP.
+    fn abandon(&mut self) {
+        self.in_flight = None;
+        self.device = None;
+        self.frames.reset();
     }
 
     fn run(mut self, commands: Receiver<Command>, results: Sender<Result<Vec<DecodedFrame>>>) {
         while let Ok(cmd) = commands.recv() {
             let result = match cmd {
                 Command::Decode { data, pts } => self.decode(&data, pts),
-                Command::Flush => Ok(self.reorder.drain()),
+                Command::Flush => match self.collect() {
+                    Ok(previous) => {
+                        let mut out = self.convert(previous);
+                        out.extend(self.reorder.drain());
+                        Ok(out)
+                    }
+                    Err(e) => {
+                        self.abandon();
+                        Err(e)
+                    }
+                },
+                Command::Limit(limit) => {
+                    self.limit = limit;
+                    Ok(Vec::new())
+                }
                 Command::Reset { discard_before } => {
+                    // Collect (and discard) the picture in flight so the
+                    // driver's queues stay consistent.
+                    if self.collect().is_err() {
+                        self.abandon();
+                    }
                     self.frames.reset();
                     self.reorder.drain();
                     self.discard_before = discard_before;
@@ -555,7 +648,15 @@ impl V4l2HevcDecoder {
             match HevcFrames::new(&hvcc, nal_length_size) {
                 Ok(frames) => {
                     let _ = ready_tx.send(Ok(()));
-                    Worker { nodes, frames, device: None, reorder: Reorder::new(reorder_depth), discard_before: i64::MIN }
+                    Worker {
+                        nodes,
+                        frames,
+                        device: None,
+                        reorder: Reorder::new(reorder_depth),
+                        discard_before: i64::MIN,
+                        limit: None,
+                        in_flight: None,
+                    }
                         .run(cmd_rx, res_tx);
                 }
                 Err(e) => drop(ready_tx.send(Err(e))),
@@ -590,6 +691,12 @@ impl VideoDecoder for V4l2HevcDecoder {
 
     fn reset(&mut self, discard_before: i64) -> Result<()> {
         self.call(Command::Reset { discard_before }).map(drop)
+    }
+
+    fn set_output_limit(&mut self, limit: Option<(u32, u32)>) {
+        if let Err(e) = self.call(Command::Limit(limit)) {
+            log::warn!("HEVC decoder: {e:#}");
+        }
     }
 }
 

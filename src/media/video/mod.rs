@@ -41,6 +41,10 @@ pub trait VideoDecoder: Send {
     /// dropped, and frames before `discard_before` are decoded (they are
     /// references) but not colour-converted or returned.
     fn reset(&mut self, discard_before: i64) -> Result<()>;
+    /// The largest size frames can be shown at (physical pixels). Decoders
+    /// that convert colour on the CPU may return smaller frames down to this
+    /// size; others ignore it.
+    fn set_output_limit(&mut self, _limit: Option<(u32, u32)>) {}
 }
 
 /// Puts frames from a decoder that emits decode order into display order.

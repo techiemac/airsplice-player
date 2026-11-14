@@ -105,6 +105,8 @@ struct Shared {
     video_done: AtomicU64,
     error: Mutex<Option<String>>,
     stop: AtomicBool,
+    /// Largest size video can be shown at, `width << 32 | height`; 0 = unknown.
+    output_limit: AtomicU64,
 }
 
 impl Shared {
@@ -303,6 +305,7 @@ impl Player {
             video_done: AtomicU64::new(NO_GENERATION),
             error: Mutex::new(None),
             stop: AtomicBool::new(false),
+            output_limit: AtomicU64::new(0),
         });
 
         let mut audio_out = None;
@@ -433,6 +436,11 @@ impl Player {
             st.volume = volume;
             st.muted = muted;
         }
+    }
+
+    /// Tell the decoder the largest size video can currently be shown at.
+    pub fn set_output_limit(&self, width: u32, height: u32) {
+        self.shared.output_limit.store((width as u64) << 32 | height as u64, Ordering::Relaxed);
     }
 
     pub fn levels(&self) -> [f32; 2] {
@@ -843,6 +851,7 @@ fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time
             q.insert(at, VideoFrame { pts, generation, width: f.width, height: f.height, bgra: f.bgra });
         }
     };
+    let mut applied_limit = 0u64;
     while let Ok(msg) = rx.recv() {
         if shared.stopped() {
             return;
@@ -851,6 +860,11 @@ fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time
             VideoMsg::Packet { generation, pts, data } => {
                 if generation != shared.current() {
                     continue;
+                }
+                let packed = shared.output_limit.load(Ordering::Relaxed);
+                if packed != applied_limit {
+                    applied_limit = packed;
+                    decoder.set_output_limit((packed != 0).then_some(((packed >> 32) as u32, packed as u32)));
                 }
                 match decoder.decode(&data, pts) {
                     Ok(frames) => push(frames, generation),

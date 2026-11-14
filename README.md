@@ -52,11 +52,15 @@ uses, so software H.264 stays single-threaded.
 
 | Stream | Decoder | Presented |
 |---|---|---|
-| 1080p60 HEVC | V4L2 hardware | 60 fps (decode path 2.1x real time) |
-| 4K30 HEVC 10-bit | V4L2 hardware | ~18 fps (see open items) |
+| 1080p60 HEVC | V4L2 hardware | 60 fps |
+| 4K30 HEVC 10-bit | V4L2 hardware | 30 fps (shown at up to 1080p) |
 
-The hardware decodes 4K in ~9 ms; the limit is converting the Pi's tiled
-YUV to BGRA on the CPU and uploading 33 MB per frame through GPUI.
+The hardware decodes 4K in ~9 ms; the cost is converting the Pi's tiled YUV
+to BGRA on the CPU and uploading it through GPUI. So frames are converted
+at the size they can be shown: when the window is at most half the video's
+size, a 2x2 (or 4x4) box filter is applied during conversion, never below
+the window's size. Hardware decoding of the next frame overlaps conversion
+of the current one.
 
 ## Interface
 
@@ -187,9 +191,9 @@ timestamp.
   sync is unaffected, but sound starts late. On a Raspberry Pi 5 desktop
   with PipeWire the playback tests show no such delay (inferred from their
   timing, not measured per stream).
-- 4K HEVC on a Raspberry Pi 5 presents ~18 fps, not 30: CPU colour
-  conversion and the GPUI upload of full-size BGRA are the limit, not the
-  decoder.
+- On a Raspberry Pi 5, 4K HEVC in a window larger than 1920x1080 (or full
+  screen on a 4K display) is converted at full size and presents ~18 fps:
+  full-resolution CPU conversion and GPUI upload are the limit there.
 - No hardware video backend on Windows (Media Foundation), for H.264 on
   Raspberry Pi 4 (stateful V4L2), or VA-API desktops: HEVC and VP9 play
   audio only there.

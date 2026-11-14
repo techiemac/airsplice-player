@@ -1,5 +1,6 @@
 //! Measures video decode + colour conversion throughput:
 //! `cargo run --release --example bench_decode -- <file>...`
+//! Set `OUTPUT_LIMIT=1920x1080` to decode as if shown at that size.
 use std::fs::File;
 use std::time::Instant;
 
@@ -17,6 +18,12 @@ fn main() -> anyhow::Result<()> {
         let params = track.codec_params.as_ref().unwrap().video().unwrap();
         let (w, h) = (params.width.unwrap_or(0), params.height.unwrap_or(0));
         let mut dec = make_decoder(params)?;
+        if let Some((w, h)) = std::env::var("OUTPUT_LIMIT").ok().and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        }) {
+            dec.set_output_limit(Some((w, h)));
+        }
         let tb = track.time_base.unwrap();
         let (mut frames, mut first, mut last) = (0usize, None, 0.0f64);
         let start = Instant::now();

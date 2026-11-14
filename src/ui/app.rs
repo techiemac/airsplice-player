@@ -405,6 +405,11 @@ impl MediaPlayer {
         self.save_session(false);
         self.sync_os_media(window, cx);
         let Some(player) = &self.player else { return };
+        // Video is never shown larger than the window: decoders that convert
+        // on the CPU can skip pixels nobody would see.
+        let size = window.viewport_size();
+        let scale = window.scale_factor();
+        player.set_output_limit((f32::from(size.width) * scale) as u32, (f32::from(size.height) * scale) as u32);
         let mut changed = false;
         if let Some(frame) = player.take_frame() {
             let image = to_render_image(frame.width, frame.height, frame.bgra);
