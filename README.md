@@ -1,217 +1,221 @@
 # media-play
 
-A cross-platform media player with a Zed-style interface, built on
-[GPUI](https://crates.io/crates/gpui) (Zed's own UI framework) and Rust
-decoders. No ffmpeg.
+A desktop video and music player written in Rust. The interface is built
+with [GPUI](https://crates.io/crates/gpui), the GPU-rendered UI framework
+behind the Zed editor, and uses Zed's One Dark look. Decoding uses Rust
+libraries and the operating system's hardware decoders; there is no
+FFmpeg, GStreamer or libVLC underneath.
 
-## What's inside
+It plays local files only. The player has no network code paths: no
+streaming URLs, no metadata lookups, no update checks, no telemetry.
 
-| Layer | Crate | Language |
+**Status:** early (0.1). Developed and tested on macOS and Linux, including
+the Raspberry Pi 5. The Windows build has not been tested yet.
+
+## Features
+
+- Playlist with tag titles, durations and total length; drop files or
+  folders anywhere in the window
+- Command palette and fuzzy file finder, keyboard-first controls
+- Hardware media keys and the system Now Playing view (macOS Control
+  Center, Windows media overlay, Linux MPRIS)
+- Session restore: playlist, track, position, volume, repeat mode and panel
+  layout come back (paused) on the next launch
+- Hardware video decoding on macOS and Raspberry Pi
+- Surround Opus; AAC encoder delay trimmed using MP4 edit lists
+- Seeks land on the requested time, decoding forward from the previous
+  keyframe
+
+## Format support
+
+**Containers:** MP4/MOV, Matroska/WebM, Ogg, WAV, AIFF, CAF, MP3, FLAC.
+
+**Audio:** AAC, MP3, FLAC, Opus (up to 7.1), Vorbis, ALAC, PCM, ADPCM, on
+every platform.
+
+**Video:**
+
+| Codec | macOS | Raspberry Pi 5 | Other Linux, Windows |
+|---|---|---|---|
+| H.264 | hardware | software | software |
+| HEVC 8/10-bit | hardware | hardware | not supported |
+| AV1 8/10-bit | hardware on M3 and later, otherwise software | software | software |
+| VP9 | hardware | not supported | not supported |
+| VP8 | not supported | not supported | not supported |
+
+When a file's video codec is not supported, its audio still plays and the
+player says why. The info panel (Cmd/Ctrl+R) shows which decoder is in use.
+
+Software decoders: [rav1d](https://github.com/memorysafety/rav1d) for AV1
+and Cisco's [OpenH264](https://github.com/cisco/openh264) for H.264
+(compiled from bundled source; it is the one C++ component, since there is
+no production-ready Rust H.264 decoder). Encrypted (DRM) content is not
+supported.
+
+### Performance
+
+Apple M5 Max, release build, decode and colour conversion, multiples of
+real time:
+
+| Stream | Hardware | Software |
 |---|---|---|
-| UI | `gpui` (GPU-rendered: Metal, DirectX, Vulkan) | Rust |
-| Demux: MP4/MOV, MKV/WebM, Ogg, WAV, AIFF, CAF, MP3, FLAC | `symphonia` | Rust |
-| Audio: AAC, MP3, FLAC, Vorbis, ALAC, PCM, ADPCM | `symphonia` | Rust |
-| Audio: Opus (incl. 5.1/7.1) | `ropus` (bit-exact port of libopus) | Rust |
-| Video, macOS: H.264, HEVC (8/10 bit), VP9, AV1 | VideoToolbox hardware decoding, via `objc2` bindings | OS |
-| Video, Linux: HEVC (8/10 bit) on stateless V4L2 decoders (Raspberry Pi 4/5) | own V4L2 request-API backend; `cros-codecs` HEVC parser, `v4l2r` kernel bindings | Rust |
-| Video, software: AV1 (8 and 10 bit) | `rav1d` (port of dav1d) | Rust |
-| Video, software: H.264 | `openh264` (Cisco, BSD, built from bundled source) | C++ |
-| Audio output | `cpal` (CoreAudio, WASAPI, ALSA/PulseAudio/PipeWire) | Rust |
-| Media keys, Now Playing | `souvlaki` (zbus on Linux) | Rust |
-| Resampling | `rubato` | Rust |
+| 4K30 H.264 | 5.9x | 1.1x |
+| 4K30 HEVC 10-bit | 7.1x | |
+| 1080p60 H.264 | 7.7x | 2.3x |
+| 1080p30 AV1 | | 7.3x |
 
-The OS hardware decoder is used where there is one; otherwise H.264 and AV1
-fall back to software (OpenH264 is the one non-Rust decoder: there is no
-production-quality pure-Rust H.264 decoder yet). `MEDIA_PLAY_SOFTWARE_VIDEO=1`
-forces software. The info panel shows which decoder is running.
+Raspberry Pi 5, frames shown on screen by the app:
 
-**HEVC and VP9** need a hardware decoder: macOS has one (VP9 and AV1 on
-recent Apple silicon), and HEVC works on Linux boards with a stateless
-V4L2 HEVC decoder such as the Raspberry Pi 4 and 5. Elsewhere (Windows,
-other Linux machines) files with those tracks play their audio and say why.
+| Stream | Result |
+|---|---|
+| 1080p60 HEVC | 60 fps |
+| 4K30 HEVC 10-bit, window up to 1920x1080 | 30 fps |
+| 4K30 HEVC 10-bit, full screen on a 4K display | about 18 fps |
 
-The Raspberry Pi backend (`src/media/video/hevc/`) derives picture order
-counts, reference picture sets and reference lists itself (H.265 8.3),
-drives the kernel's request API, and de-tiles the Pi's column-128 output.
-Its output is bit-identical to ffmpeg's software HEVC decoder on the test
-streams; a golden-checksum test holds it there.
+## Building
 
-**Performance** (M5 Max, release build, decode plus BGRA conversion):
-
-| Stream | VideoToolbox | Software |
-|---|---|---|
-| 4K30 H.264 | 5.9x real time | 1.1x (OpenH264) |
-| 4K30 HEVC 10-bit | 7.1x | n/a |
-| 1080p60 H.264 | 7.7x | 2.3x (OpenH264) |
-| 1080p30 AV1 | hardware on M3+ | 7.3x (rav1d) |
-
-OpenH264's threaded mode deadlocks with the low-latency API this player
-uses, so software H.264 stays single-threaded.
-
-**Raspberry Pi 5**, frames presented by the app on the Pi's display:
-
-| Stream | Decoder | Presented |
-|---|---|---|
-| 1080p60 HEVC | V4L2 hardware | 60 fps |
-| 4K30 HEVC 10-bit | V4L2 hardware | 30 fps (shown at up to 1080p) |
-
-The hardware decodes 4K in ~9 ms; the cost is converting the Pi's tiled YUV
-to BGRA on the CPU and uploading it through GPUI. So frames are converted
-at the size they can be shown: when the window is at most half the video's
-size, a 2x2 (or 4x4) box filter is applied during conversion, never below
-the window's size. Hardware decoding of the next frame overlaps conversion
-of the current one.
-
-## Interface
-
-Zed's One Dark theme and layout: title bar, playlist dock (left), the
-video or now-playing view with a tab bar, info dock (right), status bar,
-command palette and file finder. Drop files or folders anywhere.
-
-- The playlist shows tag titles and durations (read in the background) and
-  the total length; the file finder matches titles and file names.
-- Hardware media keys and the system "Now Playing" view work on all three
-  platforms (macOS Control Center, Windows media overlay, Linux MPRIS),
-  via `souvlaki`.
-- The session (playlist, track, position, volume, repeat, docks) is saved
-  to `<config dir>/media-play/session.json` and restored paused on the next
-  launch. Files given on the command line replace the saved playlist.
-
-| Action | macOS | Linux / Windows |
-|---|---|---|
-| Play / pause | Space or K | Space or K |
-| Seek -5 s / +5 s | Left / Right (J / L) | Left / Right (J / L) |
-| Volume | Up / Down, scroll on slider | Up / Down, scroll on slider |
-| Mute | M | M |
-| Previous / next track | P / N, Cmd+Left / Cmd+Right | P / N, Ctrl+Left / Ctrl+Right |
-| Repeat off / all / one | R | R |
-| Full screen (video only view) | F, double-click video | F, double-click video |
-| Open files | Cmd+O | Ctrl+O |
-| Command palette | Cmd+Shift+P | Ctrl+Shift+P |
-| Find in playlist | Cmd+P | Ctrl+P |
-| Toggle playlist / info dock | Cmd+B / Cmd+R | Ctrl+B / Ctrl+R |
-| Stop | Cmd+. | Ctrl+. |
-
-## Build and run
+Developed with Rust 1.92 (older versions are untested).
 
 ```sh
 cargo run --release -- [files or folders...]
 ```
 
-- **macOS:** Xcode command line tools. GPUI's shaders compile at launch, so
-  the separate Metal Toolchain download is not needed.
-- **Linux:** `libasound2-dev libfontconfig-dev libfreetype-dev
-  libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libxcb1-dev
-  libvulkan-dev` (Debian/Ubuntu names) and a C++ compiler.
-- **Windows:** MSVC build tools (C++ workload).
+- **macOS:** Xcode command line tools. The separate Metal Toolchain is not
+  needed (shaders compile at launch).
+- **Linux:** a C++ compiler, libclang, and the development packages for
+  ALSA, fontconfig, freetype, Wayland, X11/xcb, xkbcommon and Vulkan. On
+  Debian and Ubuntu:
 
-## Tests
+  ```sh
+  sudo apt install build-essential libclang-dev libasound2-dev \
+    libfontconfig-dev libfreetype-dev libwayland-dev libx11-xcb-dev \
+    libxkbcommon-x11-dev libxcb1-dev libvulkan-dev
+  ```
+
+- **Windows:** Visual Studio Build Tools with the C++ workload.
+
+### Raspberry Pi
+
+The Pi 5 runs the player on Raspberry Pi OS (64-bit, desktop). Building on
+the Pi itself works but takes close to an hour, so `scripts/pi.sh`
+cross-builds in Docker on another machine and copies the result over SSH:
 
 ```sh
-cargo test               # this machine
-scripts/test-linux.sh    # Linux, in Docker (clippy + full suite)
-scripts/pi.sh test       # build on this machine, run the tests on a Raspberry Pi
+export PI_HOST=user@raspberrypi      # required
+export PI_KEY=~/.ssh/id_ed25519      # optional: SSH key to use
+export PI_DIR=/home/user/media-play  # optional: install directory on the Pi
+
+scripts/pi.sh release                # build and copy the release binary
+scripts/pi.sh run [files...]         # build, copy and launch it
+scripts/pi.sh test [filter]          # run the test suite on the Pi
 ```
 
-`scripts/pi.sh` compiles in the same Docker image (64-bit ARM Linux) and
-runs on the Pi, so the Pi's decoder hardware, PipeWire and display are
-real. On an M5 Max an edit-compile-copy cycle takes about 25 s; the whole
-suite runs on a Pi 5 in about 35 s. `scripts/pi.sh release` and
-`scripts/pi.sh run [files]` build, copy and launch the release binary.
-Set `PI_HOST` (`user@host`), `PI_KEY` (SSH key) and optionally `PI_DIR` to
-choose the Pi; nothing about a particular machine is stored in the repo.
+Hardware HEVC uses the Pi's stateless V4L2 decoder (`rpi-hevc-dec`) through
+the kernel's request API. Only the Pi 5 has been tested; the Pi 4 has the
+same decoder and may work.
 
-The Linux script builds in a Debian 13 container with the CI job's packages
-and plays audio into a PulseAudio null sink, so the audio-clock tests run in
-real time.
+## Usage
 
-- Unit tests: YUV conversion, avcC/Annex B, H.264 and AV1 keyframe parsing,
-  OpusHead and surround channel order, resampling and downmix, fuzzy match.
-- `tests/decode.rs`: every video codec on every available backend against
-  fixtures with known content (1 s red, 1 s green, 1 s blue): frame count,
-  timestamps, pixel colour; and B-frame streams must come out in display
-  order.
-- `tests/playback.rs`: the full engine: A/V sync on the audio and wall
-  clocks, pause, seeks while paused, seeking back after the end in every
-  container, unsupported-codec fallback. Tests that need an audio device
-  skip (and say so) when there is none.
-- UI tests drive the real view through the real keymap on GPUI's test
-  platform.
+| Action | macOS | Linux / Windows |
+|---|---|---|
+| Play / pause | Space or K | Space or K |
+| Seek back / forward 5 s | Left / Right, or J / L | Left / Right, or J / L |
+| Volume | Up / Down, or scroll on the slider | Up / Down, or scroll on the slider |
+| Mute | M | M |
+| Previous / next track | P / N, Cmd+Left / Cmd+Right | P / N, Ctrl+Left / Ctrl+Right |
+| Repeat off / all / one | R | R |
+| Full screen | F, or double-click the video | F, or double-click the video |
+| Open files | Cmd+O | Ctrl+O |
+| Command palette | Cmd+Shift+P | Ctrl+Shift+P |
+| Find in playlist | Cmd+P | Ctrl+P |
+| Toggle playlist / info panel | Cmd+B / Cmd+R | Ctrl+B / Ctrl+R |
+| Stop | Cmd+. | Ctrl+. |
 
-Fixtures are in `tests/fixtures` (484 KB); `generate.sh` documents how they
-were made.
+Files passed on the command line replace the saved playlist. The session is
+stored in `media-play/session.json` under the platform's config directory
+(`~/Library/Application Support` on macOS, `~/.config` on Linux,
+`%APPDATA%` on Windows).
 
-`examples/bench_decode.rs` and `examples/bench_playback.rs` measure decode
-throughput and real-time frame delivery for any file; `cmp_decoders.rs`
-checks the software and hardware decoders produce the same picture at each
-timestamp.
+Environment variables:
 
-## Engine notes
+- `MEDIA_PLAY_SOFTWARE_VIDEO=1` disables hardware video decoding.
+- `RUST_LOG=media_play=debug` logs why hardware decoding was skipped, decode
+  errors, and the presented frame rate.
 
-- **Clock:** audio-driven when there is audio: frames consumed by the
-  device, minus its buffer latency from cpal's callback timestamps (so
-  deep device buffers do not desync video), with ~20 ms buffers requested.
-  Otherwise a wall clock. Either clock holds after open and seek until the
-  first frame is ready (pre-roll).
-- **Seeking** uses a generation counter: the UI bumps it and resets the
-  clock at once; every queued sample and frame is tagged and dropped if
-  stale, so a seek never waits on a full queue.
-- **Keyframes:** seeks land on a decodable frame regardless of container
-  support, by backing off 1 s, 2 s, 4 s until the first video packet is a
-  keyframe. Pre-roll frames are decoded but not colour-converted.
-- **Display order:** decoders that emit decode order (OpenH264's
-  low-latency API, VideoToolbox) feed a reorder buffer sized from the
-  stream's SPS (`max_num_reorder_frames`, `sps_max_num_reorder_pics`), which
-  is exact for conforming streams. As a last line of defence the frame
-  picker never shows a frame older than the one on screen.
-- **Workarounds for upstream issues** (worth reporting upstream):
-  - Symphonia 0.6.1's MP4 reader ignores composition offsets (`ctts`) and
-    edit lists (`elst`): `pts` is really the decode time, which put B-frame
-    video in decode order and left AAC priming untrimmed.
-    `src/media/mp4_timing.rs` reads those boxes and corrects timestamps.
-  - Symphonia's MP4 reader rejects `avcC`/`hvcC` records over 1 KiB, which
-    rules out most x265 files; `vendor/symphonia-format-isomp4` is a patched
-    copy (see its `PATCHED.md`).
-  - Symphonia's Matroska reader can seek to the cue point after the target,
-    and its MP4 reader lands mid-GOP; seeks verify they landed on a keyframe
-    at or before the target and back off otherwise.
-  - Symphonia 0.6.1's MP4 and Matroska readers cannot seek after reaching
-    end of stream; the engine reopens the file.
-  - cros-codecs 0.0.6's HEVC slice parser panics on more than 32 entry
-    point offsets (every 4K wavefront stream); `vendor/cros-codecs` reads
-    past them (see its `PATCHED.md`).
-  - gpui 0.2.2 pulls in xattr 0.2.3, which does not build on Linux with
-    current libc (the deprecated `ENOATTR` alias was removed);
-    `vendor/xattr` is a patched copy (see its `PATCHED.md`).
+## Development
 
-## Known open items
+```sh
+cargo test                  # tests on this machine
+cargo clippy --all-targets  # lints
+scripts/test-linux.sh       # clippy and tests on Linux, in Docker
+scripts/pi.sh test          # tests on a Raspberry Pi (see above)
+```
 
-- Through PulseAudio's ALSA plugin (as in the Docker test setup) the device
-  pulls no audio for about 2 s after a stream opens; the clock holds, so
-  sync is unaffected, but sound starts late. On a Raspberry Pi 5 desktop
-  with PipeWire the playback tests show no such delay (inferred from their
-  timing, not measured per stream).
-- On a Raspberry Pi 5, 4K HEVC in a window larger than 1920x1080 (or full
-  screen on a 4K display) is converted at full size and presents ~18 fps:
-  full-resolution CPU conversion and GPUI upload are the limit there.
-- No hardware video backend on Windows (Media Foundation), for H.264 on
-  Raspberry Pi 4 (stateful V4L2), or VA-API desktops: HEVC and VP9 play
-  audio only there.
-  - The published `rav1d` 1.1.0 crate omits `src/arm/asm-offsets.h`, so its
-    assembly is disabled (pure Rust, still faster than real time at 1080p).
-  - `opus-decoder` 0.1.1 was rejected: its multistream framing does not
-    follow RFC 6716 Appendix B, and a `u8` shift in its CELT collapse mask
-    overflows on real hybrid stereo frames.
+The tests decode small fixtures with known content through every backend
+available on the machine, check timestamps and display order, run the full
+playback engine against real audio devices (A/V sync, pause, seeking in
+every container), and drive the UI through its real key bindings on GPUI's
+test platform. Tests that need an audio device or a hardware decoder skip,
+with a message, when there is none. Fixtures live in `tests/fixtures`;
+`generate.sh` there recreates them.
+
+`examples/` has tools for working on decoders: `bench_decode` and
+`bench_playback` measure throughput and real-time delivery for any file,
+`cmp_decoders` compares software and hardware output frame by frame, and
+`dump_frames` writes raw decoded frames to a file for comparing decoders
+across machines.
+
+### Layout
+
+| Path | Contents |
+|---|---|
+| `src/ui/` | GPUI views, theme, key bindings, session store, OS media controls |
+| `src/media/player.rs` | playback engine: demux, decode and audio threads, clock, seeking |
+| `src/media/audio.rs` | audio output, resampling, the playback clock |
+| `src/media/video/` | video decoder trait, reorder buffer, colour conversion, backends |
+| `src/media/video/hevc/` | Raspberry Pi V4L2 HEVC decoder |
+| `src/media/mp4_timing.rs` | MP4 composition offsets and edit lists |
+| `vendor/` | patched copies of upstream crates (each has a `PATCHED.md`) |
+
+### Upstream issues worked around
+
+These are worth fixing upstream; each workaround can go once they are.
+
+- Symphonia 0.6.1's MP4 reader ignores composition offsets and edit lists,
+  so its timestamps are decode times. `src/media/mp4_timing.rs` corrects
+  them.
+- Symphonia's MP4 reader rejects `avcC`/`hvcC` records over 1 KiB, which
+  excludes most x265 output. Patched in `vendor/symphonia-format-isomp4`.
+- Symphonia's MP4 and Matroska readers can seek past the target or into the
+  middle of a GOP, and cannot seek after reaching the end. The engine
+  verifies each seek lands on an earlier keyframe and reopens the file after
+  end of stream.
+- cros-codecs 0.0.6 panics on HEVC slices with more than 32 entry points
+  (common in 4K). Patched in `vendor/cros-codecs`.
+- xattr 0.2.3 (via GPUI) does not build against current libc on Linux.
+  Patched in `vendor/xattr`.
+- The published rav1d 1.1.0 crate is missing a header its ARM assembly
+  needs, so it is built without assembly.
+- OpenH264 deadlocks in threaded mode with the low-latency API, so software
+  H.264 decodes on one thread.
+
+## Known limitations
+
+- No hardware video decoding on Windows (Media Foundation), on Linux PCs
+  (VA-API), or for H.264 on the Raspberry Pi 4. HEVC and VP9 files play
+  audio only on those systems.
+- On the Pi 5, 4K HEVC full screen on a 4K display runs at about 18 fps.
+- With PulseAudio's ALSA plugin, sound can start about 2 s late (video
+  waits for it, so sync is kept). PipeWire does not show this.
 
 ## License
 
-Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-The patched crates in `vendor/` keep their own licenses. In particular,
-`vendor/symphonia-format-isomp4` is MPL-2.0: changes to its files stay under
-MPL-2.0. Dependencies pulled from crates.io are under their own (all
-permissive or file-level copyleft) licenses.
+The patched crates in `vendor/` keep their own licenses. Notably,
+`vendor/symphonia-format-isomp4` is MPL-2.0, so changes to its files stay
+under MPL-2.0.
 
-The license covers this code, not codec patents. H.264 and HEVC are patented;
-OpenH264 is built from source here, so Cisco's patent coverage for its own
-binaries does not apply to these builds.
+The license covers this code, not codec patents. H.264 and HEVC are
+patented, and because OpenH264 is built from source here, Cisco's patent
+coverage for its own binaries does not apply.
