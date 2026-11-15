@@ -37,7 +37,10 @@ souvlaki = { version = "0.9.3", default-features = false, features = ["use_zbus"
 cros-codecs = { version = "0.0.6", default-features = false }
 notify = "8"
 # Real-time upscaling on the GPU (FSR 1 compute shaders) through Vulkan,
-# Direct3D 12 or Metal. Pinned a release behind the newest.
+# Direct3D 12 or Metal. Pinned a release behind the newest. On Windows,
+# Cargo.lock must give gpu-allocator (which accepts windows 0.53 to 0.62)
+# the same windows version as wgpu-hal (0.62), not GPUI's 0.61, or the
+# Direct3D 12 backend does not compile; CI's Windows job catches it.
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
 pollster = "1"
 
