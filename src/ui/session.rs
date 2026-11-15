@@ -40,6 +40,8 @@ pub struct Session {
     pub autoplay: bool,
     /// Folders collapsed in the playlist.
     pub collapsed_folders: Vec<PathBuf>,
+    /// The playlist pane's width, in logical pixels.
+    pub sidebar_width: f32,
 }
 
 /// One open tab: its file and where it was left.
@@ -70,6 +72,7 @@ impl Default for Session {
             still_seconds: 10,
             autoplay: true,
             collapsed_folders: Vec::new(),
+            sidebar_width: 240.0,
         }
     }
 }
@@ -202,6 +205,7 @@ mod tests {
             still_seconds: 45,
             autoplay: false,
             collapsed_folders: vec![dir.clone()],
+            sidebar_width: 320.0,
         };
         store.save(&session).unwrap();
         assert_eq!(store.load(), session);

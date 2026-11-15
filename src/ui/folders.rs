@@ -206,6 +206,39 @@ pub fn tree_cmp(a: &Path, b: &Path) -> std::cmp::Ordering {
     a.len().cmp(&b.len())
 }
 
+/// Where a file newly found under `root` joins `playlist`: among the files
+/// of its own folder, by name; else with the entries of its nearest
+/// enclosing folder, never inside another subfolder's run. Works whatever
+/// order those entries are in (a playlist built before folder order
+/// existed), so a folder is never split in two.
+pub fn insert_position(playlist: &[PathBuf], root: &Path, file: &Path) -> usize {
+    let parent = file.parent();
+    let siblings: Vec<usize> = (0..playlist.len()).filter(|&i| playlist[i].parent() == parent).collect();
+    if let Some(&last) = siblings.last() {
+        return siblings.iter().copied().find(|&i| playlist[i].file_name() > file.file_name()).unwrap_or(last + 1);
+    }
+    // The branch of `p` directly under `dir`, if `p` is in a subfolder.
+    let branch = |p: &Path, dir: &Path| -> Option<std::ffi::OsString> {
+        let mut rest = p.strip_prefix(dir).ok()?.components();
+        let first = rest.next()?;
+        rest.next().map(|_| first.as_os_str().to_owned())
+    };
+    let mut dir = parent;
+    while let Some(d) = dir.filter(|d| d.starts_with(root)) {
+        let group: Vec<usize> = (0..playlist.len()).filter(|&i| playlist[i].starts_with(d)).collect();
+        if let Some(&last) = group.last() {
+            let mut at = group.iter().copied().find(|&i| tree_cmp(&playlist[i], file).is_gt()).unwrap_or(last + 1);
+            // Not between two entries of the same subfolder.
+            while at > 0 && at < playlist.len() && branch(&playlist[at], d).is_some() && branch(&playlist[at - 1], d) == branch(&playlist[at], d) {
+                at += 1;
+            }
+            return at;
+        }
+        dir = d.parent();
+    }
+    playlist.len()
+}
+
 /// Every media file under `dir`, recursively, in folder order.
 pub fn list(dir: &Path) -> Listing {
     fn walk(dir: &Path, out: &mut Vec<(PathBuf, Stamp)>) -> std::io::Result<()> {
@@ -254,6 +287,27 @@ mod tests {
         assert!(f.contains(&base.join("a/x.mp4")) && !f.contains(&base.join("ab/x.mp4")));
         f.set(vec![base.join("x/y"), base.join("x")]);
         assert_eq!(f.roots(), [base.join("x")]);
+    }
+
+    #[test]
+    fn new_files_join_their_own_folder_without_splitting_another() {
+        let p = |s: &str| PathBuf::from(s);
+        let root = p("/m");
+        // Built in the old plain path order: the subfolder sits between
+        // the root's own files.
+        let old_order = [p("/m/a.mp4"), p("/m/sub/b.mp4"), p("/m/sub/d.mp4"), p("/m/z.mp4")];
+        assert_eq!(insert_position(&old_order, &root, &p("/m/sub/c.mp4")), 2, "between its siblings");
+        assert_eq!(insert_position(&old_order, &root, &p("/m/sub/e.mp4")), 3, "after the last sibling, not after z.mp4");
+        assert_eq!(insert_position(&old_order, &root, &p("/m/m.mp4")), 3, "a root file among root files, by name");
+        // A new subfolder goes with its parent's entries but never inside
+        // the run of another subfolder.
+        let at = insert_position(&old_order, &root, &p("/m/new/x.mp4"));
+        assert!(at != 2, "split sub");
+        // Folder order (files first) stays folder order.
+        let tree_order = [p("/m/a.mp4"), p("/m/z.mp4"), p("/m/sub/b.mp4")];
+        assert_eq!(insert_position(&tree_order, &root, &p("/m/q/x.mp4")), 2, "subfolders by name, after the files");
+        assert_eq!(insert_position(&tree_order, &root, &p("/m/t/x.mp4")), 3);
+        assert_eq!(insert_position(&[p("/other/x.mp4")], &root, &p("/m/a.mp4")), 1, "nothing of the folder yet: at the end");
     }
 
     #[test]

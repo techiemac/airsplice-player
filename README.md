@@ -233,6 +233,7 @@ same decoder and may work.
 | Command palette | Cmd+Shift+P | Ctrl+Shift+P |
 | Find in playlist | Cmd+P | Ctrl+P |
 | Toggle playlist / info panel | Cmd+B / Cmd+R | Ctrl+B / Ctrl+R |
+| Resize the playlist | Drag its right edge (double-click to reset) | Same |
 | Stop (closes the tab) | Cmd+. | Ctrl+. |
 | Open in new tab | Cmd+click a playlist entry, or Cmd+Enter in the finder | Ctrl+click, or Ctrl+Enter |
 | Next / previous tab | Cmd+Shift+] / [, or Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Shift+] / [, or Ctrl+Tab / Ctrl+Shift+Tab |

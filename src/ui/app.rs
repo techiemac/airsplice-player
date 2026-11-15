@@ -183,7 +183,12 @@ impl Repeat {
 enum Drag {
     Seek,
     Volume,
+    /// The playlist pane's right edge.
+    Sidebar,
 }
+
+/// The playlist pane's width range, in logical pixels.
+const SIDEBAR_WIDTH: std::ops::RangeInclusive<f32> = 160.0..=560.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PickerKind {
@@ -295,6 +300,8 @@ pub struct MediaPlayer {
     /// Move on to the next playlist entry when one ends (the playlist
     /// pane's switch). Off, playback stops at the end of each entry.
     autoplay: bool,
+    /// The playlist pane's width (logical pixels), set by dragging its edge.
+    sidebar_width: f32,
     /// Folders collapsed in the playlist pane. Sorted, for a stable
     /// session file.
     collapsed: std::collections::BTreeSet<PathBuf>,
@@ -386,6 +393,7 @@ impl MediaPlayer {
             still_seconds: session.still_seconds,
             autoplay: session.autoplay,
             collapsed: session.collapsed_folders.iter().cloned().collect(),
+            sidebar_width: session.sidebar_width.clamp(*SIDEBAR_WIDTH.start(), *SIDEBAR_WIDTH.end()),
             preloaded: None,
             opened_at: Instant::now(),
             // Known before anything is opened, so the first file (from the
@@ -568,6 +576,7 @@ impl MediaPlayer {
             still_seconds: self.still_seconds,
             autoplay: self.autoplay,
             collapsed_folders: self.collapsed.iter().cloned().collect(),
+            sidebar_width: self.sidebar_width,
         }
     }
 
@@ -1232,13 +1241,7 @@ impl MediaPlayer {
                 if present.contains(&file) || self.removed_from_folders.contains(&file) {
                     continue;
                 }
-                let in_folder: Vec<usize> = (0..self.playlist.len()).filter(|&i| self.playlist[i].starts_with(&root)).collect();
-                let ix = in_folder
-                    .iter()
-                    .copied()
-                    .find(|&i| folders::tree_cmp(&self.playlist[i], &file).is_gt())
-                    .or(in_folder.last().map(|i| i + 1))
-                    .unwrap_or(self.playlist.len());
+                let ix = folders::insert_position(&self.playlist, &root, &file);
                 self.insert_entry(ix, file);
                 changed = true;
             }
@@ -1537,6 +1540,11 @@ impl MediaPlayer {
                     self.set_volume(f as f32, cx);
                 }
             }
+            // The pane starts at the window's left edge.
+            Some(Drag::Sidebar) => {
+                self.sidebar_width = f32::from(x).clamp(*SIDEBAR_WIDTH.start(), *SIDEBAR_WIDTH.end());
+                cx.notify();
+            }
             None => {}
         }
     }
@@ -1688,16 +1696,16 @@ impl MediaPlayer {
                                 .h(px(26.))
                                 .flex()
                                 .items_center()
-                                .gap(px(4.))
-                                .pl(px(6. + depth as f32 * 12.))
+                                .gap(px(6.))
+                                // The icon lines up with the file icons at the same depth.
+                                .pl(px(12. + depth as f32 * 12.))
                                 .pr(px(10.))
                                 .border_l_2()
                                 .border_color(gpui::transparent_black())
                                 .hover(|s| s.bg(Theme::hover()))
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_folder(path.clone(), cx)))
-                                .child(icon(if collapsed { Icon::ChevronRight } else { Icon::ChevronDown }, px(12.), Theme::text_placeholder()))
-                                .child(icon(Icon::Folder, px(14.), Theme::text_muted()))
+                                .child(icon(if collapsed { Icon::Folder } else { Icon::FolderOpen }, px(14.), Theme::text_muted()))
                                 .child(div().flex_1().min_w_0().text_sm().truncate().text_color(Theme::text_muted()).child(name))
                                 .child(div().flex_none().text_xs().text_color(Theme::text_placeholder()).child(count.to_string()))
                                 .into_any_element();
@@ -1781,11 +1789,35 @@ impl MediaPlayer {
         };
 
         div()
-            .w(px(240.))
+            .relative()
+            .w(px(self.sidebar_width))
             .flex_none()
             .flex()
             .flex_col()
             .bg(Theme::panel_bg())
+            // Drag the right edge to resize; double-click it to reset.
+            .child(
+                div()
+                    .id("sidebar-edge")
+                    .debug_selector(|| "sidebar-edge".into())
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(px(-3.))
+                    .w(px(6.))
+                    .cursor_col_resize()
+                    .hover(|s| s.bg(Theme::border()))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.drag = Some(Drag::Sidebar);
+                        cx.stop_propagation();
+                    }))
+                    .on_click(cx.listener(|this, e: &ClickEvent, _, cx| {
+                        if e.click_count() == 2 {
+                            this.sidebar_width = 240.0;
+                            cx.notify();
+                        }
+                    })),
+            )
             .border_r_1()
             .border_color(Theme::border())
             .child(header)
@@ -3383,6 +3415,58 @@ mod tests {
         tick_until(&view, vcx, "autoplay into the subfolder", |v| v.current == Some(1));
         assert_eq!(view.read_with(vcx, |v, _| shape(v))[2], "1- sub 2", "opened for the entry now playing");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_file_added_to_a_subfolder_joins_it_instead_of_repeating_it(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let dir = media_folder("subfolder-add");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        put(&dir, "a.mp4", "video_only.mp4");
+        put(&dir, "sub/b.mp4", "video_only.mp4");
+        put(&dir, "z.mp4", "video_only.mp4");
+        let (view, vcx) = cx.add_window_view({
+            let dir = dir.clone();
+            |window, cx| MediaPlayer::new(vec![dir], None, window, cx)
+        });
+        // As a playlist built before folder order: plain path order puts
+        // the subfolder between the folder's own files.
+        view.update_in(vcx, |v, _, _| v.playlist.sort());
+        let folders = |v: &MediaPlayer| {
+            tree::rows(&v.playlist, v.folders.roots(), &|_| false).into_iter().filter(|r| matches!(r, Row::Folder { .. })).count()
+        };
+        assert_eq!(view.read_with(vcx, |v, _| folders(v)), 2, "the folder and sub");
+
+        put(&dir, "sub/c.mp4", "video_only.mp4");
+        tick_until(&view, vcx, "sub/c.mp4 to appear", |v| v.playlist.len() == 4);
+        view.read_with(vcx, |v, _| {
+            assert_eq!(names(v), ["a.mp4", "b.mp4", "c.mp4", "z.mp4"], "next to its sibling");
+            assert_eq!(folders(v), 2, "sub is shown once, not split in two");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn the_playlist_pane_resizes_by_its_edge(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(vec![fixture("video_only.mp4")], None, window, cx));
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("sidebar-edge").is_some(), "a drag handle on the pane's edge");
+        assert_eq!(view.read_with(vcx, |v, _| v.sidebar_width), 240.0);
+        // Press on the edge wherever it is now, drag to `x`, release.
+        let drag_to = |vcx: &mut gpui::VisualTestContext, x: f32| {
+            vcx.run_until_parked();
+            let edge = vcx.debug_bounds("sidebar-edge").unwrap().center();
+            vcx.simulate_mouse_down(edge, MouseButton::Left, gpui::Modifiers::none());
+            vcx.simulate_mouse_move(gpui::point(px(x), edge.y), Some(MouseButton::Left), gpui::Modifiers::none());
+            vcx.simulate_mouse_up(gpui::point(px(x), edge.y), MouseButton::Left, gpui::Modifiers::none());
+        };
+        drag_to(vcx, 380.0);
+        assert_eq!(view.read_with(vcx, |v, _| (v.sidebar_width, v.snapshot(false).sidebar_width)), (380.0, 380.0), "resized and saved");
+        drag_to(vcx, 20.0);
+        assert_eq!(view.read_with(vcx, |v, _| v.sidebar_width), 160.0, "no narrower than 160");
+        drag_to(vcx, 700.0);
+        assert_eq!(view.read_with(vcx, |v, _| v.sidebar_width), 560.0, "no wider than 560");
     }
 
     #[gpui::test]
