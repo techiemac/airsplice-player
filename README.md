@@ -110,7 +110,8 @@ Raspberry Pi 5, frames shown on screen by the app:
 
 ## Building
 
-Developed with Rust 1.92 (older versions are untested).
+The Rust version is pinned in `rust-toolchain.toml`; with rustup, run
+`rustup toolchain install` once in the checkout to get it.
 
 ```sh
 cargo run --release -- [files or folders...]

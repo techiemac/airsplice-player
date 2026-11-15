@@ -660,7 +660,7 @@ pub fn decode_image(bytes: &[u8]) -> Option<Image> {
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (width, height) = img.dimensions();
     let mut bgra = img.into_raw();
-    for px in bgra.chunks_exact_mut(4) {
+    for px in bgra.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
     Some(Image { width, height, bgra: Arc::new(bgra) })

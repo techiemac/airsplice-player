@@ -195,8 +195,8 @@ impl Col128<'_> {
                     gs[i] = ((y - m.gu * u - m.gv * v + 8192) >> 14).clamp(0, 255) as u8;
                     rs[i] = ((y + m.rv * v + 8192) >> 14).clamp(0, 255) as u8;
                 }
-                for (i, px) in line[x0 * 4..(x0 + n) * 4].chunks_exact_mut(4).enumerate() {
-                    px.copy_from_slice(&[bs[i], gs[i], rs[i], 255]);
+                for (i, px) in line[x0 * 4..(x0 + n) * 4].as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    *px = [bs[i], gs[i], rs[i], 255];
                 }
             }
         });
@@ -207,8 +207,8 @@ impl Col128<'_> {
 /// 128 bytes of 10-bit samples, three per little-endian word, into 96.
 #[inline]
 fn unpack10(src: &[u8], dst: &mut [u16; 128]) {
-    for (k, word) in src.chunks_exact(4).enumerate() {
-        let bits = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+    for (k, word) in src.as_chunks::<4>().0.iter().enumerate() {
+        let bits = u32::from_le_bytes(*word);
         dst[k * 3] = (bits & 0x3ff) as u16;
         dst[k * 3 + 1] = ((bits >> 10) & 0x3ff) as u16;
         dst[k * 3 + 2] = ((bits >> 20) & 0x3ff) as u16;

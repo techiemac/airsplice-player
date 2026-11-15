@@ -17,9 +17,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      # The version and components pinned in rust-toolchain.toml, so CI
+      # lints with the same clippy as local builds.
+      - name: Install Rust
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux system libraries
         if: runner.os == 'Linux'

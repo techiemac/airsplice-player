@@ -408,7 +408,8 @@ impl MediaPlayer {
         #[cfg(target_os = "windows")]
         let hwnd = {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            match window.window_handle().map(|h| h.as_raw()) {
+            // GPUI's own `Window::window_handle` would shadow the trait's.
+            match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
                 Ok(RawWindowHandle::Win32(h)) => Some(h.hwnd.get() as *mut std::ffi::c_void),
                 _ => None,
             }
