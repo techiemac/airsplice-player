@@ -1752,7 +1752,6 @@ impl MediaPlayer {
                     .gap(px(10.))
                     .flex_none()
                     .child(self.repeat.label())
-                    .child(if self.muted { "Muted".to_string() } else { format!("{}%", (self.volume * 100.0).round()) })
                     .child(icon_button("sb-info", Icon::PanelRight, self.info_open, cx.listener(|this, _, window, cx| {
                         this.toggle_info(&ToggleInfoPanel, window, cx)
                     }))),
