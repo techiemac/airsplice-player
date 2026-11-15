@@ -62,12 +62,13 @@ impl Render for OutputView {
             .id("output")
             .relative()
             .size_full()
-            .bg(rgb(0x000000))
+            // Black only around the picture (see `letterbox`).
+            .when(picture.is_none(), |el| el.bg(rgb(0x000000)))
             // Keys always go to the controls: a click here (an operator
             // reaching for them) hands the keyboard back.
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 let _ = main.update(cx, |_, window, _| window.activate_window());
             })
-            .when_some(picture, |el, p| el.child(img(p).absolute().inset_0().size_full().object_fit(ObjectFit::Contain)))
+            .when_some(picture, |el, p| el.child(super::letterbox::bars(&p)).child(img(p).absolute().inset_0().size_full().object_fit(ObjectFit::Contain)))
     }
 }

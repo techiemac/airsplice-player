@@ -4,6 +4,7 @@ pub mod app;
 pub mod folders;
 pub mod fuzzy;
 pub mod icons;
+pub mod letterbox;
 pub mod os_media;
 pub mod output;
 pub mod session;

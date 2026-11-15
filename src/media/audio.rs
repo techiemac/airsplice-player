@@ -195,6 +195,22 @@ impl Clock {
         }
     }
 
+    /// The time, while the clock is running: primed and not paused. Video
+    /// can only be late against a running clock.
+    pub fn running(&self) -> Option<f64> {
+        let running = match self {
+            Clock::Audio { state, .. } => {
+                let st = state.lock().unwrap();
+                st.primed && !st.paused
+            }
+            Clock::Wall(w) => {
+                let w = w.lock().unwrap();
+                w.primed && !w.paused
+            }
+        };
+        running.then(|| self.now())
+    }
+
     pub fn set_paused(&self, paused: bool) {
         match self {
             Clock::Audio { state, .. } => state.lock().unwrap().paused = paused,

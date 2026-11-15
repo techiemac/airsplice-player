@@ -18,6 +18,7 @@ use gpui::{
 use super::folders::{self, Folders, Scan, Stamp};
 use super::fuzzy::fuzzy_match;
 use super::icons::Icon;
+use super::letterbox;
 use super::os_media::{NowPlaying, OsMedia, PlayState};
 use super::output::{self, OutputView};
 use super::session::{Session, SessionStore, TabState};
@@ -344,6 +345,14 @@ pub struct MediaPlayer {
     /// presentation-rate log.
     fps_count: u32,
     fps_since: Instant,
+    /// For the same log: renders since `fps_since`, frames replaced before
+    /// any render showed them, the longest gap between renders, and whether
+    /// the current frame has been rendered yet.
+    draw_count: u32,
+    never_drawn: u32,
+    longest_gap: Duration,
+    last_draw: Instant,
+    frame_pending: bool,
     /// Tags and durations for playlist entries, filled in the background.
     summaries: std::collections::HashMap<PathBuf, Summary>,
     /// Folders added to the playlist, watched for files added later.
@@ -428,6 +437,11 @@ impl MediaPlayer {
             drawn_position: -1.0,
             fps_count: 0,
             fps_since: Instant::now(),
+            draw_count: 0,
+            never_drawn: 0,
+            longest_gap: Duration::ZERO,
+            last_draw: Instant::now(),
+            frame_pending: false,
             summaries: Default::default(),
             folders: Folders::default(),
             removed_from_folders: Default::default(),
@@ -651,11 +665,25 @@ impl MediaPlayer {
                 let _ = window.drop_image(old);
             }
             changed = true;
+            if self.frame_pending {
+                self.never_drawn += 1;
+            }
+            self.frame_pending = true;
             self.fps_count += 1;
             let elapsed = self.fps_since.elapsed();
             if elapsed >= Duration::from_secs(2) {
-                log::debug!("presented {:.1} frames/s", self.fps_count as f64 / elapsed.as_secs_f64());
+                let secs = elapsed.as_secs_f64();
+                log::debug!(
+                    "presented {:.1} frames/s, rendered {:.1}/s, {} never rendered, longest gap {} ms",
+                    self.fps_count as f64 / secs,
+                    self.draw_count as f64 / secs,
+                    self.never_drawn,
+                    self.longest_gap.as_millis()
+                );
                 self.fps_count = 0;
+                self.draw_count = 0;
+                self.never_drawn = 0;
+                self.longest_gap = Duration::ZERO;
                 self.fps_since = Instant::now();
             }
         }
@@ -1896,7 +1924,6 @@ impl MediaPlayer {
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
-                .bg(gpui::black())
                 .on_click(cx.listener(|this, e: &ClickEvent, window, cx| {
                     if e.click_count() == 2 {
                         window.toggle_fullscreen();
@@ -1907,6 +1934,9 @@ impl MediaPlayer {
                 // Absolutely placed, so the image's box is exactly the stage
                 // whatever its shape: in the flex layout a tall picture's box
                 // grew past the stage and was cropped.
+                // Black only where the picture does not reach: nothing under
+                // the stage paints a background (see `letterbox`).
+                .child(letterbox::bars(frame))
                 .child(img(frame.clone()).debug_selector(|| "video-frame".into()).absolute().inset_0().size_full().object_fit(ObjectFit::Contain))
                 .into_any_element();
         }
@@ -1951,7 +1981,7 @@ impl MediaPlayer {
                 .into_any_element(),
             (None, None) => self.render_welcome(),
         };
-        div().flex_1().min_h_0().flex().items_center().justify_center().p(px(24.)).child(content).into_any_element()
+        div().flex_1().min_h_0().bg(Theme::editor_bg()).flex().items_center().justify_center().p(px(24.)).child(content).into_any_element()
     }
 
     fn render_welcome(&self) -> AnyElement {
@@ -2352,6 +2382,10 @@ impl Render for MediaPlayer {
         if let Some(p) = &self.player {
             self.drawn_position = p.position();
         }
+        self.frame_pending = false;
+        self.draw_count += 1;
+        self.longest_gap = self.longest_gap.max(self.last_draw.elapsed());
+        self.last_draw = Instant::now();
         let immersive = window.is_fullscreen() && self.frame.is_some();
         let picker = self.render_picker(window, cx);
         let settings = self.render_settings(window, cx);
@@ -2367,7 +2401,6 @@ impl Render for MediaPlayer {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .bg(Theme::editor_bg())
                     .when(!immersive, |el| el.child(self.render_tab_bar(cx)))
                     .child(self.render_stage(cx))
                     .child(self.render_transport(cx)),
@@ -2392,7 +2425,9 @@ impl Render for MediaPlayer {
             .key_context("Workspace")
             .relative()
             .size_full()
-            .bg(Theme::editor_bg())
+            // No background here or on the stage's column: every region
+            // paints its own, so the video is never drawn over a
+            // full-window fill (see `letterbox`).
             .text_color(Theme::text())
             .on_action(cx.listener(Self::play_pause))
             .on_action(cx.listener(Self::next_track))

@@ -125,8 +125,13 @@ Raspberry Pi 5, frames shown on screen by the app:
 | Stream | Result |
 |---|---|
 | 1080p60 HEVC | 60 fps |
+| 1080p60 H.264 (software), full screen | about 30 fps |
 | 4K30 HEVC 10-bit, window up to 1920x1080 | 30 fps |
 | 4K30 HEVC 10-bit, full screen on a 4K display | about 18 fps |
+
+Video the CPU cannot decode in time first skips frames that no other frame
+refers to, then jumps to the next keyframe if it is still behind; audio
+never waits for it.
 
 ## Upscaling
 

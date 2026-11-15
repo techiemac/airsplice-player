@@ -50,6 +50,10 @@ const PREROLL_TOLERANCE: f64 = 0.1;
 const SAME_TIME: f64 = 0.002;
 /// Longest the clock waits for the first video frame after open or seek.
 const MAX_PREROLL: StdDuration = StdDuration::from_millis(500);
+/// How far video may fall behind the clock before it skips ahead to a
+/// keyframe. Audio is read from the same file as video, so video that
+/// cannot keep up must skip, or it holds the audio back with it.
+const MAX_VIDEO_LAG: f64 = 0.5;
 
 #[derive(Clone, Debug, Default)]
 pub struct MediaInfo {
@@ -442,9 +446,10 @@ impl Player {
             let (tx, rx) = mpsc::sync_channel(VIDEO_PACKET_QUEUE);
             let time_base = track.time_base.unwrap_or_default();
             let shared = shared.clone();
+            let clock = clock.clone();
             thread::Builder::new()
                 .name("video-decode".into())
-                .spawn(move || video_thread(decoder, rx, time_base, shared))?;
+                .spawn(move || video_thread(decoder, rx, time_base, shared, clock))?;
             video_route =
                 Some(VideoRoute { track_id: track.id, time_base, is_keyframe: video::keyframe_check(params)?, tx });
         }
@@ -1029,7 +1034,19 @@ fn demux_thread(
 /// Queue one decoded frame for display, upscaled first if that is switched
 /// on, waiting while the queue is full. False when a seek or stop made the
 /// frame moot (the caller stops pushing that generation).
-fn queue_frame(shared: &Shared, stage: &mut Stage, generation: u64, pts: f64, width: u32, height: u32, bgra: Vec<u8>) -> bool {
+///
+/// `now` reads the running clock (None while it is held or paused). Frames
+/// too late to ever be shown are dropped instead of waited behind, so a UI
+/// that stops taking frames for a while never stalls the decoder, and
+/// through it the demuxer and the audio.
+fn queue_frame(
+    shared: &Shared,
+    stage: &mut Stage,
+    generation: u64,
+    pts: f64,
+    (width, height, bgra): (u32, u32, Vec<u8>),
+    now: &dyn Fn() -> Option<f64>,
+) -> bool {
     // Upscaled here, off the UI thread, to the size it is shown at.
     let (width, height, bgra) = if shared.upscale.load(Ordering::Relaxed) {
         let packed = shared.output_limit.load(Ordering::Relaxed);
@@ -1053,10 +1070,16 @@ fn queue_frame(shared: &Shared, stage: &mut Stage, generation: u64, pts: f64, wi
     }
     // The one frame held at or before the target does not count: the
     // picker needs its successor to know it is the one to show.
-    while q.iter().filter(|e| !held(e)).count() >= shared.max_frames.load(Ordering::Relaxed)
-        && shared.current() == generation
-        && !shared.stopped()
-    {
+    loop {
+        if let Some(now) = now() {
+            q.retain(|e| e.generation != generation || e.pts >= now - MAX_VIDEO_LAG);
+        }
+        if q.iter().filter(|e| !held(e)).count() < shared.max_frames.load(Ordering::Relaxed)
+            || shared.current() != generation
+            || shared.stopped()
+        {
+            break;
+        }
         q = shared.frames_cv.wait_timeout(q, StdDuration::from_millis(100)).unwrap().0;
     }
     if shared.current() != generation || shared.stopped() {
@@ -1110,7 +1133,7 @@ fn picture_thread(path: &Path, outline: &Outline, shared: &Shared) {
                 }
             }
             let Some(px) = decoded.get(i) else { break };
-            if !queue_frame(shared, &mut stage, generation, start, outline.width, outline.height, px.clone()) {
+            if !queue_frame(shared, &mut stage, generation, start, (outline.width, outline.height, px.clone()), &|| None) {
                 interrupted = true;
                 break;
             }
@@ -1142,7 +1165,7 @@ fn still_thread(path: &Path, shared: &Shared) {
         let limit = ((packed >> 32) as u32, packed as u32);
         match picture::still(path, limit) {
             Ok((w, h, px)) => {
-                if queue_frame(shared, &mut stage, generation, 0.0, w, h, px) {
+                if queue_frame(shared, &mut stage, generation, 0.0, (w, h, px), &|| None) {
                     shared.video_done.store(generation, Ordering::Release);
                     shared.demux_done.store(generation, Ordering::Release);
                 }
@@ -1159,16 +1182,67 @@ fn still_thread(path: &Path, shared: &Shared) {
     }
 }
 
-fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time_base: TimeBase, shared: Arc<Shared>) {
+/// What the video thread does with a packet when video may be behind.
+#[derive(Debug, PartialEq)]
+enum Step {
+    Decode,
+    /// Late, and no other frame needs it: leave it undecoded.
+    Drop,
+    /// Too late: drop it undecoded, until the next keyframe on time.
+    Skip,
+    /// A keyframe on time after skipping: restart the decoder here.
+    Resume,
+}
+
+/// Software decoding of a stream too heavy for the CPU shows what it can,
+/// in step with the audio, instead of slowing everything to its pace. Late
+/// frames that no other frame refers to are left undecoded, which keeps
+/// the picture moving at a lower rate. If video still falls more than
+/// `MAX_VIDEO_LAG` behind, it skips to the next keyframe on time.
+#[derive(Default)]
+struct CatchUp {
+    skipping: bool,
+    skipped: usize,
+    dropped: usize,
+}
+
+impl CatchUp {
+    /// `now` is the running clock, None while it is held or paused.
+    fn step(&mut self, pts: f64, keyframe: bool, droppable: bool, now: Option<f64>) -> Step {
+        if !self.skipping && now.is_some_and(|now| pts < now - MAX_VIDEO_LAG) {
+            self.skipping = true;
+            self.skipped = 0;
+        }
+        if !self.skipping {
+            if droppable && now.is_some_and(|now| pts < now) {
+                self.dropped += 1;
+                return Step::Drop;
+            }
+            return Step::Decode;
+        }
+        // While the clock is stopped any keyframe will do.
+        if keyframe && now.is_none_or(|now| pts >= now) {
+            self.skipping = false;
+            return Step::Resume;
+        }
+        self.skipped += 1;
+        Step::Skip
+    }
+}
+
+fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time_base: TimeBase, shared: Arc<Shared>, clock: Arc<Clock>) {
     let mut stage = Stage::default();
+    let now = || clock.running();
+    let secs = |pts: i64| time_base.calc_time(Timestamp::new(pts)).map_or(0.0, |t| t.as_secs_f64());
     let mut push = |frames: Vec<DecodedFrame>, generation: u64| {
         for f in frames {
-            let pts = time_base.calc_time(Timestamp::new(f.pts)).map_or(0.0, |t| t.as_secs_f64());
-            if !queue_frame(&shared, &mut stage, generation, pts, f.width, f.height, f.bgra) {
+            if !queue_frame(&shared, &mut stage, generation, secs(f.pts), (f.width, f.height, f.bgra), &now) {
                 return;
             }
         }
     };
+    let mut catch_up = CatchUp::default();
+    let mut last_report = std::time::Instant::now();
     let mut applied_limit = 0u64;
     while let Ok(msg) = rx.recv() {
         if shared.stopped() {
@@ -1178,6 +1252,23 @@ fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time
             VideoMsg::Packet { generation, pts, data } => {
                 if generation != shared.current() {
                     continue;
+                }
+                let step = catch_up.step(secs(pts), decoder.is_keyframe(&data), decoder.is_droppable(&data), now());
+                if catch_up.dropped > 0 && last_report.elapsed() >= StdDuration::from_secs(2) {
+                    log::debug!("video was behind: left {} frames undecoded", catch_up.dropped);
+                    catch_up.dropped = 0;
+                    last_report = std::time::Instant::now();
+                }
+                match step {
+                    Step::Decode => {}
+                    Step::Drop | Step::Skip => continue,
+                    Step::Resume => {
+                        log::debug!("video was behind: skipped {} packets to the keyframe at {:.2}s", catch_up.skipped, secs(pts));
+                        if let Err(e) = decoder.reset(pts) {
+                            *shared.error.lock().unwrap() = Some(format!("video decoder reset failed: {e}"));
+                            continue;
+                        }
+                    }
                 }
                 let packed = shared.output_limit.load(Ordering::Relaxed);
                 if packed != applied_limit {
@@ -1190,6 +1281,7 @@ fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time
                 }
             }
             VideoMsg::Reset { discard_before } => {
+                catch_up = CatchUp::default();
                 if let Err(e) = decoder.reset(discard_before) {
                     *shared.error.lock().unwrap() = Some(format!("video decoder reset failed: {e}"));
                 }
@@ -1509,5 +1601,120 @@ mod tests {
         assert_eq!(info.title, "Test Tone");
         assert_eq!(info.artist.as_deref(), Some("Fixture Band"));
         assert_eq!(info.album.as_deref(), Some("Fixtures"));
+    }
+
+    #[test]
+    fn video_on_time_is_decoded() {
+        let mut c = CatchUp::default();
+        assert_eq!(c.step(10.0, false, false, Some(10.2)), Step::Decode, "a little late is still decoded");
+        assert_eq!(c.step(10.0, false, true, None), Step::Decode, "nothing is late while the clock is stopped");
+        assert_eq!(c.step(10.3, false, true, Some(10.2)), Step::Decode, "on time: kept even though droppable");
+    }
+
+    #[test]
+    fn video_too_far_behind_skips_to_the_next_keyframe_on_time() {
+        let mut c = CatchUp::default();
+        let now = Some(20.0);
+        assert_eq!(c.step(19.0, false, false, now), Step::Skip);
+        assert_eq!(c.step(19.5, false, true, now), Step::Skip);
+        // A keyframe that is itself late is no place to restart.
+        assert_eq!(c.step(19.8, true, false, now), Step::Skip);
+        assert_eq!(c.step(20.1, false, false, now), Step::Skip, "not a keyframe");
+        assert_eq!(c.step(20.4, true, false, now), Step::Resume);
+        assert_eq!(c.skipped, 4);
+        assert_eq!(c.step(20.42, false, false, now), Step::Decode);
+    }
+
+    #[test]
+    fn a_stopped_clock_resumes_at_any_keyframe() {
+        let mut c = CatchUp::default();
+        assert_eq!(c.step(1.0, false, false, Some(5.0)), Step::Skip);
+        // Paused mid-skip: the next keyframe restarts decoding, so the
+        // paused picture is never left stale.
+        assert_eq!(c.step(1.2, false, false, None), Step::Skip);
+        assert_eq!(c.step(1.5, true, false, None), Step::Resume);
+    }
+
+    #[test]
+    fn late_frames_nothing_refers_to_are_dropped_first() {
+        let mut c = CatchUp::default();
+        let now = Some(10.0);
+        assert_eq!(c.step(9.8, false, true, now), Step::Drop);
+        assert_eq!(c.step(9.85, false, false, now), Step::Decode, "a reference frame is still decoded");
+        assert_eq!(c.step(9.9, false, true, now), Step::Drop);
+        assert_eq!(c.dropped, 2);
+    }
+
+    #[test]
+    fn h264_b_frames_that_are_not_references_are_droppable() {
+        // x264 with three B-frames and its default B-pyramid: the middle B of
+        // each run is a reference, the others are not.
+        let path = fixture("bframes_h264.mp4");
+        let mss = MediaSourceStream::new(Box::new(File::open(&path).unwrap()), Default::default());
+        let mut hint = Hint::new();
+        hint.with_extension("mp4");
+        let mut format = symphonia::default::get_probe()
+            .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
+            .unwrap();
+        let track = format.default_track(TrackType::Video).unwrap().clone();
+        let params = track.codec_params.as_ref().unwrap().video().unwrap();
+        let decoder = video::make_software_decoder(params).unwrap();
+        let (mut total, mut droppable, mut keyframes) = (0, 0, 0);
+        while let Ok(Some(p)) = format.next_packet() {
+            if p.track_id != track.id {
+                continue;
+            }
+            total += 1;
+            let key = decoder.is_keyframe(&p.data);
+            if decoder.is_droppable(&p.data) {
+                assert!(!key, "a keyframe is never droppable");
+                droppable += 1;
+            }
+            keyframes += usize::from(key);
+        }
+        assert_eq!(total, 50);
+        assert_eq!(keyframes, 2);
+        assert!((10..total / 2 + 1).contains(&droppable), "{droppable} of {total} droppable");
+    }
+
+    #[test]
+    fn h264_decodes_cleanly_with_its_droppable_frames_left_out() {
+        let path = fixture("bframes_h264.mp4");
+        let mss = MediaSourceStream::new(Box::new(File::open(&path).unwrap()), Default::default());
+        let mut hint = Hint::new();
+        hint.with_extension("mp4");
+        let mut format = symphonia::default::get_probe()
+            .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
+            .unwrap();
+        let track = format.default_track(TrackType::Video).unwrap().clone();
+        let params = track.codec_params.as_ref().unwrap().video().unwrap();
+        let mut decoder = video::make_software_decoder(params).unwrap();
+        let (mut fed, mut pts_out) = (0, Vec::new());
+        while let Ok(Some(p)) = format.next_packet() {
+            if p.track_id != track.id || decoder.is_droppable(&p.data) {
+                continue;
+            }
+            fed += 1;
+            pts_out.extend(decoder.decode(&p.data, p.pts.get()).unwrap().into_iter().map(|f| f.pts));
+        }
+        pts_out.extend(decoder.flush().unwrap().into_iter().map(|f| f.pts));
+        eprintln!("fed {fed} of 50 packets");
+        assert_eq!(pts_out.len(), fed, "one picture per packet fed");
+        assert!(pts_out.is_sorted(), "still in display order: {pts_out:?}");
+    }
+
+    #[test]
+    fn frames_too_late_to_show_do_not_block_the_decoder() {
+        let shared = Shared::new();
+        shared.max_frames.store(1, Ordering::Relaxed);
+        let mut stage = Stage::default();
+        let frame = || (2, 2, vec![0u8; 16]);
+        assert!(queue_frame(&shared, &mut stage, 0, 1.0, frame(), &|| Some(1.0)));
+        // The queue is full and nothing takes frames (a stalled UI). The
+        // queued frame is now too late to show, so it is dropped rather than
+        // waited behind; without that this call would wait forever.
+        assert!(queue_frame(&shared, &mut stage, 0, 3.0, frame(), &|| Some(3.0)));
+        let q = shared.frames.lock().unwrap();
+        assert_eq!(q.iter().map(|f| f.pts).collect::<Vec<_>>(), [3.0]);
     }
 }

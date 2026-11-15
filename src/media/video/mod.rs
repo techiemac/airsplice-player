@@ -35,6 +35,11 @@ pub trait VideoDecoder: Send {
     fn decode(&mut self, data: &[u8], pts: i64) -> Result<Vec<DecodedFrame>>;
     /// Whether decoding can start at this access unit.
     fn is_keyframe(&self, data: &[u8]) -> bool;
+    /// Whether no other frame refers to this access unit, so video that is
+    /// behind can leave it undecoded without harming the frames after it.
+    fn is_droppable(&self, _data: &[u8]) -> bool {
+        false
+    }
     /// Return frames still buffered inside the decoder (end of stream).
     fn flush(&mut self) -> Result<Vec<DecodedFrame>>;
     /// Discard all state after a seek. Frames until the next keyframe are

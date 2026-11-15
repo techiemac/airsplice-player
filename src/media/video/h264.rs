@@ -242,6 +242,23 @@ pub fn is_keyframe(data: &[u8], nal_length_size: usize) -> bool {
     })
 }
 
+/// Whether every slice of the access unit has `nal_ref_idc` 0: no other
+/// picture refers to it, so it can be left undecoded.
+pub fn is_droppable(data: &[u8], nal_length_size: usize) -> bool {
+    let mut slices = 0;
+    for nal in nal_units(data, nal_length_size) {
+        let Some(&header) = nal.first() else { continue };
+        // Slices, data partition A (which carries the slice header), IDR.
+        if matches!(header & 0x1f, NAL_SLICE | 2 | NAL_IDR) {
+            if header & 0x60 != 0 {
+                return false;
+            }
+            slices += 1;
+        }
+    }
+    slices > 0
+}
+
 pub struct H264Decoder {
     decoder: Decoder,
     config: AvcConfig,
@@ -319,6 +336,10 @@ impl VideoDecoder for H264Decoder {
 
     fn is_keyframe(&self, data: &[u8]) -> bool {
         is_keyframe(data, self.config.nal_length_size)
+    }
+
+    fn is_droppable(&self, data: &[u8]) -> bool {
+        is_droppable(data, self.config.nal_length_size)
     }
 
     fn decode(&mut self, data: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
