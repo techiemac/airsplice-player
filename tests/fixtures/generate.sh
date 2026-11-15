@@ -72,3 +72,8 @@ open("ctts_v0_negative.mov", "wb").write(d)
 # Video that starts after time zero: B-frames and no edit list, so the first
 # frame is stamped 0.08 s (as in many camera and web files).
 ffmpeg "${q[@]}" -filter_complex "$V" -map "[v]" -c:v libx264 -bf 2 -g 25 -use_editlist 0 late_start.mp4
+
+# Audio that ends 1 s before the video (as in many real files, by a few
+# frames): playback must still reach the last frame and finish.
+ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=44100:d=2" -filter_complex "$V" -map "[v]" -map 0:a \
+  -c:v libx264 -bf 2 -g 25 -c:a aac -ac 2 -b:a 64k audio_ends_first.mp4

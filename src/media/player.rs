@@ -812,6 +812,16 @@ impl AudioDec {
     }
 }
 
+impl AudioPipeline {
+    /// Every sample of this generation has been decoded and queued.
+    fn mark_ended(&self, generation: u64) {
+        let mut st = self.state.lock().unwrap();
+        if st.generation == generation {
+            st.ended = true;
+        }
+    }
+}
+
 struct AudioPipeline {
     track_id: u32,
     time_base: TimeBase,
@@ -952,6 +962,9 @@ fn demux_thread(
                 if let Some(v) = &video {
                     let _ = v.tx.send(VideoMsg::EndOfStream { generation });
                 }
+                if let Some(a) = &audio {
+                    a.mark_ended(generation);
+                }
                 shared.demux_done.store(generation, Ordering::Release);
                 continue;
             }
@@ -967,6 +980,9 @@ fn demux_thread(
                 exhausted = true;
                 if let Some(v) = &video {
                     let _ = v.tx.send(VideoMsg::EndOfStream { generation });
+                }
+                if let Some(a) = &audio {
+                    a.mark_ended(generation);
                 }
                 shared.demux_done.store(generation, Ordering::Release);
                 continue;

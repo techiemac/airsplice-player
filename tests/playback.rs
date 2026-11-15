@@ -276,3 +276,16 @@ fn a_paused_file_shows_its_first_frame_when_video_starts_after_zero() {
     assert_eq!(colour(&f), "red");
     assert!(player.position() < 0.01, "still at the start: {:.3}s", player.position());
 }
+
+#[test]
+fn video_that_outlasts_its_audio_plays_to_the_end_and_finishes() {
+    // Audio stops at 2 s, video runs to 3 s. The clock keeps running after
+    // the audio ends, so the last second still plays and the file finishes
+    // (which is what moves a playlist on).
+    let Some(player) = open("audio_ends_first.mp4") else { return };
+    let shown = play_to_end(&player, Duration::from_secs(8));
+    let last = shown.last().expect("frames shown");
+    assert!(last.pts > 2.9, "stopped at {:.3}s, short of the 3 s of video", last.pts);
+    assert_eq!(last.colour, "blue");
+    assert!(shown.iter().filter(|s| s.pts > 2.0).count() >= 20, "the last second was skipped, not played");
+}

@@ -33,6 +33,10 @@ pub struct AudioState {
     /// Frames handed to the device but not yet heard (its buffer latency),
     /// from the callback's timestamps. The clock subtracts it.
     pub latency_frames: u64,
+    /// The stream's audio has all been decoded (end of file). Once the
+    /// buffer is empty the clock keeps running on the silence played, so
+    /// video that outlasts the audio still plays to its end.
+    pub ended: bool,
 }
 
 pub struct AudioOutput {
@@ -75,6 +79,7 @@ impl AudioOutput {
             muted,
             peak: [0.0; 2],
             latency_frames: 0,
+            ended: false,
         }));
 
         let build_with = |config: &StreamConfig| match format {
@@ -137,7 +142,10 @@ where
                 *slot = T::from_sample(s);
             }
             out[available..].fill(silence);
-            st.consumed_frames += (available / channels) as u64;
+            // Running dry mid-stream (a slow decoder) holds the clock so the
+            // picture waits for the sound; after the end, silence counts.
+            let played = if st.ended { out.len() } else { available };
+            st.consumed_frames += (played / channels) as u64;
             // Decay so the meter falls smoothly instead of snapping to zero.
             for (held, new) in st.peak.iter_mut().zip(peak) {
                 *held = new.max(*held * 0.85);
@@ -210,6 +218,7 @@ impl Clock {
             Clock::Audio { state, preroll, .. } => {
                 let mut st = state.lock().unwrap();
                 st.primed = !*preroll;
+                st.ended = false;
                 st.buf.clear();
                 st.consumed_frames = 0;
                 st.base_secs = secs;
