@@ -164,6 +164,7 @@ same decoder and may work.
 | Open in new tab | Cmd+click a playlist entry, or Cmd+Enter in the finder | Ctrl+click, or Ctrl+Enter |
 | Next / previous tab | Cmd+Shift+] / [, or Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Shift+] / [, or Ctrl+Tab / Ctrl+Shift+Tab |
 | Close tab | Cmd+W | Ctrl+W |
+| Go to tab 1 to 8 / last tab | Cmd+1 to Cmd+8 / Cmd+9 | Ctrl+1 to Ctrl+8 / Ctrl+9 |
 
 Opening a file from the playlist plays it in the current tab. Opening it in
 a new tab (also the + button on each entry) loads it in the background,

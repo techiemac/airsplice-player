@@ -46,6 +46,15 @@ actions!(
         CloseTab,
         NextTab,
         PreviousTab,
+        ActivateTab1,
+        ActivateTab2,
+        ActivateTab3,
+        ActivateTab4,
+        ActivateTab5,
+        ActivateTab6,
+        ActivateTab7,
+        ActivateTab8,
+        ActivateLastTab,
         PickerUp,
         PickerDown,
         PickerConfirm,
@@ -92,6 +101,16 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-[", PreviousTab, None),
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
+        // As in browsers and editors: 1 to 8 pick that tab, 9 the last one.
+        KeyBinding::new("secondary-1", ActivateTab1, None),
+        KeyBinding::new("secondary-2", ActivateTab2, None),
+        KeyBinding::new("secondary-3", ActivateTab3, None),
+        KeyBinding::new("secondary-4", ActivateTab4, None),
+        KeyBinding::new("secondary-5", ActivateTab5, None),
+        KeyBinding::new("secondary-6", ActivateTab6, None),
+        KeyBinding::new("secondary-7", ActivateTab7, None),
+        KeyBinding::new("secondary-8", ActivateTab8, None),
+        KeyBinding::new("secondary-9", ActivateLastTab, None),
         KeyBinding::new("up", PickerUp, picker),
         KeyBinding::new("down", PickerDown, picker),
         KeyBinding::new("enter", PickerConfirm, picker),
@@ -750,6 +769,19 @@ impl MediaPlayer {
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(a) = self.active {
             self.activate_tab((a + 1) % self.tabs.len(), window, cx);
+        }
+    }
+
+    /// Cmd/Ctrl+1 to 8: tab `n` (1-based), if open.
+    fn activate_tab_number(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if n >= 1 && n <= self.tabs.len() {
+            self.activate_tab(n - 1, window, cx);
+        }
+    }
+
+    fn activate_last_tab(&mut self, _: &ActivateLastTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(last) = self.tabs.len().checked_sub(1) {
+            self.activate_tab(last, window, cx);
         }
     }
 
@@ -1894,6 +1926,15 @@ impl Render for MediaPlayer {
             .on_action(cx.listener(Self::close_active_tab))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
+            .on_action(cx.listener(|this, _: &ActivateTab1, window, cx| this.activate_tab_number(1, window, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab2, window, cx| this.activate_tab_number(2, window, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab3, window, cx| this.activate_tab_number(3, window, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab4, window, cx| this.activate_tab_number(4, window, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab5, window, cx| this.activate_tab_number(5, window, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab6, window, cx| this.activate_tab_number(6, window, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab7, window, cx| this.activate_tab_number(7, window, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab8, window, cx| this.activate_tab_number(8, window, cx)))
+            .on_action(cx.listener(Self::activate_last_tab))
             .on_action(cx.listener(Self::clear_playlist))
             .on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.open_picker(PickerKind::Commands, window, cx)))
             .on_action(cx.listener(|this, _: &FileFinder, window, cx| this.open_picker(PickerKind::Files, window, cx)))
@@ -2323,13 +2364,26 @@ mod tests {
             assert_eq!(v.player.as_ref().unwrap().position(), left_at, "back where it was left");
         });
 
+        // Cmd+number picks a tab; 9 is the last one; a number past the open
+        // tabs does nothing.
+        view.update_in(cx, |v, window, cx| v.open_in_new_tab(0, window, cx));
+        cx.simulate_keystrokes("secondary-3");
+        assert_eq!(view.read_with(cx, |v, _| v.active), Some(2));
+        cx.simulate_keystrokes("secondary-1");
+        assert_eq!(view.read_with(cx, |v, _| v.active), Some(0));
+        cx.simulate_keystrokes("secondary-5");
+        assert_eq!(view.read_with(cx, |v, _| v.active), Some(0), "no fifth tab");
+        cx.simulate_keystrokes("secondary-9");
+        assert_eq!(view.read_with(cx, |v, _| v.active), Some(2), "9 is the last tab");
         // Closing the active tab shows its neighbour, paused; closing the last
-        // leaves nothing open.
-        cx.simulate_keystrokes("secondary-w");
+        // leaves nothing open. Tabs now: entries 0, 1, 0.
+        cx.simulate_keystrokes("secondary-1 secondary-w");
         view.read_with(cx, |v, _| {
-            assert_eq!((v.tabs.len(), v.active, v.current), (1, Some(0), Some(1)));
+            assert_eq!((v.tabs.len(), v.active, v.current), (2, Some(0), Some(1)), "entry 1's tab moved into first place");
             assert!(v.player.as_ref().unwrap().is_paused());
         });
+        cx.simulate_keystrokes("secondary-w");
+        assert_eq!(view.read_with(cx, |v, _| (v.tabs.len(), v.active, v.current)), (1, Some(0), Some(0)));
         cx.simulate_keystrokes("secondary-w");
         view.read_with(cx, |v, _| assert_eq!((v.tabs.len(), v.active, v.current, v.player.is_some()), (0, None, None, false)));
     }
