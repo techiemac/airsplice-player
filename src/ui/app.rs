@@ -1792,8 +1792,11 @@ impl MediaPlayer {
         if let Some(frame) = &self.frame {
             return div()
                 .id("video")
+                .debug_selector(|| "video".into())
+                .relative()
                 .flex_1()
                 .min_h_0()
+                .overflow_hidden()
                 .bg(gpui::black())
                 .on_click(cx.listener(|this, e: &ClickEvent, window, cx| {
                     if e.click_count() == 2 {
@@ -1802,7 +1805,10 @@ impl MediaPlayer {
                         this.play_pause(&PlayPause, window, cx);
                     }
                 }))
-                .child(img(frame.clone()).size_full().object_fit(ObjectFit::Contain))
+                // Absolutely placed, so the image's box is exactly the stage
+                // whatever its shape: in the flex layout a tall picture's box
+                // grew past the stage and was cropped.
+                .child(img(frame.clone()).debug_selector(|| "video-frame".into()).absolute().inset_0().size_full().object_fit(ObjectFit::Contain))
                 .into_any_element();
         }
         let content: AnyElement = match (&self.player, &self.error) {
@@ -3219,6 +3225,27 @@ mod tests {
             v.tick(window, cx);
         });
         assert!(view.read_with(vcx, |v, _| v.preloaded.is_none()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_portrait_picture_fits_inside_the_stage(cx: &mut gpui::TestAppContext) {
+        use crate::media::picture::tests::temp_dir;
+        cx.update(bind_keys);
+        let dir = temp_dir("portrait");
+        let tall = dir.join("tall.png");
+        image::RgbaImage::from_pixel(90, 160, image::Rgba([200, 50, 50, 255])).save(&tall).unwrap();
+        let (view, vcx) = cx.add_window_view({
+            let tall = tall.clone();
+            |window, cx| MediaPlayer::new(vec![tall], None, window, cx)
+        });
+        tick_until(&view, vcx, "the picture", |v| v.frame.is_some());
+        vcx.run_until_parked();
+        let stage = vcx.debug_bounds("video").expect("stage");
+        let frame = vcx.debug_bounds("video-frame").expect("frame image");
+        // The image's box is the stage; ObjectFit::Contain then fits the
+        // picture inside it (pillarboxed), instead of cropping it.
+        assert_eq!(frame, stage, "image box {frame:?} is not the stage {stage:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
