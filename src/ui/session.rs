@@ -25,6 +25,9 @@ pub struct Session {
     /// Files inside those folders that the user removed from the playlist,
     /// so a rescan does not bring them back. Sorted.
     pub removed_from_folders: Vec<PathBuf>,
+    /// Stable ids of the output displays; the picture goes full screen on
+    /// each one whenever it is connected.
+    pub output_displays: Vec<String>,
 }
 
 /// One open tab: its file and where it was left.
@@ -49,6 +52,7 @@ impl Default for Session {
             active_tab: None,
             folders: Vec::new(),
             removed_from_folders: Vec::new(),
+            output_displays: Vec::new(),
         }
     }
 }
@@ -175,6 +179,7 @@ mod tests {
             active_tab: Some(0),
             folders: vec![dir.clone()],
             removed_from_folders: vec![track],
+            output_displays: vec!["6f1c-display".into(), "a07e-display".into()],
         };
         store.save(&session).unwrap();
         assert_eq!(store.load(), session);

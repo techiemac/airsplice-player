@@ -16,6 +16,9 @@ the Raspberry Pi 5. The Windows build has not been tested yet.
   into them later join the playlist, deleted ones leave it
 - Tabs: open files in background tabs, each loaded and paused on its first
   frame, then cut between them instantly
+- External outputs: the picture full screen on any number of displays,
+  including the one the controls are on. The choice is remembered, and each
+  output comes back by itself when its display is reconnected
 - Command palette and fuzzy file finder, keyboard-first controls
 - Hardware media keys and the system Now Playing view (macOS Control
   Center, Windows media overlay, Linux MPRIS)
@@ -157,6 +160,8 @@ same decoder and may work.
 | Previous / next track | P / N, Cmd+Left / Cmd+Right | P / N, Ctrl+Left / Ctrl+Right |
 | Repeat off / all / one | R | R |
 | Full screen | F, or double-click the video | F, or double-click the video |
+| Outputs (turn each display on or off) | Settings, or Cmd+Shift+F, or the monitor button in the status bar | Settings, or Ctrl+Shift+F, or the monitor button |
+| Settings | Cmd+, the gear in the status bar, or the app menu | Ctrl+, or the gear in the status bar |
 | Open files | Cmd+O | Ctrl+O |
 | Command palette | Cmd+Shift+P | Ctrl+Shift+P |
 | Find in playlist | Cmd+P | Ctrl+P |

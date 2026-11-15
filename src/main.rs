@@ -4,7 +4,7 @@ use gpui::{
     App, Application, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*,
     px, size,
 };
-use airsplice_player::ui::app::{self, MediaPlayer, OpenFiles, Quit};
+use airsplice_player::ui::app::{self, MediaPlayer, OpenFiles, OpenSettings, Quit};
 use airsplice_player::ui::icons::Assets;
 use airsplice_player::ui::session::SessionStore;
 
@@ -17,7 +17,10 @@ fn main() {
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus(vec![
-            Menu { name: "airsplice-player".into(), items: vec![MenuItem::action("Quit", Quit)] },
+            Menu {
+                name: "airsplice-player".into(),
+                items: vec![MenuItem::action("Settings…", OpenSettings), MenuItem::separator(), MenuItem::action("Quit", Quit)],
+            },
             Menu { name: "File".into(), items: vec![MenuItem::action("Open…", OpenFiles)] },
         ]);
 
@@ -48,7 +51,13 @@ fn main() {
             )
             .expect("failed to open the main window");
         let _ = window;
-        cx.on_window_closed(|cx| cx.quit()).detach();
+        // Closing the main window quits; closing the external output does not.
+        cx.on_window_closed(|cx| {
+            if !cx.windows().iter().any(|w| w.downcast::<MediaPlayer>().is_some()) {
+                cx.quit();
+            }
+        })
+        .detach();
         cx.activate(true);
     });
 }

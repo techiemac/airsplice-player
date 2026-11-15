@@ -25,6 +25,9 @@ pub enum Icon {
     Info,
     Search,
     ChevronRight,
+    Display,
+    Settings,
+    Check,
 }
 
 impl Icon {
@@ -52,6 +55,9 @@ impl Icon {
             Icon::Info => "info",
             Icon::Search => "search",
             Icon::ChevronRight => "chevron-right",
+            Icon::Display => "display",
+            Icon::Settings => "settings",
+            Icon::Check => "check",
         }
     }
 
@@ -75,10 +81,13 @@ impl Icon {
             Icon::Info => r##"<circle cx="12" cy="12" r="9"/><path d="M12 16v-5M12 8h.01"/>"##,
             Icon::Search => r##"<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>"##,
             Icon::ChevronRight => r##"<path d="M9 6l6 6-6 6"/>"##,
+            Icon::Display => r##"<rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>"##,
+            Icon::Check => r##"<path d="M5 12.5l4.5 4.5L19 7"/>"##,
+            Icon::Settings => r##"<circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="6.5"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/>"##,
         }
     }
 
-    const ALL: [Icon; 18] = [
+    const ALL: [Icon; 21] = [
         Icon::Play,
         Icon::Pause,
         Icon::SkipBack,
@@ -97,6 +106,9 @@ impl Icon {
         Icon::Info,
         Icon::Search,
         Icon::ChevronRight,
+        Icon::Display,
+        Icon::Settings,
+        Icon::Check,
     ];
 }
 

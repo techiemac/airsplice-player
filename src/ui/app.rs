@@ -10,18 +10,22 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    Action, AnyElement, App, Bounds, ClickEvent, Context, ExternalPaths, FocusHandle, FontWeight, HighlightStyle,
+    Action, AnyElement, App, Bounds, ClickEvent, Context, DisplayId, ExternalPaths, FocusHandle, FontWeight, HighlightStyle,
     KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, PathPromptOptions, Pixels,
-    RenderImage, ScrollWheelEvent, SharedString, StyledText, Task, Window, actions, canvas, div, img, px, svg,
+    RenderImage, ScrollWheelEvent, SharedString, StyledText, Task, Window, WindowHandle, actions, canvas, div, img, px, svg,
 };
 
 use super::folders::{self, Folders, Scan, Stamp};
 use super::fuzzy::fuzzy_match;
 use super::icons::Icon;
 use super::os_media::{NowPlaying, OsMedia, PlayState};
+use super::output::{self, OutputView};
 use super::session::{Session, SessionStore, TabState};
 use super::theme::{Theme, mono_font};
 use crate::media::{Image, Player, Summary, probe};
+
+mod settings;
+use settings::{Output, SETTINGS_CONTEXT, Screen, SettingsScreen};
 
 actions!(
     airsplice_player,
@@ -61,6 +65,9 @@ actions!(
         PickerConfirm,
         PickerConfirmInNewTab,
         PickerDismiss,
+        OutputToDisplay,
+        StopExternalOutput,
+        OpenSettings,
     ]
 );
 
@@ -117,6 +124,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", PickerConfirm, picker),
         KeyBinding::new("secondary-enter", PickerConfirmInNewTab, picker),
         KeyBinding::new("escape", PickerDismiss, picker),
+        // F is full screen here; with Shift, full screen on another display.
+        KeyBinding::new("secondary-shift-f", OutputToDisplay, None),
+        KeyBinding::new("secondary-,", OpenSettings, None),
+        KeyBinding::new("up", PickerUp, Some(SETTINGS_CONTEXT)),
+        KeyBinding::new("down", PickerDown, Some(SETTINGS_CONTEXT)),
+        KeyBinding::new("enter", PickerConfirm, Some(SETTINGS_CONTEXT)),
+        KeyBinding::new("escape", PickerDismiss, Some(SETTINGS_CONTEXT)),
     ]);
 }
 
@@ -168,12 +182,15 @@ enum Drag {
 enum PickerKind {
     Commands,
     Files,
+    Displays,
 }
 
 struct Picker {
     kind: PickerKind,
     query: String,
     selected: usize,
+    /// For `Displays`: the displays connected when the picker opened.
+    displays: Vec<Screen>,
 }
 
 struct PickerItem {
@@ -216,6 +233,10 @@ impl Loaded {
 enum PickerTarget {
     Action(Box<dyn Action>),
     Track(usize),
+    /// Turn the output on this display on or off.
+    ToggleOutput(String),
+    /// Turn every output off.
+    NoOutput,
 }
 
 fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
@@ -233,6 +254,9 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Toggle Playlist Panel", Box::new(ToggleSidebar)),
         ("Toggle Info Panel", Box::new(ToggleInfoPanel)),
         ("Toggle Full Screen", Box::new(ToggleFullscreen)),
+        ("Outputs…", Box::new(OutputToDisplay)),
+        ("Turn Off All Outputs", Box::new(StopExternalOutput)),
+        ("Settings", Box::new(OpenSettings)),
         ("Find in Playlist", Box::new(FileFinder)),
         ("Stop", Box::new(Stop)),
         ("Close Tab", Box::new(CloseTab)),
@@ -253,6 +277,15 @@ pub struct MediaPlayer {
     active: Option<usize>,
     /// A short message about the last command (e.g. the tab limit).
     notice: Option<String>,
+    /// The output windows open now, one per display.
+    outputs: Vec<Output>,
+    /// Stable ids of the displays chosen as outputs, connected or not.
+    output_setting: Vec<String>,
+    /// Output windows asked for but not open yet.
+    outputs_opening: Vec<String>,
+    output_checked: Instant,
+    settings: Option<SettingsScreen>,
+    settings_focus: FocusHandle,
     current: Option<usize>,
     player: Option<Player>,
     ended: bool,
@@ -315,6 +348,13 @@ impl MediaPlayer {
             tabs: Vec::new(),
             active: None,
             notice: None,
+            outputs: Vec::new(),
+            output_setting: session.output_displays.clone(),
+            outputs_opening: Vec::new(),
+            // Long ago, so the first tick opens a remembered output.
+            output_checked: Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or_else(Instant::now),
+            settings: None,
+            settings_focus: cx.focus_handle(),
             current: None,
             player: None,
             ended: false,
@@ -476,6 +516,7 @@ impl MediaPlayer {
             active_tab: self.active,
             folders: self.folders.roots().to_vec(),
             removed_from_folders: self.removed_from_folders.iter().cloned().collect(),
+            output_displays: self.output_setting.clone(),
         }
     }
 
@@ -512,6 +553,7 @@ impl MediaPlayer {
         if let Some(scan) = self.folders.poll() {
             self.apply_scan(scan, window, cx);
         }
+        self.poll_output(window, cx);
         self.save_session(false);
         self.sync_os_media(window, cx);
         // Background tabs are paused; this picks up the frame each one is
@@ -1132,7 +1174,9 @@ impl MediaPlayer {
             self.close_picker(window, cx);
             return;
         }
-        self.picker = Some(Picker { kind, query: String::new(), selected: 0 });
+        let displays = if kind == PickerKind::Displays { self.screens(window, cx) } else { Vec::new() };
+        self.settings = None;
+        self.picker = Some(Picker { kind, query: String::new(), selected: 0, displays });
         window.focus(&self.picker_focus);
         cx.notify();
     }
@@ -1173,6 +1217,21 @@ impl MediaPlayer {
                     Some((m.score, PickerItem { label: name.into(), positions: m.positions, detail, target: PickerTarget::Track(ix) }))
                 })
                 .collect(),
+            // The same choices as the settings screen; each one toggles.
+            PickerKind::Displays => {
+                let none = (!self.output_setting.is_empty()).then(|| ("None".to_string(), "turn every output off".to_string(), PickerTarget::NoOutput));
+                let screens = picker.displays.iter().map(|d| {
+                    let state = if self.output_on(&d.uuid) { "on" } else { "off" };
+                    (d.label.clone(), format!("{}, {state}", self.screen_detail(d)), PickerTarget::ToggleOutput(d.uuid.clone()))
+                });
+                none.into_iter()
+                    .chain(screens)
+                    .filter_map(|(label, detail, target)| {
+                        let m = fuzzy_match(&picker.query, &label)?;
+                        Some((m.score, PickerItem { label: label.into(), positions: m.positions, detail: Some(detail.into()), target }))
+                    })
+                    .collect()
+            }
         };
         if !picker.query.is_empty() {
             items.sort_by_key(|(score, _)| -score);
@@ -1218,6 +1277,8 @@ impl MediaPlayer {
             Some(PickerTarget::Action(action)) => window.dispatch_action(action, cx),
             Some(PickerTarget::Track(ix)) if new_tab => self.open_in_new_tab(ix, window, cx),
             Some(PickerTarget::Track(ix)) => self.play_index(ix, window, cx),
+            Some(PickerTarget::ToggleOutput(uuid)) => self.toggle_output(uuid, window, cx),
+            Some(PickerTarget::NoOutput) => self.clear_outputs(window, cx),
             None => {}
         }
     }
@@ -1868,6 +1929,15 @@ impl MediaPlayer {
                     .gap(px(10.))
                     .flex_none()
                     .child(self.repeat.label())
+                    .when_some(self.output_status(), |el, status| el.child(status))
+                    .child(div().debug_selector(|| "sb-output".into()).child(icon_button("sb-output", Icon::Display, !self.output_setting.is_empty(), cx.listener(|this, _, window, cx| {
+                        this.output_to_display(&OutputToDisplay, window, cx)
+                    }))))
+                    .child(
+                        div().debug_selector(|| "sb-settings".into()).child(icon_button("sb-settings", Icon::Settings, self.settings.is_some(), cx.listener(|this, _, window, cx| {
+                            this.open_settings(&OpenSettings, window, cx)
+                        }))),
+                    )
                     .child(icon_button("sb-info", Icon::PanelRight, self.info_open, cx.listener(|this, _, window, cx| {
                         this.toggle_info(&ToggleInfoPanel, window, cx)
                     }))),
@@ -1882,6 +1952,7 @@ impl MediaPlayer {
         let placeholder = match picker.kind {
             PickerKind::Commands => "Execute a command…",
             PickerKind::Files => "Search playlist…",
+            PickerKind::Displays => "Turn an output on or off…",
         };
         let input = div()
             .h(px(40.))
@@ -1945,6 +2016,9 @@ impl MediaPlayer {
                 .inset_0()
                 .flex()
                 .justify_center()
+                // A click outside only dismisses: it does not also reach
+                // what is underneath (such as the button that opened this).
+                .occlude()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_picker(window, cx)))
                 .child(
                     div()
@@ -1985,6 +2059,7 @@ impl Render for MediaPlayer {
         }
         let immersive = window.is_fullscreen() && self.frame.is_some();
         let picker = self.render_picker(window, cx);
+        let settings = self.render_settings(window, cx);
 
         let workspace = div()
             .flex_1()
@@ -2037,6 +2112,9 @@ impl Render for MediaPlayer {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_info))
             .on_action(cx.listener(Self::toggle_fullscreen))
+            .on_action(cx.listener(Self::output_to_display))
+            .on_action(cx.listener(Self::stop_external_output))
+            .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::stop))
             .on_action(cx.listener(Self::close_active_tab))
             .on_action(cx.listener(Self::next_tab))
@@ -2069,6 +2147,7 @@ impl Render for MediaPlayer {
             .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(Theme::hover()))
             .child(player_area)
             .children(picker)
+            .children(settings)
     }
 }
 
@@ -2668,6 +2747,137 @@ mod tests {
         tick_until(&view, vcx, "c.mp4 to appear", |v| v.playlist.len() == 2);
         assert_eq!(view.read_with(vcx, |v, _| names(v)), ["a.mp4", "c.mp4"], "b.mp4 stays removed");
         let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(store.path().parent().unwrap());
+    }
+
+    fn output_windows(view: &gpui::Entity<MediaPlayer>, cx: &mut gpui::VisualTestContext) -> Vec<WindowHandle<OutputView>> {
+        view.read_with(cx, |v, _| v.outputs.iter().map(|o| o.window).collect())
+    }
+
+    /// GPUI's test platform has one display, the one the window is on.
+    fn test_display(view: &gpui::Entity<MediaPlayer>, cx: &mut gpui::VisualTestContext) -> String {
+        view.update_in(cx, |v, window, cx| v.screens(window, cx))[0].uuid.clone()
+    }
+
+    #[gpui::test]
+    fn settings_turn_outputs_on_and_off(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(vec![fixture("video_only.mp4")], None, window, cx));
+        tick_until(&view, vcx, "the first frame", |v| v.frame.is_some());
+        let display = test_display(&view, vcx);
+
+        // The display the controls are on is offered too.
+        vcx.simulate_keystrokes("secondary-,");
+        assert!(view.read_with(vcx, |v, _| v.settings.is_some()), "Cmd+, opens settings");
+        let screens = view.update_in(vcx, |v, window, cx| v.screens(window, cx));
+        assert_eq!((screens.len(), screens[0].label.as_str(), screens[0].here), (1, "Display 1", true));
+
+        // Enter turns it on: the picture goes there and follows playback.
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        let out = *output_windows(&view, vcx).first().expect("output open");
+        assert_eq!(vcx.windows().len(), 2);
+        let shows_current = |vcx: &mut gpui::VisualTestContext| {
+            let frame = view.read_with(vcx, |v, _| v.frame.clone()).unwrap();
+            let _ = out.update(vcx, |_, window, _| window.refresh());
+            vcx.run_until_parked();
+            vcx.update(|_, cx| out.read(cx).unwrap().shown().is_some_and(|s| Arc::ptr_eq(s, &frame)))
+        };
+        assert!(shows_current(vcx), "first frame");
+        let first = view.read_with(vcx, |v, _| v.frame.clone()).unwrap();
+        tick_until(&view, vcx, "a later frame", |v| v.frame.as_ref().is_some_and(|f| !Arc::ptr_eq(f, &first)));
+        assert!(shows_current(vcx), "later frame");
+        assert_eq!(view.read_with(vcx, |v, _| v.output_status()).as_deref(), Some("Output: Display 1"));
+
+        // Enter again turns it off.
+        vcx.simulate_keystrokes("enter");
+        assert_eq!(view.read_with(vcx, |v, _| (v.outputs.len(), v.output_setting.len())), (0, 0));
+        assert_eq!(vcx.windows().len(), 1, "output window closed");
+        vcx.simulate_keystrokes("escape");
+
+        // The footer menu toggles the same choices, and offers None once
+        // anything is on.
+        let menu = |view: &gpui::Entity<MediaPlayer>, vcx: &mut gpui::VisualTestContext| {
+            view.update_in(vcx, |v, window, _| v.picker_items(window).into_iter().map(|i| format!("{}: {}", i.label, i.detail.unwrap())).collect::<Vec<_>>())
+        };
+        vcx.simulate_keystrokes("secondary-shift-f");
+        let size = screens[0].size.clone();
+        assert_eq!(menu(&view, vcx), [format!("Display 1: {size}, covers this window, off")]);
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        assert_eq!(output_windows(&view, vcx).len(), 1);
+        vcx.simulate_keystrokes("secondary-shift-f");
+        assert_eq!(menu(&view, vcx), ["None: turn every output off".to_string(), format!("Display 1: {size}, covers this window, on")]);
+        vcx.simulate_keystrokes("enter");
+        assert!(output_windows(&view, vcx).is_empty(), "None turned it off");
+
+        // Several outputs; one display not connected: the connected one
+        // shows, the other is remembered and waited for.
+        view.update_in(vcx, |v, window, cx| {
+            v.toggle_output("unplugged".into(), window, cx);
+            v.toggle_output(display.clone(), window, cx);
+        });
+        vcx.run_until_parked();
+        assert_eq!(output_windows(&view, vcx).len(), 1);
+        assert_eq!(view.read_with(vcx, |v, _| v.output_status()).as_deref(), Some("Outputs: Display 1, 1 not connected"));
+        assert_eq!(view.read_with(vcx, |v, _| v.snapshot(false).output_displays), ["unplugged".to_string(), display.clone()]);
+        view.update_in(vcx, |v, window, cx| v.toggle_output(display.clone(), window, cx));
+        assert_eq!(view.read_with(vcx, |v, _| v.output_status()).as_deref(), Some("Output: display not connected"));
+
+        // An output window closed from outside counts as turning it off.
+        view.update_in(vcx, |v, window, cx| v.toggle_output(display.clone(), window, cx));
+        vcx.run_until_parked();
+        let out = output_windows(&view, vcx)[0];
+        let _ = out.update(vcx, |_, window, _| window.remove_window());
+        vcx.run_until_parked();
+        view.update_in(vcx, |v, window, cx| v.sync_output(window, cx));
+        assert_eq!(view.read_with(vcx, |v, _| (v.outputs.len(), v.output_setting.clone())), (0, vec!["unplugged".to_string()]));
+        assert!(view.read_with(vcx, |v, _| v.player.is_some()), "playback carries on");
+    }
+
+    #[gpui::test]
+    fn the_footer_gear_opens_and_closes_settings(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(Vec::new(), None, window, cx));
+        vcx.run_until_parked();
+        let gear = vcx.debug_bounds("sb-settings").expect("gear in the footer").center();
+        vcx.simulate_click(gear, gpui::Modifiers::none());
+        assert!(view.read_with(vcx, |v, _| v.settings.is_some()), "a click opens settings");
+        vcx.simulate_click(gear, gpui::Modifiers::none());
+        assert!(view.read_with(vcx, |v, _| v.settings.is_none()), "a second click closes them");
+
+        // The monitor button and its menu behave the same way.
+        let monitor = vcx.debug_bounds("sb-output").expect("monitor button in the footer").center();
+        vcx.simulate_click(monitor, gpui::Modifiers::none());
+        assert!(view.read_with(vcx, |v, _| v.picker.as_ref().is_some_and(|p| p.kind == PickerKind::Displays)));
+        vcx.simulate_click(monitor, gpui::Modifiers::none());
+        assert!(view.read_with(vcx, |v, _| v.picker.is_none()));
+    }
+
+    #[gpui::test]
+    fn the_output_display_is_remembered(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let store = SessionStore::new(media_folder("output-session").join("session.json"));
+        let (view, vcx) = cx.add_window_view({
+            let store = store.clone();
+            |window, cx| MediaPlayer::new(vec![fixture("video_only.mp4")], Some(store), window, cx)
+        });
+        let display = test_display(&view, vcx);
+        view.update_in(vcx, |v, window, cx| {
+            v.toggle_output(display.clone(), window, cx);
+            v.save_session(true);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, _| window.remove_window());
+        vcx.run_until_parked();
+
+        let (view, vcx) = cx.add_window_view({
+            let store = store.clone();
+            |window, cx| MediaPlayer::new(Vec::new(), Some(store), window, cx)
+        });
+        view.update_in(vcx, |v, window, cx| v.tick(window, cx));
+        vcx.run_until_parked();
+        assert_eq!(output_windows(&view, vcx).len(), 1, "the output reopens at launch");
         let _ = std::fs::remove_dir_all(store.path().parent().unwrap());
     }
 
