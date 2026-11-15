@@ -28,6 +28,9 @@ pub struct Session {
     /// Stable ids of the output displays; the picture goes full screen on
     /// each one whenever it is connected.
     pub output_displays: Vec<String>,
+    /// The outputs' on/off switch. On by default, so choosing a display
+    /// in the settings shows the picture there straight away.
+    pub outputs_on: bool,
 }
 
 /// One open tab: its file and where it was left.
@@ -53,6 +56,7 @@ impl Default for Session {
             folders: Vec::new(),
             removed_from_folders: Vec::new(),
             output_displays: Vec::new(),
+            outputs_on: true,
         }
     }
 }
@@ -180,6 +184,7 @@ mod tests {
             folders: vec![dir.clone()],
             removed_from_folders: vec![track],
             output_displays: vec!["6f1c-display".into(), "a07e-display".into()],
+            outputs_on: false,
         };
         store.save(&session).unwrap();
         assert_eq!(store.load(), session);

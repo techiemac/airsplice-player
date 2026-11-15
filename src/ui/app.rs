@@ -25,7 +25,7 @@ use super::theme::{Theme, mono_font};
 use crate::media::{Image, Player, Summary, probe};
 
 mod settings;
-use settings::{Output, SETTINGS_CONTEXT, Screen, SettingsScreen};
+use settings::{Output, SETTINGS_CONTEXT, SettingsScreen};
 
 actions!(
     airsplice_player,
@@ -65,8 +65,7 @@ actions!(
         PickerConfirm,
         PickerConfirmInNewTab,
         PickerDismiss,
-        OutputToDisplay,
-        StopExternalOutput,
+        ToggleOutputs,
         OpenSettings,
     ]
 );
@@ -124,8 +123,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", PickerConfirm, picker),
         KeyBinding::new("secondary-enter", PickerConfirmInNewTab, picker),
         KeyBinding::new("escape", PickerDismiss, picker),
-        // F is full screen here; with Shift, full screen on another display.
-        KeyBinding::new("secondary-shift-f", OutputToDisplay, None),
+        // F is full screen here; with Shift, the outputs on other displays.
+        KeyBinding::new("secondary-shift-f", ToggleOutputs, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("up", PickerUp, Some(SETTINGS_CONTEXT)),
         KeyBinding::new("down", PickerDown, Some(SETTINGS_CONTEXT)),
@@ -182,15 +181,12 @@ enum Drag {
 enum PickerKind {
     Commands,
     Files,
-    Displays,
 }
 
 struct Picker {
     kind: PickerKind,
     query: String,
     selected: usize,
-    /// For `Displays`: the displays connected when the picker opened.
-    displays: Vec<Screen>,
 }
 
 struct PickerItem {
@@ -233,10 +229,6 @@ impl Loaded {
 enum PickerTarget {
     Action(Box<dyn Action>),
     Track(usize),
-    /// Turn the output on this display on or off.
-    ToggleOutput(String),
-    /// Turn every output off.
-    NoOutput,
 }
 
 fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
@@ -254,8 +246,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Toggle Playlist Panel", Box::new(ToggleSidebar)),
         ("Toggle Info Panel", Box::new(ToggleInfoPanel)),
         ("Toggle Full Screen", Box::new(ToggleFullscreen)),
-        ("Outputs…", Box::new(OutputToDisplay)),
-        ("Turn Off All Outputs", Box::new(StopExternalOutput)),
+        ("Toggle Outputs", Box::new(ToggleOutputs)),
         ("Settings", Box::new(OpenSettings)),
         ("Find in Playlist", Box::new(FileFinder)),
         ("Stop", Box::new(Stop)),
@@ -281,6 +272,9 @@ pub struct MediaPlayer {
     outputs: Vec<Output>,
     /// Stable ids of the displays chosen as outputs, connected or not.
     output_setting: Vec<String>,
+    /// The outputs' on/off switch (the status bar button). Off keeps the
+    /// chosen displays for next time.
+    outputs_on: bool,
     /// Output windows asked for but not open yet.
     outputs_opening: Vec<String>,
     output_checked: Instant,
@@ -351,6 +345,7 @@ impl MediaPlayer {
             outputs: Vec::new(),
             output_setting: session.output_displays.clone(),
             outputs_opening: Vec::new(),
+            outputs_on: session.outputs_on,
             // Long ago, so the first tick opens a remembered output.
             output_checked: Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or_else(Instant::now),
             settings: None,
@@ -517,6 +512,7 @@ impl MediaPlayer {
             folders: self.folders.roots().to_vec(),
             removed_from_folders: self.removed_from_folders.iter().cloned().collect(),
             output_displays: self.output_setting.clone(),
+            outputs_on: self.outputs_on,
         }
     }
 
@@ -1174,9 +1170,8 @@ impl MediaPlayer {
             self.close_picker(window, cx);
             return;
         }
-        let displays = if kind == PickerKind::Displays { self.screens(window, cx) } else { Vec::new() };
         self.settings = None;
-        self.picker = Some(Picker { kind, query: String::new(), selected: 0, displays });
+        self.picker = Some(Picker { kind, query: String::new(), selected: 0 });
         window.focus(&self.picker_focus);
         cx.notify();
     }
@@ -1217,21 +1212,6 @@ impl MediaPlayer {
                     Some((m.score, PickerItem { label: name.into(), positions: m.positions, detail, target: PickerTarget::Track(ix) }))
                 })
                 .collect(),
-            // The same choices as the settings screen; each one toggles.
-            PickerKind::Displays => {
-                let none = (!self.output_setting.is_empty()).then(|| ("None".to_string(), "turn every output off".to_string(), PickerTarget::NoOutput));
-                let screens = picker.displays.iter().map(|d| {
-                    let state = if self.output_on(&d.uuid) { "on" } else { "off" };
-                    (d.label.clone(), format!("{}, {state}", self.screen_detail(d)), PickerTarget::ToggleOutput(d.uuid.clone()))
-                });
-                none.into_iter()
-                    .chain(screens)
-                    .filter_map(|(label, detail, target)| {
-                        let m = fuzzy_match(&picker.query, &label)?;
-                        Some((m.score, PickerItem { label: label.into(), positions: m.positions, detail: Some(detail.into()), target }))
-                    })
-                    .collect()
-            }
         };
         if !picker.query.is_empty() {
             items.sort_by_key(|(score, _)| -score);
@@ -1277,8 +1257,6 @@ impl MediaPlayer {
             Some(PickerTarget::Action(action)) => window.dispatch_action(action, cx),
             Some(PickerTarget::Track(ix)) if new_tab => self.open_in_new_tab(ix, window, cx),
             Some(PickerTarget::Track(ix)) => self.play_index(ix, window, cx),
-            Some(PickerTarget::ToggleOutput(uuid)) => self.toggle_output(uuid, window, cx),
-            Some(PickerTarget::NoOutput) => self.clear_outputs(window, cx),
             None => {}
         }
     }
@@ -1388,9 +1366,6 @@ impl MediaPlayer {
                     .gap(px(2.))
                     .child(icon_button("tb-find", Icon::Search, false, cx.listener(|this, _, window, cx| {
                         this.open_picker(PickerKind::Files, window, cx)
-                    })))
-                    .child(icon_button("tb-open", Icon::Folder, false, cx.listener(|this, _, window, cx| {
-                        this.open_files(&OpenFiles, window, cx)
                     }))),
             )
             .into_any_element()
@@ -1930,8 +1905,8 @@ impl MediaPlayer {
                     .flex_none()
                     .child(self.repeat.label())
                     .when_some(self.output_status(), |el, status| el.child(status))
-                    .child(div().debug_selector(|| "sb-output".into()).child(icon_button("sb-output", Icon::Display, !self.output_setting.is_empty(), cx.listener(|this, _, window, cx| {
-                        this.output_to_display(&OutputToDisplay, window, cx)
+                    .child(div().debug_selector(|| "sb-output".into()).child(icon_button("sb-output", Icon::Display, self.outputs_live(), cx.listener(|this, _, window, cx| {
+                        this.toggle_outputs(&ToggleOutputs, window, cx)
                     }))))
                     .child(
                         div().debug_selector(|| "sb-settings".into()).child(icon_button("sb-settings", Icon::Settings, self.settings.is_some(), cx.listener(|this, _, window, cx| {
@@ -1952,7 +1927,6 @@ impl MediaPlayer {
         let placeholder = match picker.kind {
             PickerKind::Commands => "Execute a command…",
             PickerKind::Files => "Search playlist…",
-            PickerKind::Displays => "Turn an output on or off…",
         };
         let input = div()
             .h(px(40.))
@@ -2112,8 +2086,7 @@ impl Render for MediaPlayer {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_info))
             .on_action(cx.listener(Self::toggle_fullscreen))
-            .on_action(cx.listener(Self::output_to_display))
-            .on_action(cx.listener(Self::stop_external_output))
+            .on_action(cx.listener(Self::toggle_outputs))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::stop))
             .on_action(cx.listener(Self::close_active_tab))
@@ -2766,9 +2739,14 @@ mod tests {
         tick_until(&view, vcx, "the first frame", |v| v.frame.is_some());
         let display = test_display(&view, vcx);
 
-        // The display the controls are on is offered too.
+        // With no display chosen, the switch opens the settings to pick one.
+        vcx.simulate_keystrokes("secondary-shift-f");
+        assert!(view.read_with(vcx, |v, _| v.settings.is_some()), "the switch opens settings");
+        vcx.simulate_keystrokes("escape");
         vcx.simulate_keystrokes("secondary-,");
-        assert!(view.read_with(vcx, |v, _| v.settings.is_some()), "Cmd+, opens settings");
+        assert!(view.read_with(vcx, |v, _| v.settings.is_some()), "so does Cmd+,");
+
+        // The display the controls are on is offered too.
         let screens = view.update_in(vcx, |v, window, cx| v.screens(window, cx));
         assert_eq!((screens.len(), screens[0].label.as_str(), screens[0].here), (1, "Display 1", true));
 
@@ -2795,21 +2773,22 @@ mod tests {
         assert_eq!(vcx.windows().len(), 1, "output window closed");
         vcx.simulate_keystrokes("escape");
 
-        // The footer menu toggles the same choices, and offers None once
-        // anything is on.
-        let menu = |view: &gpui::Entity<MediaPlayer>, vcx: &mut gpui::VisualTestContext| {
-            view.update_in(vcx, |v, window, _| v.picker_items(window).into_iter().map(|i| format!("{}: {}", i.label, i.detail.unwrap())).collect::<Vec<_>>())
-        };
-        vcx.simulate_keystrokes("secondary-shift-f");
-        let size = screens[0].size.clone();
-        assert_eq!(menu(&view, vcx), [format!("Display 1: {size}, covers this window, off")]);
-        vcx.simulate_keystrokes("enter");
+        // The status bar switch: off keeps the choice, on brings it back.
+        view.update_in(vcx, |v, window, cx| v.toggle_output(display.clone(), window, cx));
         vcx.run_until_parked();
         assert_eq!(output_windows(&view, vcx).len(), 1);
         vcx.simulate_keystrokes("secondary-shift-f");
-        assert_eq!(menu(&view, vcx), ["None: turn every output off".to_string(), format!("Display 1: {size}, covers this window, on")]);
-        vcx.simulate_keystrokes("enter");
-        assert!(output_windows(&view, vcx).is_empty(), "None turned it off");
+        assert!(output_windows(&view, vcx).is_empty(), "switched off");
+        view.read_with(vcx, |v, _| {
+            assert_eq!(v.output_setting, std::slice::from_ref(&display), "the choice is kept");
+            assert_eq!(v.output_status().as_deref(), Some("Outputs off"));
+            assert!(!v.outputs_live());
+        });
+        vcx.simulate_keystrokes("secondary-shift-f");
+        vcx.run_until_parked();
+        assert_eq!(output_windows(&view, vcx).len(), 1, "switched back on");
+        view.update_in(vcx, |v, window, cx| v.toggle_output(display.clone(), window, cx));
+        assert!(output_windows(&view, vcx).is_empty());
 
         // Several outputs; one display not connected: the connected one
         // shows, the other is remembered and waited for.
@@ -2846,12 +2825,23 @@ mod tests {
         vcx.simulate_click(gear, gpui::Modifiers::none());
         assert!(view.read_with(vcx, |v, _| v.settings.is_none()), "a second click closes them");
 
-        // The monitor button and its menu behave the same way.
+        // The monitor button with nothing chosen opens settings too; a
+        // second click (on the backdrop) closes them.
         let monitor = vcx.debug_bounds("sb-output").expect("monitor button in the footer").center();
         vcx.simulate_click(monitor, gpui::Modifiers::none());
-        assert!(view.read_with(vcx, |v, _| v.picker.as_ref().is_some_and(|p| p.kind == PickerKind::Displays)));
+        assert!(view.read_with(vcx, |v, _| v.settings.is_some()));
         vcx.simulate_click(monitor, gpui::Modifiers::none());
-        assert!(view.read_with(vcx, |v, _| v.picker.is_none()));
+        assert!(view.read_with(vcx, |v, _| v.settings.is_none()));
+
+        // With a display chosen it is a plain on/off switch.
+        let display = test_display(&view, vcx);
+        view.update_in(vcx, |v, window, cx| v.toggle_output(display, window, cx));
+        vcx.run_until_parked();
+        vcx.simulate_click(monitor, gpui::Modifiers::none());
+        assert!(view.read_with(vcx, |v, _| !v.outputs_on && v.outputs.is_empty() && v.settings.is_none()));
+        vcx.simulate_click(monitor, gpui::Modifiers::none());
+        vcx.run_until_parked();
+        assert!(view.read_with(vcx, |v, _| v.outputs_on && v.outputs.len() == 1));
     }
 
     #[gpui::test]
@@ -2878,6 +2868,22 @@ mod tests {
         view.update_in(vcx, |v, window, cx| v.tick(window, cx));
         vcx.run_until_parked();
         assert_eq!(output_windows(&view, vcx).len(), 1, "the output reopens at launch");
+
+        // Switched off when the app closed: stays off, choice kept.
+        view.update_in(vcx, |v, window, cx| {
+            v.toggle_outputs(&ToggleOutputs, window, cx);
+            v.save_session(true);
+        });
+        vcx.update(|window, _| window.remove_window());
+        vcx.run_until_parked();
+        let (view, vcx) = cx.add_window_view({
+            let store = store.clone();
+            |window, cx| MediaPlayer::new(Vec::new(), Some(store), window, cx)
+        });
+        view.update_in(vcx, |v, window, cx| v.tick(window, cx));
+        vcx.run_until_parked();
+        assert!(output_windows(&view, vcx).is_empty());
+        assert_eq!(view.read_with(vcx, |v, _| v.output_status()).as_deref(), Some("Outputs off"));
         let _ = std::fs::remove_dir_all(store.path().parent().unwrap());
     }
 

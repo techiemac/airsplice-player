@@ -15,7 +15,6 @@ pub enum Icon {
     RepeatOne,
     Volume,
     VolumeMuted,
-    Folder,
     Plus,
     Close,
     Music,
@@ -45,7 +44,6 @@ impl Icon {
             Icon::RepeatOne => "repeat-one",
             Icon::Volume => "volume",
             Icon::VolumeMuted => "volume-muted",
-            Icon::Folder => "folder",
             Icon::Plus => "plus",
             Icon::Close => "close",
             Icon::Music => "music",
@@ -71,7 +69,6 @@ impl Icon {
             Icon::RepeatOne => r##"<path d="M17 2l4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/><path d="M11 10l1.5-1v6"/>"##,
             Icon::Volume => r##"<path d="M11 5L6 9H2v6h4l5 4z" fill="#fff"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/>"##,
             Icon::VolumeMuted => r##"<path d="M11 5L6 9H2v6h4l5 4z" fill="#fff"/><path d="M22 9l-6 6"/><path d="M16 9l6 6"/>"##,
-            Icon::Folder => r##"<path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4.6l2 2h8.4A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"/>"##,
             Icon::Plus => r##"<path d="M12 5v14M5 12h14"/>"##,
             Icon::Close => r##"<path d="M6 6l12 12M18 6L6 18"/>"##,
             Icon::Music => r##"<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>"##,
@@ -87,7 +84,7 @@ impl Icon {
         }
     }
 
-    const ALL: [Icon; 21] = [
+    const ALL: [Icon; 20] = [
         Icon::Play,
         Icon::Pause,
         Icon::SkipBack,
@@ -96,7 +93,6 @@ impl Icon {
         Icon::RepeatOne,
         Icon::Volume,
         Icon::VolumeMuted,
-        Icon::Folder,
         Icon::Plus,
         Icon::Close,
         Icon::Music,

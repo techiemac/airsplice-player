@@ -1,7 +1,8 @@
 //! The settings screen, and the external outputs it configures.
 //!
-//! Outputs are chosen per display, by each display's stable id, and any
-//! number can be on at once, all showing the same picture. While a chosen
+//! Outputs are chosen per display in the settings, by each display's
+//! stable id, and any number can be on at once, all showing the same
+//! picture. The status bar button switches them all on and off. While a chosen
 //! display is connected the picture is full screen on it; when it is
 //! unplugged its window closes, and it comes back when the display does,
 //! without anyone touching the controls.
@@ -94,8 +95,23 @@ impl MediaPlayer {
         cx.notify();
     }
 
-    pub(super) fn clear_outputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.output_setting.clear();
+    /// Whether any output is meant to be showing: switched on, with at
+    /// least one display chosen.
+    pub(super) fn outputs_live(&self) -> bool {
+        self.outputs_on && !self.output_setting.is_empty()
+    }
+
+    /// The status bar button: switch the outputs on or off, keeping the
+    /// chosen displays. With none chosen yet, it opens the settings to
+    /// choose some.
+    pub(super) fn toggle_outputs(&mut self, _: &ToggleOutputs, window: &mut Window, cx: &mut Context<Self>) {
+        if self.output_setting.is_empty() {
+            if self.settings.is_none() {
+                self.open_settings(&OpenSettings, window, cx);
+            }
+            return;
+        }
+        self.outputs_on = !self.outputs_on;
         self.notice = None;
         self.sync_output(window, cx);
         cx.notify();
@@ -120,14 +136,15 @@ impl MediaPlayer {
         let connected: Vec<&str> = screens.iter().map(|s| s.uuid.as_str()).collect();
         // Opening counts as open, so a slow open is not started twice.
         let open: Vec<&str> = self.outputs.iter().map(|o| o.uuid.as_str()).chain(self.outputs_opening.iter().map(String::as_str)).collect();
-        let (to_open, to_close) = plan(&self.output_setting, &connected, &open);
+        let chosen: &[String] = if self.outputs_on { &self.output_setting } else { &[] };
+        let (to_open, to_close) = plan(chosen, &connected, &open);
         for uuid in to_close {
             let Some(ix) = self.outputs.iter().position(|o| o.uuid == uuid) else { continue };
             let out = self.outputs.remove(ix);
             let _ = out.window.update(cx, |_, window, _| window.remove_window());
             // Still chosen, so its display went away. Closing beats letting
             // the OS move the window onto another display.
-            if self.output_on(&out.uuid) {
+            if self.outputs_on && self.output_on(&out.uuid) {
                 self.notice = Some(format!("{} was disconnected; its output comes back when it is reconnected", out.label));
             }
             cx.notify();
@@ -150,8 +167,8 @@ impl MediaPlayer {
             me.update(cx, |this, cx| {
                 this.outputs_opening.retain(|u| *u != uuid);
                 match opened {
-                    Ok(handle) if this.output_on(&uuid) => this.outputs.push(Output { window: handle, uuid, label }),
-                    // Turned off while it opened.
+                    Ok(handle) if this.outputs_on && this.output_on(&uuid) => this.outputs.push(Output { window: handle, uuid, label }),
+                    // Switched off while it opened.
                     Ok(handle) => {
                         let _ = handle.update(cx, |_, window, _| window.remove_window());
                     }
@@ -180,6 +197,9 @@ impl MediaPlayer {
         if self.output_setting.is_empty() {
             return None;
         }
+        if !self.outputs_on {
+            return Some("Outputs off".into());
+        }
         let mut parts: Vec<String> = self.outputs.iter().map(|o| o.label.clone()).collect();
         let shown = self.outputs.len() + self.outputs_opening.len();
         let missing = self.output_setting.len().saturating_sub(shown);
@@ -191,14 +211,6 @@ impl MediaPlayer {
         }
         let noun = if self.output_setting.len() > 1 { "Outputs" } else { "Output" };
         Some(format!("{noun}: {}", parts.join(", ")))
-    }
-
-    pub(super) fn output_to_display(&mut self, _: &OutputToDisplay, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_picker(PickerKind::Displays, window, cx);
-    }
-
-    pub(super) fn stop_external_output(&mut self, _: &StopExternalOutput, window: &mut Window, cx: &mut Context<Self>) {
-        self.clear_outputs(window, cx);
     }
 
     /// The detail shown next to a display in the settings and footer menu.
@@ -326,9 +338,19 @@ impl MediaPlayer {
                             .pb(px(6.))
                             .text_xs()
                             .text_color(Theme::text_muted())
-                            .child("Show the picture full screen on these displays, as many as you like. None ticked: no output."),
+                            .child("Show the picture full screen on these displays, as many as you like. The monitor button in the status bar switches them on and off."),
                     )
-                    .children(choices),
+                    .children(choices)
+                    .when(!self.outputs_on && !self.output_setting.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .px(px(8.))
+                                .pt(px(4.))
+                                .text_xs()
+                                .text_color(Theme::warning())
+                                .child(format!("Outputs are switched off. Turn them on with the monitor button or {}.", window.keystroke_text_for(&ToggleOutputs))),
+                        )
+                    }),
             )
             .child(
                 div()
