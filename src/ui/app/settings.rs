@@ -11,6 +11,28 @@ use super::*;
 
 pub(super) const SETTINGS_CONTEXT: &str = "Settings";
 
+/// The still durations the settings step through, in seconds; 0 keeps a
+/// still up until skipped.
+pub(super) const STILL_PRESETS: &[u32] = &[0, 1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300];
+
+/// The preset `by` steps from `secs` (which need not be a preset),
+/// stopping at the ends, or wrapping when `wrap`.
+pub(super) fn step_still(secs: u32, by: isize, wrap: bool) -> u32 {
+    let at = STILL_PRESETS.iter().position(|&p| p >= secs).unwrap_or(STILL_PRESETS.len() - 1) as isize;
+    // A value between presets steps to its neighbours.
+    let at = if STILL_PRESETS[at as usize] > secs && by > 0 { at - 1 } else { at };
+    let len = STILL_PRESETS.len() as isize;
+    let next = if wrap { (at + by).rem_euclid(len) } else { (at + by).clamp(0, len - 1) };
+    STILL_PRESETS[next as usize]
+}
+
+fn still_label(secs: u32) -> String {
+    if secs == 0 { "Until skipped".into() } else { format!("{secs} s") }
+}
+
+/// Settings rows: upscaling, stills, then one per display.
+const FIRST_SCREEN_ROW: usize = 2;
+
 /// How often the connected displays are checked, so an output display
 /// plugged in or out is noticed.
 const DISPLAY_POLL: Duration = Duration::from_millis(500);
@@ -253,9 +275,8 @@ impl MediaPlayer {
         cx.notify();
     }
 
-    /// Settings rows: the upscaling switch, then one per display.
     fn settings_move(&mut self, by: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let len = 1 + self.screens(window, cx).len() as isize;
+        let len = (FIRST_SCREEN_ROW + self.screens(window, cx).len()) as isize;
         if let Some(s) = self.settings.as_mut()
             && len > 0
         {
@@ -268,21 +289,32 @@ impl MediaPlayer {
         if let Some(s) = self.settings.as_mut() {
             s.selected = ix;
         }
-        if ix == 0 {
-            // Nothing to switch on without a GPU that can do it.
-            if upscale::available().is_some() {
-                self.set_upscaling(!self.upscaling, cx);
+        match ix {
+            0 => {
+                // Nothing to switch on without a GPU that can do it.
+                if upscale::available().is_some() {
+                    self.set_upscaling(!self.upscaling, cx);
+                }
             }
-            return;
+            1 => self.set_still_seconds(step_still(self.still_seconds, 1, true), cx),
+            _ => {
+                let Some(screen) = self.screens(window, cx).into_iter().nth(ix - FIRST_SCREEN_ROW) else { return };
+                self.toggle_output(screen.uuid, window, cx);
+            }
         }
-        let Some(screen) = self.screens(window, cx).into_iter().nth(ix - 1) else { return };
-        self.toggle_output(screen.uuid, window, cx);
+    }
+
+    /// Left and Right: change the still duration when that row is selected.
+    fn settings_adjust(&mut self, by: isize, cx: &mut Context<Self>) {
+        if self.settings.as_ref().is_some_and(|s| s.selected == 1) {
+            self.set_still_seconds(step_still(self.still_seconds, by, false), cx);
+        }
     }
 
     pub(super) fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let settings = self.settings.as_ref()?;
         let screens = self.screens(window, cx);
-        let selected = settings.selected.min(screens.len());
+        let selected = settings.selected.min(screens.len() + FIRST_SCREEN_ROW - 1);
         let checkbox = |on: bool, enabled: bool| {
             div()
                 .size(px(14.))
@@ -319,8 +351,29 @@ impl MediaPlayer {
         };
         let upscale_now = self.upscaling.then(|| self.player.as_ref().map(|p| Self::upscale_label(&p.upscale_status()))).flatten();
 
+        // Stills: row 1.
+        let secs = self.still_seconds;
+        let still_row = div()
+            .id("still-choice")
+            .h(px(32.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .rounded(px(4.))
+            .text_sm()
+            .when(selected == 1, |el| el.bg(Theme::selected()))
+            .child(div().flex_1().min_w_0().truncate().text_color(Theme::text()).child("Show stills for"))
+            .child(icon_button("still-less", Icon::Minus, false, cx.listener(move |this, _, _, cx| {
+                this.set_still_seconds(step_still(secs, -1, false), cx)
+            })))
+            .child(div().w(px(96.)).flex_none().text_center().text_color(Theme::text()).child(still_label(secs)))
+            .child(icon_button("still-more", Icon::Plus, false, cx.listener(move |this, _, _, cx| {
+                this.set_still_seconds(step_still(secs, 1, false), cx)
+            })));
+
         let row = |ix: usize, screen: &Screen| {
-            let ix = ix + 1;
+            let ix = ix + FIRST_SCREEN_ROW;
             let on = self.output_on(&screen.uuid);
             div()
                 .id(("output-choice", ix))
@@ -352,6 +405,8 @@ impl MediaPlayer {
                 this.settings_toggle(ix, window, cx)
             }))
             .on_action(cx.listener(|this, _: &PickerDismiss, window, cx| this.close_settings(window, cx)))
+            .on_action(cx.listener(|this, _: &SettingsLess, _, cx| this.settings_adjust(-1, cx)))
+            .on_action(cx.listener(|this, _: &SettingsMore, _, cx| this.settings_adjust(1, cx)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .occlude()
             .mt(px(72.))
@@ -387,6 +442,16 @@ impl MediaPlayer {
                     .child(upscale_row)
                     .child(div().px(px(8.)).text_xs().text_color(Theme::text_muted()).child(upscale_detail))
                     .when_some(upscale_now, |el, now| el.child(div().px(px(8.)).text_xs().text_color(Theme::text_placeholder()).child(format!("Now: {now}")))),
+            )
+            .child(
+                div()
+                    .px(px(12.))
+                    .pt(px(12.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(Theme::text()).child("Stills"))
+                    .child(still_row),
             )
             .child(
                 div()
@@ -438,6 +503,16 @@ mod tests {
 
     fn chosen(uuids: &[&str]) -> Vec<String> {
         uuids.iter().map(|u| u.to_string()).collect()
+    }
+
+    #[test]
+    fn still_durations_step_through_the_presets() {
+        assert_eq!((step_still(10, 1, false), step_still(10, -1, false)), (15, 5));
+        assert_eq!(step_still(0, -1, false), 0, "stops at until skipped");
+        assert_eq!(step_still(300, 1, false), 300, "stops at the longest");
+        assert_eq!((step_still(300, 1, true), step_still(0, -1, true)), (0, 300), "Enter wraps");
+        assert_eq!((step_still(12, 1, false), step_still(12, -1, false)), (15, 10), "a value between presets");
+        assert_eq!((still_label(0), still_label(45)), ("Until skipped".to_string(), "45 s".to_string()));
     }
 
     #[test]

@@ -310,6 +310,9 @@ pub struct Player {
     preroll_since: std::cell::Cell<std::time::Instant>,
     /// Set when playing a still image or an animated GIF.
     picture: Option<Outline>,
+    /// How long a still shows before it counts as finished; `None` keeps
+    /// it up until the user moves on.
+    still_secs: Option<f64>,
 }
 
 impl Shared {
@@ -460,6 +463,7 @@ impl Player {
             last_shown: Default::default(),
             preroll_since: std::cell::Cell::new(std::time::Instant::now()),
             picture: None,
+            still_secs: None,
         })
     }
 
@@ -488,12 +492,23 @@ impl Player {
             last_shown: Default::default(),
             preroll_since: std::cell::Cell::new(std::time::Instant::now()),
             picture: Some(outline),
+            still_secs: None,
         })
     }
 
-    pub fn position(&self) -> f64 {
-        // A still has no timeline.
+    /// How long a still image shows (`None`: until the user moves on). A
+    /// still with a duration has a timeline like a clip of that length.
+    /// No effect on anything but stills.
+    pub fn set_still_duration(&mut self, secs: Option<f64>) {
         if self.picture.as_ref().is_some_and(Outline::is_still) {
+            self.still_secs = secs.filter(|s| *s > 0.0);
+            self.info.duration = self.still_secs;
+        }
+    }
+
+    pub fn position(&self) -> f64 {
+        // A still without a duration has no timeline.
+        if self.picture.as_ref().is_some_and(Outline::is_still) && self.still_secs.is_none() {
             return 0.0;
         }
         let pos = self.clock.now();
@@ -641,8 +656,8 @@ impl Player {
 
     pub fn is_finished(&self) -> bool {
         match &self.picture {
-            // A still stays up until the user moves on.
-            Some(p) if p.is_still() => return false,
+            // A still shows for its set duration, or until the user moves on.
+            Some(p) if p.is_still() => return self.still_secs.is_some_and(|d| self.clock.now() >= d - SAME_TIME),
             // An animation's last frame shows for its full delay.
             Some(p) if self.clock.now() < p.duration.unwrap_or(0.0) - SAME_TIME => return false,
             _ => {}
@@ -1323,6 +1338,22 @@ mod tests {
             thread::sleep(StdDuration::from_millis(5));
         }
         assert!(probe(&path).is_ok_and(|s| s.has_video && s.duration.is_none()));
+
+        // Given a duration, a still is a clip of that length: its clock runs
+        // and it finishes, so a playlist moves on.
+        let mut p = Player::open(&path, 0.0, true).unwrap();
+        p.set_still_duration(Some(0.3));
+        assert_eq!(p.info.duration, Some(0.3));
+        let _ = next_frame(&p, 2000);
+        let started = std::time::Instant::now();
+        while !p.is_finished() {
+            assert!(started.elapsed() < StdDuration::from_secs(3), "never finished");
+            thread::sleep(StdDuration::from_millis(5));
+        }
+        assert!(p.position() > 0.25, "finished at {}", p.position());
+        // Back to "until skipped".
+        p.set_still_duration(None);
+        assert_eq!((p.info.duration, p.position(), p.is_finished()), (None, 0.0, false));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -95,8 +95,10 @@ PCM, ADPCM, on every platform. HE-AAC is not supported yet.
 When a file's video codec is not supported, its audio still plays and the
 player says why. The info panel (Cmd/Ctrl+R) shows which decoder is in use.
 
-**Images:** PNG, JPEG and WebP show as stills, with no timeline, until you
-move on. Animated GIF and WebP play like video: they have a duration, play
+**Images:** PNG, JPEG and WebP are stills. Each shows for the time set in
+the settings (10 s by default, or until skipped), with a seek bar like a
+clip of that length, then the playlist moves on. Animated GIF and WebP play
+like video: they have a duration, play
 and pause, and scrub on the seek bar, with each frame shown for its delay
 (10 ms or less counts as 100 ms, as in browsers). An animation plays once;
 repeat one loops it. Decoded frames are kept for instant scrubbing, so
@@ -218,6 +220,7 @@ same decoder and may work.
 | Repeat off / all / one | R | R |
 | Full screen | F, or double-click the video | F, or double-click the video |
 | Upscaling on / off | Settings | Settings |
+| How long stills show | Settings | Settings |
 | Choose output displays | Settings | Settings |
 | Outputs on / off | Cmd+Shift+F, or the monitor button in the status bar | Ctrl+Shift+F, or the monitor button |
 | Settings | Cmd+, the gear in the status bar, or the app menu | Ctrl+, or the gear in the status bar |

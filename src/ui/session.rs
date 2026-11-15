@@ -33,6 +33,9 @@ pub struct Session {
     pub outputs_on: bool,
     /// Upscale video on the GPU to the size it is shown at.
     pub upscaling: bool,
+    /// Seconds a still image shows before the playlist moves on; 0 keeps
+    /// it up until skipped.
+    pub still_seconds: u32,
 }
 
 /// One open tab: its file and where it was left.
@@ -60,6 +63,7 @@ impl Default for Session {
             output_displays: Vec::new(),
             outputs_on: true,
             upscaling: false,
+            still_seconds: 10,
         }
     }
 }
@@ -189,6 +193,7 @@ mod tests {
             output_displays: vec!["6f1c-display".into(), "a07e-display".into()],
             outputs_on: false,
             upscaling: true,
+            still_seconds: 45,
         };
         store.save(&session).unwrap();
         assert_eq!(store.load(), session);

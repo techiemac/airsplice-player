@@ -68,6 +68,8 @@ actions!(
         PickerDismiss,
         ToggleOutputs,
         OpenSettings,
+        SettingsLess,
+        SettingsMore,
     ]
 );
 
@@ -131,6 +133,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("down", PickerDown, Some(SETTINGS_CONTEXT)),
         KeyBinding::new("enter", PickerConfirm, Some(SETTINGS_CONTEXT)),
         KeyBinding::new("escape", PickerDismiss, Some(SETTINGS_CONTEXT)),
+        KeyBinding::new("left", SettingsLess, Some(SETTINGS_CONTEXT)),
+        KeyBinding::new("right", SettingsMore, Some(SETTINGS_CONTEXT)),
     ]);
 }
 
@@ -281,6 +285,9 @@ pub struct MediaPlayer {
     outputs_px: (u32, u32),
     /// Upscale video on the GPU to the size it is shown at (a setting).
     upscaling: bool,
+    /// Seconds a still shows before the playlist moves on; 0: until
+    /// skipped (a setting).
+    still_seconds: u32,
     /// The display size the paused frame was last refreshed for, and when
     /// the size last changed: a paused frame is decoded again once the
     /// size settles, so upscaling follows resizes and the switch.
@@ -360,6 +367,7 @@ impl MediaPlayer {
             outputs_on: session.outputs_on,
             outputs_px: (0, 0),
             upscaling: session.upscaling,
+            still_seconds: session.still_seconds,
             limit: (0, 0),
             limit_changed: Instant::now(),
             refreshed_for: None,
@@ -532,6 +540,7 @@ impl MediaPlayer {
             output_displays: self.output_setting.clone(),
             outputs_on: self.outputs_on,
             upscaling: self.upscaling,
+            still_seconds: self.still_seconds,
         }
     }
 
@@ -687,6 +696,7 @@ impl MediaPlayer {
         match Player::open(path, self.volume, self.muted) {
             Ok(mut player) => {
                 player.set_upscaling(self.upscaling);
+                player.set_still_duration(self.still_duration());
                 let cover = player.info.cover.as_ref().map(image_to_render);
                 let error = player.info.video_unsupported.clone().map(|why| format!("Playing audio only: {why}"));
                 if !autoplay {
@@ -983,6 +993,21 @@ impl MediaPlayer {
                 Some(c) if c > ix => self.tabs[t].track = Some(c - 1),
                 _ => {}
             }
+        }
+        cx.notify();
+    }
+
+    fn still_duration(&self) -> Option<f64> {
+        (self.still_seconds > 0).then_some(self.still_seconds as f64)
+    }
+
+    /// Set how long stills show, for every open file and those opened later.
+    fn set_still_seconds(&mut self, secs: u32, cx: &mut Context<Self>) {
+        self.still_seconds = secs;
+        let duration = self.still_duration();
+        let parked = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut().and_then(|l| l.player.as_mut()));
+        for p in self.player.iter_mut().chain(parked) {
+            p.set_still_duration(duration);
         }
         cx.notify();
     }
@@ -2837,9 +2862,9 @@ mod tests {
         let screens = view.update_in(vcx, |v, window, cx| v.screens(window, cx));
         assert_eq!((screens.len(), screens[0].label.as_str(), screens[0].here), (1, "Display 1", true));
 
-        // Down to it (the upscaling switch is first), Enter turns it on: the
+        // Down to it (past upscaling and stills), Enter turns it on: the
         // picture goes there and follows playback.
-        vcx.simulate_keystrokes("down enter");
+        vcx.simulate_keystrokes("down down enter");
         vcx.run_until_parked();
         let out = *output_windows(&view, vcx).first().expect("output open");
         assert_eq!(vcx.windows().len(), 2);
@@ -2969,6 +2994,44 @@ mod tests {
             view.update_in(vcx, |v, _, cx| v.seek_to(target, cx));
             tick_until(&view, vcx, &format!("frame {frame} at {target}s"), shows(frame));
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn stills_show_for_the_set_time_then_the_playlist_moves_on(cx: &mut gpui::TestAppContext) {
+        use crate::media::picture::tests::temp_dir;
+        cx.update(bind_keys);
+        let dir = temp_dir("still-playlist");
+        let still = dir.join("slide.png");
+        image::RgbaImage::from_pixel(16, 9, image::Rgba([90, 90, 90, 255])).save(&still).unwrap();
+        let (view, vcx) = cx.add_window_view({
+            let files = vec![still.clone(), fixture("video_only.mp4")];
+            |window, cx| MediaPlayer::new(files, None, window, cx)
+        });
+        tick_until(&view, vcx, "the still on screen", |v| v.frame.is_some());
+        assert_eq!(view.read_with(vcx, |v, _| (v.still_seconds, v.player.as_ref().unwrap().info.duration)), (10, Some(10.0)), "10 s by default");
+
+        // Settings: the stills row is second; Left and Right step, Enter
+        // steps up and wraps. Saved, and applied to the still on screen.
+        vcx.simulate_keystrokes("secondary-, down right");
+        assert_eq!(view.read_with(vcx, |v, _| v.still_seconds), 15);
+        vcx.simulate_keystrokes("left left");
+        assert_eq!(view.read_with(vcx, |v, _| (v.still_seconds, v.snapshot(false).still_seconds)), (5, 5));
+        vcx.simulate_keystrokes("enter escape");
+        assert_eq!(view.read_with(vcx, |v, _| (v.still_seconds, v.player.as_ref().unwrap().info.duration)), (10, Some(10.0)));
+
+        // At 1 s the playlist moves on to the video by itself.
+        view.update_in(vcx, |v, _, cx| v.set_still_seconds(1, cx));
+        tick_until(&view, vcx, "the playlist to move past the still", |v| v.current == Some(1));
+        assert_eq!(view.read_with(vcx, |v, _| v.player.as_ref().unwrap().info.path.clone()), fixture("video_only.mp4"));
+
+        // Until skipped: the still stays up.
+        view.update_in(vcx, |v, window, cx| {
+            v.set_still_seconds(0, cx);
+            v.play_index(0, window, cx);
+        });
+        tick_until(&view, vcx, "the still again", |v| v.frame.is_some() && v.current == Some(0));
+        assert_eq!(view.read_with(vcx, |v, _| v.player.as_ref().unwrap().info.duration), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
