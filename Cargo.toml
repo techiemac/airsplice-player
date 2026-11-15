@@ -23,7 +23,7 @@ rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8",
 openh264 = "0.9.10"
 openh264-sys2 = "0.9.10"
 # Cover art decoding and the frame type GPUI renders.
-image = { version = "0.25.1", default-features = false, features = ["png", "jpeg", "gif"] }
+image = { version = "0.25.1", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # Reads GIF frame delays without decoding pixels, to time animations.
 gif = "0.14"
 rayon = "1.10"

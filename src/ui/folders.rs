@@ -243,11 +243,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("airsplice-player-list-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        for name in ["b.mp4", "a.MKV", "notes.txt", "sub/c.mp3"] {
+        for name in ["b.mp4", "a.MKV", "notes.txt", "sub/c.mp3", "d.gif", "e.webp", "f.JPG"] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
         let names: Vec<_> = list(&dir).unwrap().into_iter().map(|(p, _)| p.strip_prefix(&dir).unwrap().to_path_buf()).collect();
-        assert_eq!(names, [PathBuf::from("a.MKV"), "b.mp4".into(), "sub/c.mp3".into()]);
+        assert_eq!(names, [PathBuf::from("a.MKV"), "b.mp4".into(), "d.gif".into(), "e.webp".into(), "f.JPG".into(), "sub/c.mp3".into()]);
         assert!(list(&dir.join("missing")).is_none(), "a missing folder is not an empty one");
         let _ = std::fs::remove_dir_all(dir);
     }

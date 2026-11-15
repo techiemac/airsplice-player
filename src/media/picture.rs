@@ -1,16 +1,16 @@
-//! Still images (PNG, JPEG) and animated GIFs, played through the same
-//! frame queue as video: a still is one frame with no timeline, an
-//! animated GIF a clip whose frames start at their GIF delays, so it plays,
-//! pauses and scrubs like a video.
+//! Still images (PNG, JPEG, WebP) and animated GIF and WebP, played
+//! through the same frame queue as video: a still is one frame with no
+//! timeline, an animation a clip whose frames start at their delays, so it
+//! plays, pauses and scrubs like a video.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 use image::AnimationDecoder as _;
 
-pub const EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif"];
+pub const EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 
 /// Decoded frames are kept for instant scrubbing; beyond this an animation
 /// is refused rather than exhausting memory.
@@ -37,15 +37,80 @@ impl Outline {
     }
 }
 
-/// How long a GIF frame shows, from its delay in hundredths of a second.
-/// Browsers show delays under 20 ms as 100 ms, and GIFs are made to rely
-/// on it.
-fn delay_secs(centis: u16) -> f64 {
-    if centis < 2 { 0.1 } else { centis as f64 / 100.0 }
+/// How long an animation frame shows, from its delay in milliseconds.
+/// Browsers show delays of 10 ms or less as 100 ms, and animations are
+/// made to rely on it.
+fn delay_secs(ms: u32) -> f64 {
+    if ms <= 10 { 0.1 } else { ms as f64 / 1000.0 }
+}
+
+fn has_extension(path: &Path, ext: &str) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
 
 fn is_gif(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("gif"))
+    has_extension(path, "gif")
+}
+
+fn is_webp(path: &Path) -> bool {
+    has_extension(path, "webp")
+}
+
+/// Frame starts and size from an animation's delays, refusing ones too big
+/// to keep decoded; one frame makes a still.
+fn timeline(format: &'static str, width: u32, height: u32, delays_ms: &[u32]) -> Result<Outline> {
+    if delays_ms.len() <= 1 {
+        return Ok(Outline { format, width, height, starts: vec![0.0], duration: None });
+    }
+    let bytes = delays_ms.len() as u64 * width as u64 * height as u64 * 4;
+    if bytes > MAX_DECODED_BYTES {
+        bail!("the {format} is too large to play ({} frames at {width}x{height})", delays_ms.len());
+    }
+    let mut starts = Vec::with_capacity(delays_ms.len());
+    let mut at = 0.0;
+    for &ms in delays_ms {
+        starts.push(at);
+        at += delay_secs(ms);
+    }
+    Ok(Outline { format, width, height, starts, duration: Some(at) })
+}
+
+/// An animated WebP's canvas size and frame durations, read from its RIFF
+/// chunks (VP8X and ANMF) without decoding; `None` for a still WebP.
+fn webp_animation(file: &mut BufReader<File>) -> Result<Option<(u32, u32, Vec<u32>)>> {
+    let u24 = |b: &[u8]| u32::from(b[0]) | u32::from(b[1]) << 8 | u32::from(b[2]) << 16;
+    let mut header = [0u8; 12];
+    file.read_exact(&mut header).context("reading the WebP")?;
+    if &header[..4] != b"RIFF" || &header[8..] != b"WEBP" {
+        bail!("not a WebP image");
+    }
+    let mut canvas = None;
+    let mut delays = Vec::new();
+    let mut chunk = [0u8; 8];
+    while file.read_exact(&mut chunk).is_ok() {
+        let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u64;
+        let mut skip = size + (size & 1);
+        match &chunk[..4] {
+            b"VP8X" if size >= 10 => {
+                let mut b = [0u8; 10];
+                file.read_exact(&mut b).context("reading the WebP")?;
+                canvas = Some((u24(&b[4..7]) + 1, u24(&b[7..10]) + 1));
+                skip -= 10;
+            }
+            b"ANMF" if size >= 16 => {
+                let mut b = [0u8; 16];
+                file.read_exact(&mut b).context("reading the WebP")?;
+                delays.push(u24(&b[12..15]));
+                skip -= 16;
+            }
+            _ => {}
+        }
+        file.seek(SeekFrom::Current(skip as i64)).context("reading the WebP")?;
+    }
+    Ok(match canvas {
+        Some((w, h)) if !delays.is_empty() => Some((w, h, delays)),
+        _ => None,
+    })
 }
 
 /// Read a picture's outline without decoding its pixels.
@@ -56,30 +121,29 @@ pub fn outline(path: &Path) -> Result<Outline> {
         options.skip_frame_decoding(true);
         let mut decoder = options.read_info(BufReader::new(file)).context("reading the GIF")?;
         let (width, height) = (decoder.width() as u32, decoder.height() as u32);
-        let mut starts = Vec::new();
-        let mut at = 0.0;
+        let mut delays = Vec::new();
         while let Some(frame) = decoder.read_next_frame().context("reading the GIF")? {
-            starts.push(at);
-            at += delay_secs(frame.delay);
+            // GIF delays are in hundredths of a second.
+            delays.push(u32::from(frame.delay) * 10);
         }
-        if starts.is_empty() {
+        if delays.is_empty() {
             bail!("the GIF has no frames");
         }
-        let bytes = starts.len() as u64 * width as u64 * height as u64 * 4;
-        if bytes > MAX_DECODED_BYTES {
-            bail!("the GIF is too large to play ({} frames at {width}x{height})", starts.len());
-        }
-        let duration = (starts.len() > 1).then_some(at);
-        if duration.is_none() {
-            starts = vec![0.0];
-        }
-        return Ok(Outline { format: "GIF", width, height, starts, duration });
+        return timeline("GIF", width, height, &delays);
     }
-    let reader = image::ImageReader::new(BufReader::new(file)).with_guessed_format().context("reading the image")?;
+    let mut file = BufReader::new(file);
+    if is_webp(path) {
+        if let Some((width, height, delays)) = webp_animation(&mut file)? {
+            return timeline("WebP", width, height, &delays);
+        }
+        file.rewind().context("reading the WebP")?;
+    }
+    let reader = image::ImageReader::new(file).with_guessed_format().context("reading the image")?;
     let format = match reader.format() {
         Some(image::ImageFormat::Png) => "PNG",
         Some(image::ImageFormat::Jpeg) => "JPEG",
-        _ => bail!("not a PNG or JPEG image"),
+        Some(image::ImageFormat::WebP) => "WebP",
+        _ => bail!("not a PNG, JPEG or WebP image"),
     };
     let (width, height) = reader.into_dimensions().context("reading the image")?;
     Ok(Outline { format, width, height, starts: vec![0.0], duration: None })
@@ -101,6 +165,17 @@ pub fn frames(path: &Path) -> Result<Box<dyn Iterator<Item = Result<Vec<u8>>>>> 
         return Ok(Box::new(
             decoder.into_frames().map(|f| f.map(|f| to_bgra(f.into_buffer().into_raw())).context("decoding a GIF frame")),
         ));
+    }
+    if is_webp(path) {
+        let decoder = image::codecs::webp::WebPDecoder::new(file).context("reading the WebP")?;
+        if decoder.has_animation() {
+            return Ok(Box::new(
+                decoder.into_frames().map(|f| f.map(|f| to_bgra(f.into_buffer().into_raw())).context("decoding a WebP frame")),
+            ));
+        }
+        let file = BufReader::new(File::open(path)?);
+        let image = image::ImageReader::new(file).with_guessed_format()?.decode().context("decoding the image")?;
+        return Ok(Box::new(std::iter::once(Ok(to_bgra(image.to_rgba8().into_raw())))));
     }
     let image = image::ImageReader::new(file).with_guessed_format()?.decode().context("decoding the image")?;
     Ok(Box::new(std::iter::once(Ok(to_bgra(image.to_rgba8().into_raw())))))
@@ -179,12 +254,77 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A WebP still of one colour, lossless, as file bytes.
+    fn webp_still(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let img = RgbaImage::from_pixel(w, h, Rgba(rgba));
+        let mut out = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut out).encode(img.as_raw(), w, h, image::ExtendedColorType::Rgba8).unwrap();
+        out
+    }
+
+    /// An animated WebP built from lossless stills: each frame's VP8L chunk
+    /// wrapped in an ANMF chunk with its duration.
+    pub(crate) fn animated_webp(dir: &Path, durations_ms: &[u32]) -> PathBuf {
+        let (w, h) = (24u32, 16u32);
+        let u24 = |v: u32| v.to_le_bytes()[..3].to_vec();
+        let chunk = |fourcc: &[u8], payload: &[u8]| {
+            let mut c = fourcc.to_vec();
+            c.extend((payload.len() as u32).to_le_bytes());
+            c.extend(payload);
+            if payload.len() % 2 == 1 {
+                c.push(0);
+            }
+            c
+        };
+        let mut body = b"WEBP".to_vec();
+        let mut vp8x = vec![0x12, 0, 0, 0]; // animation and alpha flags
+        vp8x.extend(u24(w - 1));
+        vp8x.extend(u24(h - 1));
+        body.extend(chunk(b"VP8X", &vp8x));
+        body.extend(chunk(b"ANIM", &[0, 0, 0, 0, 0, 0]));
+        for (i, &ms) in durations_ms.iter().enumerate() {
+            // The still's own image chunk follows its 12-byte RIFF header.
+            let still = webp_still(w, h, colour(i));
+            let mut anmf = [u24(0), u24(0), u24(w - 1), u24(h - 1), u24(ms)].concat();
+            anmf.push(0b10); // do not blend: each frame replaces the canvas
+            anmf.extend(&still[12..]);
+            body.extend(chunk(b"ANMF", &anmf));
+        }
+        let path = dir.join("anim.webp");
+        std::fs::write(&path, chunk(b"RIFF", &body)).unwrap();
+        path
+    }
+
     #[test]
-    fn tiny_gif_delays_play_as_browsers_play_them() {
+    fn an_animated_webp_is_a_clip_timed_by_its_durations() {
+        let dir = temp_dir("webp");
+        // 0 ms plays as 100 ms, as in browsers.
+        let path = animated_webp(&dir, &[50, 0, 200]);
+        let o = outline(&path).unwrap();
+        assert_eq!((o.format, o.width, o.height, o.starts.len()), ("WebP", 24, 16, 3));
+        assert!((o.starts[1] - 0.05).abs() < 1e-9 && (o.starts[2] - 0.15).abs() < 1e-9, "{:?}", o.starts);
+        assert!((o.duration.unwrap() - 0.35).abs() < 1e-9);
+        let decoded: Vec<Vec<u8>> = frames(&path).unwrap().map(Result::unwrap).collect();
+        assert_eq!(decoded.len(), 3);
+        for (i, f) in decoded.iter().enumerate() {
+            let [r, g, b, a] = colour(i);
+            assert_eq!(&f[..4], &[b, g, r, a], "frame {i}");
+        }
+
+        let still = dir.join("still.webp");
+        std::fs::write(&still, webp_still(10, 6, [1, 2, 3, 255])).unwrap();
+        assert_eq!(outline(&still).unwrap(), Outline { format: "WebP", width: 10, height: 6, starts: vec![0.0], duration: None });
+        let f: Vec<_> = frames(&still).unwrap().map(Result::unwrap).collect();
+        assert_eq!((f.len(), &f[0][..4]), (1, &[3, 2, 1, 255][..]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tiny_delays_play_as_browsers_play_them() {
         assert_eq!(delay_secs(0), 0.1);
-        assert_eq!(delay_secs(1), 0.1);
-        assert_eq!(delay_secs(2), 0.02);
-        assert_eq!(delay_secs(150), 1.5);
+        assert_eq!(delay_secs(10), 0.1);
+        assert_eq!(delay_secs(20), 0.02);
+        assert_eq!(delay_secs(1500), 1.5);
     }
 
     #[test]
