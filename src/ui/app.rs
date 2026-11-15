@@ -15,12 +15,13 @@ use gpui::{
     RenderImage, ScrollWheelEvent, SharedString, StyledText, Task, Window, actions, canvas, div, img, px, svg,
 };
 
+use super::folders::{self, Folders, Scan, Stamp};
 use super::fuzzy::fuzzy_match;
 use super::icons::Icon;
 use super::os_media::{NowPlaying, OsMedia, PlayState};
 use super::session::{Session, SessionStore, TabState};
 use super::theme::{Theme, mono_font};
-use crate::media::{Image, Player, Summary, is_media_file, probe};
+use crate::media::{Image, Player, Summary, probe};
 
 actions!(
     airsplice_player,
@@ -276,6 +277,13 @@ pub struct MediaPlayer {
     fps_since: Instant,
     /// Tags and durations for playlist entries, filled in the background.
     summaries: std::collections::HashMap<PathBuf, Summary>,
+    /// Folders added to the playlist, watched for files added later.
+    folders: Folders,
+    /// Files in those folders the user removed; rescans leave them out.
+    removed_from_folders: std::collections::BTreeSet<PathBuf>,
+    /// Size and modification time of folder files when last seen, so a file
+    /// that changes (a copy finishing) has its tags read again.
+    stamps: std::collections::HashMap<PathBuf, Stamp>,
     os_media: Option<OsMedia>,
     store: Option<SessionStore>,
     saved: Option<Session>,
@@ -328,6 +336,9 @@ impl MediaPlayer {
             fps_count: 0,
             fps_since: Instant::now(),
             summaries: Default::default(),
+            folders: Folders::default(),
+            removed_from_folders: Default::default(),
+            stamps: Default::default(),
             os_media: None,
             store,
             saved: None,
@@ -340,6 +351,9 @@ impl MediaPlayer {
         };
         if files.is_empty() {
             this.playlist = session.playlist;
+            this.removed_from_folders = session.removed_from_folders.into_iter().collect();
+            // Rescans now, for files added while the app was closed.
+            this.folders.set(session.folders);
             this.probe_new(cx);
             if !session.tabs.is_empty() {
                 this.restore_tabs(&session.tabs, session.active_tab, window, cx);
@@ -460,6 +474,8 @@ impl MediaPlayer {
             info_open: self.info_open,
             tabs,
             active_tab: self.active,
+            folders: self.folders.roots().to_vec(),
+            removed_from_folders: self.removed_from_folders.iter().cloned().collect(),
         }
     }
 
@@ -493,6 +509,9 @@ impl MediaPlayer {
     }
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(scan) = self.folders.poll() {
+            self.apply_scan(scan, window, cx);
+        }
         self.save_session(false);
         self.sync_os_media(window, cx);
         // Background tabs are paused; this picks up the frame each one is
@@ -808,13 +827,29 @@ impl MediaPlayer {
             .iter()
             .map(|p| std::fs::canonicalize(p).or_else(|_| std::path::absolute(p)).unwrap_or_else(|_| p.clone()))
             .collect();
+        // A folder's files already listed (the folder added twice) are not
+        // added again.
+        let mut present: std::collections::HashSet<PathBuf> = self.playlist.iter().cloned().collect();
         for path in &absolute {
             if path.is_dir() {
-                let mut found = Vec::new();
-                collect_media(path, &mut found);
-                found.sort();
-                self.playlist.extend(found);
+                // Adding a folder again brings back files removed from it.
+                self.removed_from_folders.retain(|p| !p.starts_with(path));
+                self.folders.add(path.clone());
+                for (file, stamp) in folders::list(path).unwrap_or_default() {
+                    // Still being written: the rescan this schedules adds it.
+                    if !folders::settled(&stamp) {
+                        self.folders.rescan_after(folders::SETTLE);
+                        continue;
+                    }
+                    self.stamps.insert(file.clone(), stamp);
+                    if present.insert(file.clone()) {
+                        self.playlist.push(file);
+                    }
+                }
             } else {
+                // A file named on its own is added even if already listed.
+                self.removed_from_folders.remove(path);
+                present.insert(path.clone());
                 self.playlist.push(path.clone());
             }
         }
@@ -854,7 +889,18 @@ impl MediaPlayer {
         self.summaries.get(path).and_then(|s| s.title.clone()).unwrap_or_else(|| file_name(path))
     }
 
+    /// The user removing an entry. One inside a followed folder stays out
+    /// when the folder is rescanned.
     fn remove_track(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.playlist.get(ix)
+            && self.folders.contains(path)
+        {
+            self.removed_from_folders.insert(path.clone());
+        }
+        self.drop_entry(ix, window, cx);
+    }
+
+    fn drop_entry(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.playlist.len() {
             return;
         }
@@ -870,6 +916,73 @@ impl MediaPlayer {
             }
         }
         cx.notify();
+    }
+
+    /// Insert an entry at `ix`, keeping every tab on its file.
+    fn insert_entry(&mut self, ix: usize, path: PathBuf) {
+        self.playlist.insert(ix, path);
+        for t in 0..self.tabs.len() {
+            let track = if self.active == Some(t) { &mut self.current } else { &mut self.tabs[t].track };
+            if let Some(c) = track
+                && *c >= ix
+            {
+                *c += 1;
+            }
+        }
+    }
+
+    /// Bring the playlist in line with a rescan of the followed folders:
+    /// new files join next to their folder's other entries, in name order;
+    /// files deleted from disk leave, unless open in a tab.
+    fn apply_scan(&mut self, scan: Scan, window: &mut Window, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for (root, listing) in scan.folders {
+            // Missing or unreadable (an unmounted drive): leave it alone.
+            let Some(files) = listing else { continue };
+            // Cleared or replaced while the scan ran.
+            if !self.folders.roots().contains(&root) {
+                continue;
+            }
+            let on_disk: std::collections::HashSet<&PathBuf> = files.iter().map(|(p, _)| p).collect();
+            let open: Vec<PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
+            for ix in (0..self.playlist.len()).rev() {
+                let p = &self.playlist[ix];
+                if p.starts_with(&root) && !on_disk.contains(p) && !open.contains(p) && !p.exists() {
+                    self.stamps.remove(p);
+                    self.drop_entry(ix, window, cx);
+                    changed = true;
+                }
+            }
+            self.removed_from_folders.retain(|p| !p.starts_with(&root) || on_disk.contains(p));
+            let present: std::collections::HashSet<PathBuf> = self.playlist.iter().cloned().collect();
+            for (file, stamp) in files {
+                // Still being written; `Folders` looks again shortly.
+                if !folders::settled(&stamp) {
+                    continue;
+                }
+                if self.stamps.insert(file.clone(), stamp).is_some_and(|old| old != stamp) {
+                    // Changed since its tags were read.
+                    self.summaries.remove(&file);
+                    changed = true;
+                }
+                if present.contains(&file) || self.removed_from_folders.contains(&file) {
+                    continue;
+                }
+                let in_folder: Vec<usize> = (0..self.playlist.len()).filter(|&i| self.playlist[i].starts_with(&root)).collect();
+                let ix = in_folder
+                    .iter()
+                    .copied()
+                    .find(|&i| self.playlist[i] > file)
+                    .or(in_folder.last().map(|i| i + 1))
+                    .unwrap_or(self.playlist.len());
+                self.insert_entry(ix, file);
+                changed = true;
+            }
+        }
+        if changed {
+            self.probe_new(cx);
+            cx.notify();
+        }
     }
 
     fn set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
@@ -1008,6 +1121,9 @@ impl MediaPlayer {
     fn clear_playlist(&mut self, _: &ClearPlaylist, window: &mut Window, cx: &mut Context<Self>) {
         self.close_all_tabs(window);
         self.playlist.clear();
+        self.folders.clear();
+        self.removed_from_folders.clear();
+        self.stamps.clear();
         cx.notify();
     }
 
@@ -2067,18 +2183,6 @@ fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
 }
 
-fn collect_media(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_media(&path, out);
-        } else if is_media_file(&path) {
-            out.push(path);
-        }
-    }
-}
-
 pub fn format_time(secs: f64) -> String {
     let total = secs.max(0.0).floor() as u64;
     let (h, m, s) = (total / 3600, (total / 60) % 60, total % 60);
@@ -2435,6 +2539,136 @@ mod tests {
             assert_eq!(v.playlist[0], c);
             assert_eq!(v.player.as_ref().unwrap().info.path, c, "c's tab is now on screen");
         });
+    }
+
+    /// A fresh folder under the temp dir, by its canonical path (what the
+    /// playlist stores; on macOS `/var` is really `/private/var`).
+    fn media_folder(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("airsplice-player-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(dir).unwrap()
+    }
+
+    /// Copy a fixture into `dir` as `name`, dated an hour ago so it counts
+    /// as completely written.
+    fn put(dir: &Path, name: &str, fixture_name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::copy(fixture(fixture_name), &path).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        path
+    }
+
+    fn names(v: &MediaPlayer) -> Vec<String> {
+        v.playlist.iter().map(|p| file_name(p)).collect()
+    }
+
+    #[gpui::test]
+    fn a_folder_in_the_playlist_follows_files_added_and_deleted(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let dir = media_folder("follow");
+        put(&dir, "b.mp4", "video_only.mp4");
+        let d = put(&dir, "d.mp4", "bframes_h264.mp4");
+        let (view, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            |window, cx| MediaPlayer::new(vec![dir], None, window, cx)
+        });
+        view.update_in(cx, |v, window, cx| v.play_index(1, window, cx));
+        assert_eq!(view.read_with(cx, |v, _| (names(v), v.current)), (vec!["b.mp4".into(), "d.mp4".into()], Some(1)));
+
+        // A new file joins in name order; the playing entry keeps its file.
+        put(&dir, "c.mp4", "video_only.mp4");
+        tick_until(&view, cx, "c.mp4 to appear", |v| v.playlist.len() == 3);
+        view.read_with(cx, |v, _| {
+            assert_eq!(names(v), ["b.mp4", "c.mp4", "d.mp4"]);
+            assert_eq!(v.current, Some(2));
+            assert_eq!(v.player.as_ref().unwrap().info.path, d);
+        });
+
+        // In a subfolder too, and its tags are read.
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        put(&dir, "sub/e.mp3", "tagged.mp3");
+        tick_until(&view, cx, "sub/e.mp3 to appear", |v| v.playlist.len() == 4);
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.playlist[3], dir.join("sub/e.mp3"));
+            assert!(v.summaries[&v.playlist[3]].title.is_some(), "probed");
+        });
+
+        // Removed by the user: stays out when the folder changes again.
+        view.update_in(cx, |v, window, cx| v.remove_track(1, window, cx));
+        put(&dir, "a.mp4", "video_only.mp4");
+        tick_until(&view, cx, "a.mp4 to appear", |v| v.playlist.first().is_some_and(|p| p.ends_with("a.mp4")));
+        assert_eq!(view.read_with(cx, |v, _| names(v)), ["a.mp4", "b.mp4", "d.mp4", "e.mp3"], "c.mp4 not back");
+
+        // Deleted from disk: leaves, unless it is open in a tab.
+        std::fs::remove_file(dir.join("b.mp4")).unwrap();
+        std::fs::remove_file(&d).unwrap();
+        tick_until(&view, cx, "b.mp4 to leave", |v| v.playlist.len() == 3);
+        view.read_with(cx, |v, _| {
+            assert_eq!(names(v), ["a.mp4", "d.mp4", "e.mp3"], "d.mp4 is still on screen");
+            assert_eq!((v.current, v.player.as_ref().unwrap().info.path.clone()), (Some(1), d.clone()));
+        });
+
+        // Adding the folder again brings back what was removed, once.
+        view.update_in(cx, |v, window, cx| v.add_paths(std::slice::from_ref(&dir), window, cx));
+        assert_eq!(view.read_with(cx, |v, _| names(v)), ["a.mp4", "d.mp4", "e.mp3", "c.mp4"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_file_still_being_written_waits_until_it_is_done(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let dir = media_folder("settle");
+        put(&dir, "a.mp4", "video_only.mp4");
+        let (view, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            |window, cx| MediaPlayer::new(vec![dir], None, window, cx)
+        });
+        let fresh = dir.join("b.mp4");
+        std::fs::copy(fixture("video_only.mp4"), &fresh).unwrap();
+        std::fs::File::options().write(true).open(&fresh).unwrap().set_modified(std::time::SystemTime::now()).unwrap();
+        // The same scan, before and after the copy has settled.
+        let scan = |stamp: Stamp| Scan { folders: vec![(dir.clone(), Some(vec![(dir.join("a.mp4"), (1, None)), (fresh.clone(), stamp)]))] };
+        let len = std::fs::metadata(&fresh).unwrap().len();
+        view.update_in(cx, |v, window, cx| v.apply_scan(scan((len, Some(std::time::SystemTime::now()))), window, cx));
+        assert_eq!(view.read_with(cx, |v, _| names(v)), ["a.mp4"], "not added mid-copy");
+        let done = std::time::SystemTime::now() - folders::SETTLE;
+        view.update_in(cx, |v, window, cx| v.apply_scan(scan((len, Some(done))), window, cx));
+        assert_eq!(view.read_with(cx, |v, _| names(v)), ["a.mp4", "b.mp4"]);
+        // Through the watcher as well: picked up once it has been left alone.
+        put(&dir, "c.mp4", "video_only.mp4");
+        tick_until(&view, cx, "c.mp4 to appear", |v| v.playlist.len() == 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn files_added_while_the_app_was_closed_appear_at_launch(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let dir = media_folder("relaunch");
+        let store = SessionStore::new(media_folder("relaunch-session").join("session.json"));
+        put(&dir, "a.mp4", "video_only.mp4");
+        put(&dir, "b.mp4", "video_only.mp4");
+        let (view, vcx) = cx.add_window_view({
+            let (dir, store) = (dir.clone(), store.clone());
+            |window, cx| MediaPlayer::new(vec![dir], Some(store), window, cx)
+        });
+        view.update_in(vcx, |v, window, cx| {
+            v.remove_track(1, window, cx);
+            v.save_session(true);
+        });
+        vcx.update(|window, _| window.remove_window());
+
+        put(&dir, "c.mp4", "video_only.mp4");
+        let (view, vcx) = cx.add_window_view({
+            let store = store.clone();
+            |window, cx| MediaPlayer::new(Vec::new(), Some(store), window, cx)
+        });
+        tick_until(&view, vcx, "c.mp4 to appear", |v| v.playlist.len() == 2);
+        assert_eq!(view.read_with(vcx, |v, _| names(v)), ["a.mp4", "c.mp4"], "b.mp4 stays removed");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(store.path().parent().unwrap());
     }
 
     #[gpui::test]

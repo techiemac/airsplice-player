@@ -12,7 +12,8 @@ the Raspberry Pi 5. The Windows build has not been tested yet.
 ## Features
 
 - Playlist with tag titles, durations and total length; drop files or
-  folders anywhere in the window
+  folders anywhere in the window. Added folders stay in sync: files copied
+  into them later join the playlist, deleted ones leave it
 - Tabs: open files in background tabs, each loaded and paused on its first
   frame, then cut between them instantly
 - Command palette and fuzzy file finder, keyboard-first controls

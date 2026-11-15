@@ -20,6 +20,11 @@ pub struct Session {
     /// existed; `current` and `position` then describe the one file open.
     pub tabs: Vec<TabState>,
     pub active_tab: Option<usize>,
+    /// Folders added to the playlist; files added to them later join it.
+    pub folders: Vec<PathBuf>,
+    /// Files inside those folders that the user removed from the playlist,
+    /// so a rescan does not bring them back. Sorted.
+    pub removed_from_folders: Vec<PathBuf>,
 }
 
 /// One open tab: its file and where it was left.
@@ -42,6 +47,8 @@ impl Default for Session {
             info_open: false,
             tabs: Vec::new(),
             active_tab: None,
+            folders: Vec::new(),
+            removed_from_folders: Vec::new(),
         }
     }
 }
@@ -68,6 +75,8 @@ impl Session {
         if self.current.is_none() {
             self.position = 0.0;
         }
+        self.folders.retain(|f| f.is_dir());
+        self.removed_from_folders.retain(|p| p.exists());
         self.volume = self.volume.clamp(0.0, 1.0);
         if !self.position.is_finite() || self.position < 0.0 {
             self.position = 0.0;
@@ -162,8 +171,10 @@ mod tests {
             repeat: "all".into(),
             sidebar_open: false,
             info_open: true,
-            tabs: vec![TabState { path: track, position: 12.5 }],
+            tabs: vec![TabState { path: track.clone(), position: 12.5 }],
             active_tab: Some(0),
+            folders: vec![dir.clone()],
+            removed_from_folders: vec![track],
         };
         store.save(&session).unwrap();
         assert_eq!(store.load(), session);
@@ -225,6 +236,16 @@ mod tests {
 
         let s = Session { tabs: vec![tab(&a, 1.0), tab(&gone, 2.0)], active_tab: Some(1), ..Default::default() }.without_missing_files();
         assert_eq!(s.active_tab, Some(0), "the active tab's file is gone: the first tab instead");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn folders_that_are_gone_are_dropped() {
+        let dir = temp_dir("folders");
+        let gone = dir.join("unplugged");
+        let s = Session { folders: vec![dir.clone(), gone.clone()], removed_from_folders: vec![gone.join("a.mp4")], ..Default::default() }
+            .without_missing_files();
+        assert_eq!((s.folders, s.removed_from_folders), (vec![dir.clone()], vec![]));
         let _ = std::fs::remove_dir_all(dir);
     }
 
