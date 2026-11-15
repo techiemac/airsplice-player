@@ -31,6 +31,8 @@ pub struct Session {
     /// The outputs' on/off switch. On by default, so choosing a display
     /// in the settings shows the picture there straight away.
     pub outputs_on: bool,
+    /// Upscale video on the GPU to the size it is shown at.
+    pub upscaling: bool,
 }
 
 /// One open tab: its file and where it was left.
@@ -57,6 +59,7 @@ impl Default for Session {
             removed_from_folders: Vec::new(),
             output_displays: Vec::new(),
             outputs_on: true,
+            upscaling: false,
         }
     }
 }
@@ -185,6 +188,7 @@ mod tests {
             removed_from_folders: vec![track],
             output_displays: vec!["6f1c-display".into(), "a07e-display".into()],
             outputs_on: false,
+            upscaling: true,
         };
         store.save(&session).unwrap();
         assert_eq!(store.load(), session);

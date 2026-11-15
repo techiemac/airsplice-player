@@ -11,6 +11,8 @@ use airsplice_player::ui::session::SessionStore;
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,symphonia_core=error")).init();
     let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    // Find the GPU upscaler in the background, so the settings can name it.
+    airsplice_player::media::upscale::warm_up();
 
     Application::new().with_assets(Assets).run(move |cx: &mut App| {
         app::bind_keys(cx);

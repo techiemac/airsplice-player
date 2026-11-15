@@ -22,6 +22,7 @@ use super::os_media::{NowPlaying, OsMedia, PlayState};
 use super::output::{self, OutputView};
 use super::session::{Session, SessionStore, TabState};
 use super::theme::{Theme, mono_font};
+use crate::media::upscale::{self, Status as UpscaleStatus};
 use crate::media::{Image, Player, Summary, probe};
 
 mod settings;
@@ -275,6 +276,17 @@ pub struct MediaPlayer {
     /// The outputs' on/off switch (the status bar button). Off keeps the
     /// chosen displays for next time.
     outputs_on: bool,
+    /// The largest output window, in physical pixels; video is decoded
+    /// and upscaled for whichever is bigger, this or the main window.
+    outputs_px: (u32, u32),
+    /// Upscale video on the GPU to the size it is shown at (a setting).
+    upscaling: bool,
+    /// The display size the paused frame was last refreshed for, and when
+    /// the size last changed: a paused frame is decoded again once the
+    /// size settles, so upscaling follows resizes and the switch.
+    limit: (u32, u32),
+    limit_changed: Instant,
+    refreshed_for: Option<((u32, u32), bool)>,
     /// Output windows asked for but not open yet.
     outputs_opening: Vec<String>,
     output_checked: Instant,
@@ -346,6 +358,11 @@ impl MediaPlayer {
             output_setting: session.output_displays.clone(),
             outputs_opening: Vec::new(),
             outputs_on: session.outputs_on,
+            outputs_px: (0, 0),
+            upscaling: session.upscaling,
+            limit: (0, 0),
+            limit_changed: Instant::now(),
+            refreshed_for: None,
             // Long ago, so the first tick opens a remembered output.
             output_checked: Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or_else(Instant::now),
             settings: None,
@@ -514,6 +531,7 @@ impl MediaPlayer {
             removed_from_folders: self.removed_from_folders.iter().cloned().collect(),
             output_displays: self.output_setting.clone(),
             outputs_on: self.outputs_on,
+            upscaling: self.upscaling,
         }
     }
 
@@ -562,12 +580,23 @@ impl MediaPlayer {
                 let _ = window.drop_image(old);
             }
         }
-        let Some(player) = &self.player else { return };
-        // Video is never shown larger than the window: decoders that convert
-        // on the CPU can skip pixels nobody would see.
+        if self.player.is_none() {
+            return;
+        }
+        // Video is never shown larger than the biggest window showing it:
+        // decoders that convert on the CPU skip pixels nobody would see,
+        // and upscaling stops there.
         let size = window.viewport_size();
         let scale = window.scale_factor();
-        player.set_output_limit((f32::from(size.width) * scale) as u32, (f32::from(size.height) * scale) as u32);
+        let main = ((f32::from(size.width) * scale) as u32, (f32::from(size.height) * scale) as u32);
+        let limit = if self.outputs_px.0 as u64 * self.outputs_px.1 as u64 > main.0 as u64 * main.1 as u64 { self.outputs_px } else { main };
+        if limit != self.limit {
+            self.limit = limit;
+            self.limit_changed = Instant::now();
+        }
+        self.refresh_paused_frame();
+        let Some(player) = &self.player else { return };
+        player.set_output_limit(limit.0, limit.1);
         let mut changed = false;
         if let Some(frame) = player.take_frame() {
             let image = to_render_image(frame.width, frame.height, frame.bgra);
@@ -657,6 +686,7 @@ impl MediaPlayer {
     fn load(&self, path: &Path, autoplay: bool, start_at: f64) -> Loaded {
         match Player::open(path, self.volume, self.muted) {
             Ok(mut player) => {
+                player.set_upscaling(self.upscaling);
                 let cover = player.info.cover.as_ref().map(image_to_render);
                 let error = player.info.video_unsupported.clone().map(|why| format!("Playing audio only: {why}"));
                 if !autoplay {
@@ -955,6 +985,61 @@ impl MediaPlayer {
             }
         }
         cx.notify();
+    }
+
+    /// Turn upscaling on or off for every open file (and those opened
+    /// later).
+    fn set_upscaling(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.upscaling = on;
+        let parked = self.tabs.iter().filter_map(|t| t.parked.as_ref().and_then(|l| l.player.as_ref()));
+        for p in self.player.iter().chain(parked) {
+            p.set_upscaling(on);
+        }
+        // A paused frame is decoded again, with or without upscaling.
+        self.refreshed_for = None;
+        self.limit_changed = Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now);
+        cx.notify();
+    }
+
+    /// While paused nothing new is decoded, so the frame on screen keeps
+    /// the size it was decoded at. Once the display size has settled (or
+    /// upscaling was switched), decode it again by seeking to where it is.
+    fn refresh_paused_frame(&mut self) {
+        let Some(p) = self.player.as_mut() else { return };
+        if !p.is_paused() || p.info.video.is_none() || self.limit_changed.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        let key = (self.limit, self.upscaling);
+        if self.refreshed_for == Some(key) {
+            return;
+        }
+        self.refreshed_for = Some(key);
+        // Only when the picture would actually change.
+        let source = p.info.video.as_ref().map(|v| (v.width, v.height)).unwrap_or_default();
+        let showing = match p.upscale_status() {
+            UpscaleStatus::Active { to, .. } => Some(to),
+            UpscaleStatus::TooSlow | UpscaleStatus::Failed(_) => return,
+            _ => None,
+        };
+        let wanted = if self.upscaling { upscale::target_size(source, self.limit) } else { None };
+        if showing != wanted {
+            let at = p.position();
+            p.seek(at);
+        }
+    }
+
+    /// The info panel's words for what upscaling is doing.
+    fn upscale_label(status: &UpscaleStatus) -> String {
+        match status {
+            UpscaleStatus::Off => "Off".into(),
+            UpscaleStatus::NotNeeded => "Not needed: the video already fills the display".into(),
+            UpscaleStatus::Active { from, to } => {
+                let by = upscale::available().unwrap_or("GPU");
+                format!("{} × {} to {} × {}, {by}", from.0, from.1, to.0, to.1)
+            }
+            UpscaleStatus::TooSlow => "Stopped for this file: too slow on this GPU".into(),
+            UpscaleStatus::Failed(e) => format!("Stopped for this file: {e}"),
+        }
     }
 
     /// Insert an entry at `ix`, keeping every tab on its file.
@@ -1812,7 +1897,8 @@ impl MediaPlayer {
                         .child(section("VIDEO"))
                         .child(row("Codec", v.codec.into()))
                         .child(row("Size", format!("{} × {}", v.width, v.height)))
-                        .child(row("Decoder", v.decoder.into()));
+                        .child(row("Decoder", v.decoder.into()))
+                        .child(row("Upscaling", Self::upscale_label(&p.upscale_status())));
                 } else if let Some(why) = &info.video_unsupported {
                     body = body.child(section("VIDEO")).child(row("Status", why.clone()));
                 }
@@ -2751,8 +2837,9 @@ mod tests {
         let screens = view.update_in(vcx, |v, window, cx| v.screens(window, cx));
         assert_eq!((screens.len(), screens[0].label.as_str(), screens[0].here), (1, "Display 1", true));
 
-        // Enter turns it on: the picture goes there and follows playback.
-        vcx.simulate_keystrokes("enter");
+        // Down to it (the upscaling switch is first), Enter turns it on: the
+        // picture goes there and follows playback.
+        vcx.simulate_keystrokes("down enter");
         vcx.run_until_parked();
         let out = *output_windows(&view, vcx).first().expect("output open");
         assert_eq!(vcx.windows().len(), 2);
@@ -2813,6 +2900,50 @@ mod tests {
         view.update_in(vcx, |v, window, cx| v.sync_output(window, cx));
         assert_eq!(view.read_with(vcx, |v, _| (v.outputs.len(), v.output_setting.clone())), (0, vec!["unplugged".to_string()]));
         assert!(view.read_with(vcx, |v, _| v.player.is_some()), "playback carries on");
+    }
+
+    #[gpui::test]
+    fn upscaling_is_a_setting_that_reaches_the_picture(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(vec![fixture("video_only.mp4")], None, window, cx));
+        tick_until(&view, vcx, "the first frame", |v| v.frame.is_some());
+        let frame_size = |view: &gpui::Entity<MediaPlayer>, vcx: &mut gpui::VisualTestContext| {
+            view.read_with(vcx, |v, _| v.frame.as_ref().map(|f| f.size(0)).map(|s| (s.width.0 as u32, s.height.0 as u32)).unwrap())
+        };
+        let (source, limit) = view.read_with(vcx, |v, _| {
+            let video = v.player.as_ref().unwrap().info.video.as_ref().unwrap();
+            ((video.width, video.height), v.limit)
+        });
+        assert_eq!(frame_size(&view, vcx), source, "off by default: frames at their own size");
+
+        // Settings: the switch is the first row, Enter flips it.
+        vcx.simulate_keystrokes("secondary-, enter");
+        let Some(name) = upscale::available() else {
+            // No GPU (Docker, CI): the switch stays off and says why.
+            assert!(!view.read_with(vcx, |v, _| v.upscaling), "nothing to switch on");
+            eprintln!("skipping the rest: no GPU upscaler here");
+            return;
+        };
+        eprintln!("upscaling with {name}");
+        assert!(view.read_with(vcx, |v, _| v.upscaling && v.snapshot(false).upscaling), "on, and saved");
+        vcx.simulate_keystrokes("escape");
+
+        // Frames now arrive upscaled to fill the window, up to 2x.
+        let target = upscale::target_size(source, limit).expect("the small fixture gains from upscaling in the test window");
+        tick_until(&view, vcx, "an upscaled frame", |v| v.frame.as_ref().is_some_and(|f| f.size(0).width.0 as u32 == target.0));
+        assert_eq!(frame_size(&view, vcx), target);
+        let status = view.read_with(vcx, |v, _| v.player.as_ref().unwrap().upscale_status());
+        assert_eq!(status, UpscaleStatus::Active { from: source, to: target });
+        assert!(MediaPlayer::upscale_label(&status).contains(name), "the info panel names the upscaler");
+
+        // Paused, then switched off: the frame on screen goes back to the
+        // source size without playing.
+        view.update_in(vcx, |v, window, cx| {
+            v.play_pause(&PlayPause, window, cx);
+            v.set_upscaling(false, cx);
+        });
+        tick_until(&view, vcx, "the paused frame at its own size", |v| v.frame.as_ref().is_some_and(|f| f.size(0).width.0 as u32 == source.0));
+        assert!(view.read_with(vcx, |v, _| v.player.as_ref().unwrap().is_paused()), "still paused");
     }
 
     #[gpui::test]

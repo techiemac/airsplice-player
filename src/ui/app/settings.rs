@@ -132,6 +132,22 @@ impl MediaPlayer {
             cx.notify();
         }
 
+        // The biggest output window, for the size video is decoded and
+        // upscaled to.
+        let sizes: Vec<(u32, u32)> = self
+            .outputs
+            .iter()
+            .filter_map(|o| {
+                o.window
+                    .update(cx, |_, w, _| {
+                        let (size, scale) = (w.viewport_size(), w.scale_factor());
+                        ((f32::from(size.width) * scale) as u32, (f32::from(size.height) * scale) as u32)
+                    })
+                    .ok()
+            })
+            .collect();
+        self.outputs_px = sizes.into_iter().max_by_key(|(w, h)| *w as u64 * *h as u64).unwrap_or((0, 0));
+
         let screens = self.screens(window, cx);
         let connected: Vec<&str> = screens.iter().map(|s| s.uuid.as_str()).collect();
         // Opening counts as open, so a slow open is not started twice.
@@ -237,8 +253,9 @@ impl MediaPlayer {
         cx.notify();
     }
 
+    /// Settings rows: the upscaling switch, then one per display.
     fn settings_move(&mut self, by: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let len = self.screens(window, cx).len() as isize;
+        let len = 1 + self.screens(window, cx).len() as isize;
         if let Some(s) = self.settings.as_mut()
             && len > 0
         {
@@ -248,18 +265,62 @@ impl MediaPlayer {
     }
 
     fn settings_toggle(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(screen) = self.screens(window, cx).into_iter().nth(ix) else { return };
         if let Some(s) = self.settings.as_mut() {
             s.selected = ix;
         }
+        if ix == 0 {
+            // Nothing to switch on without a GPU that can do it.
+            if upscale::available().is_some() {
+                self.set_upscaling(!self.upscaling, cx);
+            }
+            return;
+        }
+        let Some(screen) = self.screens(window, cx).into_iter().nth(ix - 1) else { return };
         self.toggle_output(screen.uuid, window, cx);
     }
 
     pub(super) fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let settings = self.settings.as_ref()?;
         let screens = self.screens(window, cx);
-        let selected = settings.selected.min(screens.len().saturating_sub(1));
+        let selected = settings.selected.min(screens.len());
+        let checkbox = |on: bool, enabled: bool| {
+            div()
+                .size(px(14.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .border_1()
+                .border_color(if on { Theme::accent() } else { Theme::border() })
+                .when(!enabled, |el| el.opacity(0.4))
+                .when(on, |el| el.bg(Theme::accent()).child(icon(Icon::Check, px(12.), Theme::editor_bg())))
+        };
+
+        // Upscaling: row 0.
+        let upscaler = upscale::available();
+        let upscale_row = div()
+            .id("upscale-choice")
+            .h(px(32.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .rounded(px(4.))
+            .text_sm()
+            .when(selected == 0, |el| el.bg(Theme::selected()))
+            .when(upscaler.is_some(), |el| el.hover(|s| s.bg(Theme::hover())).cursor_pointer())
+            .on_click(cx.listener(|this, _, window, cx| this.settings_toggle(0, window, cx)))
+            .child(checkbox(self.upscaling && upscaler.is_some(), upscaler.is_some()))
+            .child(div().flex_1().min_w_0().truncate().text_color(Theme::text()).child("Upscale video to the display's resolution"));
+        let upscale_detail = match upscaler {
+            Some(name) => format!("Uses {name}. Sharpens edges from the frame itself; adds no invented detail."),
+            None => "Not available: no supported GPU was found.".into(),
+        };
+        let upscale_now = self.upscaling.then(|| self.player.as_ref().map(|p| Self::upscale_label(&p.upscale_status()))).flatten();
+
         let row = |ix: usize, screen: &Screen| {
+            let ix = ix + 1;
             let on = self.output_on(&screen.uuid);
             div()
                 .id(("output-choice", ix))
@@ -274,18 +335,7 @@ impl MediaPlayer {
                 .hover(|s| s.bg(Theme::hover()))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, window, cx| this.settings_toggle(ix, window, cx)))
-                .child(
-                    div()
-                        .size(px(14.))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(3.))
-                        .border_1()
-                        .border_color(if on { Theme::accent() } else { Theme::border() })
-                        .when(on, |el| el.bg(Theme::accent()).child(icon(Icon::Check, px(12.), Theme::editor_bg()))),
-                )
+                .child(checkbox(on, true))
                 .child(div().flex_1().min_w_0().truncate().text_color(Theme::text()).child(screen.label.clone()))
                 .child(div().flex_none().text_xs().text_color(Theme::text_placeholder()).child(self.screen_detail(screen)))
         };
@@ -328,6 +378,18 @@ impl MediaPlayer {
             )
             .child(
                 div()
+                    .px(px(12.))
+                    .pt(px(12.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(Theme::text()).child("Upscaling"))
+                    .child(upscale_row)
+                    .child(div().px(px(8.)).text_xs().text_color(Theme::text_muted()).child(upscale_detail))
+                    .when_some(upscale_now, |el, now| el.child(div().px(px(8.)).text_xs().text_color(Theme::text_placeholder()).child(format!("Now: {now}")))),
+            )
+            .child(
+                div()
                     .p(px(12.))
                     .flex()
                     .flex_col()
@@ -360,7 +422,7 @@ impl MediaPlayer {
                     .border_color(Theme::border_variant())
                     .text_xs()
                     .text_color(Theme::text_placeholder())
-                    .child("Up and Down to move, Enter to turn on or off, Esc to close"),
+                    .child("Up and Down to move, Enter to switch on or off, Esc to close"),
             );
 
         Some(

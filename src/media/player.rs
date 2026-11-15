@@ -32,6 +32,7 @@ use symphonia::core::units::{Time, TimeBase, Timestamp};
 
 use super::audio::{AudioOutput, Clock, Converter};
 use super::opus::{OPUS_RATE, Opus};
+use super::upscale::{self, Stage};
 use super::video::{self, DecodedFrame, VideoDecoder};
 
 /// Decoded frames kept ahead of the clock.
@@ -114,6 +115,9 @@ struct Shared {
     output_limit: AtomicU64,
     /// Decoded frames to keep queued ahead of the one on screen.
     max_frames: std::sync::atomic::AtomicUsize,
+    /// Upscale frames on the GPU to the output limit (the settings switch).
+    upscale: AtomicBool,
+    upscale_status: Mutex<upscale::Status>,
 }
 
 impl Shared {
@@ -353,6 +357,8 @@ impl Player {
             stop: AtomicBool::new(false),
             output_limit: AtomicU64::new(0),
             max_frames: std::sync::atomic::AtomicUsize::new(MAX_QUEUED_FRAMES),
+            upscale: AtomicBool::new(false),
+            upscale_status: Mutex::new(upscale::Status::Off),
         });
 
         let mut audio_out = None;
@@ -503,6 +509,18 @@ impl Player {
     /// Tell the decoder the largest size video can currently be shown at.
     pub fn set_output_limit(&self, width: u32, height: u32) {
         self.shared.output_limit.store((width as u64) << 32 | height as u64, Ordering::Relaxed);
+    }
+
+    /// Upscale video on the GPU to the output limit. Applies to frames
+    /// decoded from now on.
+    pub fn set_upscaling(&self, on: bool) {
+        self.shared.upscale.store(on, Ordering::Relaxed);
+    }
+
+    /// What upscaling did with the latest decoded frame (so, while paused,
+    /// with the frame on screen).
+    pub fn upscale_status(&self) -> upscale::Status {
+        self.shared.upscale_status.lock().unwrap().clone()
     }
 
     pub fn levels(&self) -> [f32; 2] {
@@ -909,9 +927,21 @@ fn demux_thread(
 }
 
 fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time_base: TimeBase, shared: Arc<Shared>) {
-    let push = |frames: Vec<DecodedFrame>, generation: u64| {
+    let mut stage = Stage::default();
+    let mut push = |frames: Vec<DecodedFrame>, generation: u64| {
         for f in frames {
             let pts = time_base.calc_time(Timestamp::new(f.pts)).map_or(0.0, |t| t.as_secs_f64());
+            // Upscaled here, off the UI thread, to the size it is shown at.
+            let (width, height, bgra) = if shared.upscale.load(Ordering::Relaxed) {
+                let packed = shared.output_limit.load(Ordering::Relaxed);
+                let limit = (packed != 0).then_some(((packed >> 32) as u32, packed as u32));
+                let (frame, status) = stage.process(pts, f.width, f.height, f.bgra, limit);
+                *shared.upscale_status.lock().unwrap() = status;
+                frame
+            } else {
+                *shared.upscale_status.lock().unwrap() = upscale::Status::Off;
+                (f.width, f.height, f.bgra)
+            };
             let target = *shared.seek_target.lock().unwrap();
             let mut q = shared.frames.lock().unwrap();
             // Of the frames at or before the seek target only the latest can
@@ -935,7 +965,7 @@ fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time
             }
             // Decoders may emit in decode order; keep the queue in PTS order.
             let at = q.iter().position(|e| e.pts > pts).unwrap_or(q.len());
-            q.insert(at, VideoFrame { pts, generation, width: f.width, height: f.height, bgra: f.bgra });
+            q.insert(at, VideoFrame { pts, generation, width, height, bgra });
         }
     };
     let mut applied_limit = 0u64;

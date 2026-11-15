@@ -20,6 +20,9 @@ the Raspberry Pi 5. The Windows build has not been tested yet.
   including the one the controls are on. Choose them in the settings and
   switch them on and off from the status bar; the choice is remembered, and
   each output comes back by itself when its display is reconnected
+- Real-time GPU upscaling (optional) for video smaller than the screen:
+  MetalFX on Apple GPUs, AMD FSR 1 on other GPUs; the settings name the
+  upscaler in use (see [Upscaling](#upscaling))
 - Command palette and fuzzy file finder, keyboard-first controls
 - Hardware media keys and the system Now Playing view (macOS Control
   Center, Windows media overlay, Linux MPRIS)
@@ -58,6 +61,7 @@ The stack:
 | macOS hardware video | VideoToolbox through the [objc2](https://github.com/madsmtm/objc2) bindings |
 | Raspberry Pi hardware video | own V4L2 request-API backend, with [v4l2r](https://github.com/Gnurou/v4l2r) and the [cros-codecs](https://github.com/chromeos/cros-codecs) HEVC parser |
 | Media keys and Now Playing | [souvlaki](https://github.com/Sinono3/souvlaki) |
+| GPU upscaling | MetalFX through objc2; [wgpu](https://github.com/gfx-rs/wgpu) running a WGSL port of AMD FSR 1 |
 
 Two parts are not Rust: H.264 software decoding uses Cisco's
 [OpenH264](https://github.com/cisco/openh264) (C++, compiled from bundled
@@ -107,6 +111,47 @@ Raspberry Pi 5, frames shown on screen by the app:
 | 1080p60 HEVC | 60 fps |
 | 4K30 HEVC 10-bit, window up to 1920x1080 | 30 fps |
 | 4K30 HEVC 10-bit, full screen on a 4K display | about 18 fps |
+
+## Upscaling
+
+When a video is smaller than the screen showing it (a 1080p file on a 4K
+display or projector), the player can scale each frame up on the GPU instead
+of leaving it to the display's plain bilinear stretch. Switch it on in the
+settings; it is off by default.
+
+The upscaler depends on the hardware, and the settings and the info panel
+name the one in use:
+
+| Hardware | Upscaler |
+|---|---|
+| Apple silicon, and other Macs whose GPU MetalFX supports | MetalFX spatial upscaling, Apple's real-time upscaler |
+| Any other GPU: Linux and Windows PCs (Vulkan or Direct3D 12), the Raspberry Pi (Vulkan), Macs without MetalFX (Metal) | AMD FidelityFX Super Resolution 1 (EASU upscaling, then RCAS sharpening) as wgpu compute shaders |
+| No GPU, or only a software renderer | None; the setting is unavailable |
+
+Both are spatial upscalers: each frame is rebuilt from its own pixels,
+reconstructing and sharpening edges without inventing detail, so the picture
+stays faithful to the source. Generative (diffusion) upscalers can recover
+more apparent detail, but they alter content and are far from real time.
+
+- Frames grow at most 2x per side (the display's scaling does the rest) and
+  only when that gains at least 10%.
+- The target size is the largest window showing the video, external outputs
+  included.
+- If upscaling takes more than half of a frame's display time for 10 frames
+  in a row, it stops for that file and the info panel says so, so it never
+  slows playback down.
+- On a test image that was halved and scaled back up, both score about 30 dB
+  PSNR against the original, against 25.5 dB for bilinear scaling.
+
+Time per frame on an Apple M5 Max, including the copies to and from the GPU
+(`cargo run --release --example bench_upscale`):
+
+| Size | MetalFX | FSR 1 (on Metal) |
+|---|---|---|
+| 720p to 1440p | 1.5 ms | 1.5 ms |
+| 1080p to 2160p | 2.7 ms | 3.2 ms |
+
+Not yet measured on the Raspberry Pi, Linux or Windows.
 
 ## Building
 
@@ -162,6 +207,7 @@ same decoder and may work.
 | Previous / next track | P / N, Cmd+Left / Cmd+Right | P / N, Ctrl+Left / Ctrl+Right |
 | Repeat off / all / one | R | R |
 | Full screen | F, or double-click the video | F, or double-click the video |
+| Upscaling on / off | Settings | Settings |
 | Choose output displays | Settings | Settings |
 | Outputs on / off | Cmd+Shift+F, or the monitor button in the status bar | Ctrl+Shift+F, or the monitor button |
 | Settings | Cmd+, the gear in the status bar, or the app menu | Ctrl+, or the gear in the status bar |
@@ -212,7 +258,7 @@ with a message, when there is none. Fixtures live in `tests/fixtures`;
 `examples/` has tools for working on decoders: `bench_decode` and
 `bench_playback` measure throughput and real-time delivery for any file,
 `bench_seek` times how quickly playback resumes after clicking or dragging
-the seek bar,
+the seek bar, `bench_upscale` times each upscaler the machine offers,
 `cmp_decoders` compares software and hardware output frame by frame, and
 `dump_frames` writes raw decoded frames to a file for comparing decoders
 across machines.
@@ -227,6 +273,7 @@ across machines.
 | `src/media/video/` | video decoder trait, reorder buffer, colour conversion, backends |
 | `src/media/video/hevc/` | Raspberry Pi V4L2 HEVC decoder |
 | `src/media/mp4_timing.rs` | MP4 composition offsets and edit lists |
+| `src/media/upscale/` | GPU upscaling: MetalFX, and the FSR 1 compute shaders (`fsr1.wgsl`) |
 | `vendor/` | patched copies of upstream crates (each has a `PATCHED.md`) |
 
 ### Upstream issues worked around
@@ -261,5 +308,9 @@ These are worth fixing upstream; each workaround can go once they are.
   (VA-API), or for H.264 on the Raspberry Pi 4. HEVC and VP9 files play
   audio only on those systems.
 - On the Pi 5, 4K HEVC full screen on a 4K display runs at about 18 fps.
+- Upscaled frames make a round trip through the GPU, because the UI toolkit
+  draws video from main memory: each frame is uploaded, upscaled, read back
+  and uploaded again for display. That is cheap on unified-memory machines
+  (Apple silicon, the Pi) and costs bus bandwidth on discrete GPUs.
 - With PulseAudio's ALSA plugin, sound can start about 2 s late (video
   waits for it, so sync is kept). PipeWire does not show this.

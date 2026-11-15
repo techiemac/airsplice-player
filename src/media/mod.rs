@@ -4,6 +4,7 @@ pub mod audio;
 pub mod mp4_timing;
 pub mod opus;
 pub mod player;
+pub mod upscale;
 pub mod video;
 
 pub use player::{Image, MediaInfo, Player, Summary, VideoFrame, probe};

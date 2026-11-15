@@ -36,6 +36,10 @@ dirs = "7.0.0"
 souvlaki = { version = "0.9.3", default-features = false, features = ["use_zbus"] }
 cros-codecs = { version = "0.0.6", default-features = false }
 notify = "8"
+# Real-time upscaling on the GPU (FSR 1 compute shaders) through Vulkan,
+# Direct3D 12 or Metal. Pinned a release behind the newest.
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
+pollster = "1"
 
 [profile.dev.package."*"]
 # Decoders are unusably slow without optimisation, even in debug builds.
@@ -63,6 +67,10 @@ objc2-video-toolbox = "0.3.2"
 objc2-core-media = "0.3.2"
 objc2-core-video = "0.3.2"
 objc2-core-foundation = "0.3.2"
+# Real-time upscaling with MetalFX, the system's GPU upscaler.
+objc2 = "0.6"
+objc2-metal = "0.3.2"
+objc2-metal-fx = "0.3.2"
 
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
