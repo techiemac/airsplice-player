@@ -62,7 +62,7 @@ impl MetalFx {
     }
 
     pub fn name(&self) -> String {
-        format!("MetalFX on {}", self.gpu.device.name())
+        "MetalFX".into()
     }
 
     fn create_frames(&self, w: u32, h: u32, ow: u32, oh: u32) -> Result<Frames> {

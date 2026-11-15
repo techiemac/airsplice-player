@@ -1032,13 +1032,13 @@ impl MediaPlayer {
     fn upscale_label(status: &UpscaleStatus) -> String {
         match status {
             UpscaleStatus::Off => "Off".into(),
-            UpscaleStatus::NotNeeded => "Not needed: the video already fills the display".into(),
+            UpscaleStatus::NotNeeded => "Not needed".into(),
             UpscaleStatus::Active { from, to } => {
                 let by = upscale::available().unwrap_or("GPU");
-                format!("{} × {} to {} × {}, {by}", from.0, from.1, to.0, to.1)
+                format!("{} × {} → {} × {} using {by}", from.0, from.1, to.0, to.1)
             }
-            UpscaleStatus::TooSlow => "Stopped for this file: too slow on this GPU".into(),
-            UpscaleStatus::Failed(e) => format!("Stopped for this file: {e}"),
+            UpscaleStatus::TooSlow => "Stopped: too slow".into(),
+            UpscaleStatus::Failed(e) => format!("Stopped: {e}"),
         }
     }
 

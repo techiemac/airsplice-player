@@ -110,7 +110,8 @@ impl Gpu {
             wgpu::Backend::Dx12 => "Direct3D 12",
             _ => "GPU",
         };
-        let name = format!("AMD FSR 1 on {} ({backend})", info.name.trim());
+        log::info!("FSR upscaling on {} ({backend})", info.name.trim());
+        let name = "AMD FSR 1".to_string();
         Ok(Self { device, queue, layout, easu, rcas, name, error })
     }
 }

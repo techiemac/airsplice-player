@@ -161,7 +161,7 @@ impl MediaPlayer {
             // Still chosen, so its display went away. Closing beats letting
             // the OS move the window onto another display.
             if self.outputs_on && self.output_on(&out.uuid) {
-                self.notice = Some(format!("{} was disconnected; its output comes back when it is reconnected", out.label));
+                self.notice = Some(format!("{} disconnected", out.label));
             }
             cx.notify();
         }
@@ -312,10 +312,10 @@ impl MediaPlayer {
             .when(upscaler.is_some(), |el| el.hover(|s| s.bg(Theme::hover())).cursor_pointer())
             .on_click(cx.listener(|this, _, window, cx| this.settings_toggle(0, window, cx)))
             .child(checkbox(self.upscaling && upscaler.is_some(), upscaler.is_some()))
-            .child(div().flex_1().min_w_0().truncate().text_color(Theme::text()).child("Upscale video to the display's resolution"));
+            .child(div().flex_1().min_w_0().truncate().text_color(Theme::text()).child("Upscale video"));
         let upscale_detail = match upscaler {
-            Some(name) => format!("Uses {name}. Sharpens edges from the frame itself; adds no invented detail."),
-            None => "Not available: no supported GPU was found.".into(),
+            Some(name) => format!("Upscales using {name}"),
+            None => "No supported GPU".into(),
         };
         let upscale_now = self.upscaling.then(|| self.player.as_ref().map(|p| Self::upscale_label(&p.upscale_status()))).flatten();
 
@@ -400,7 +400,7 @@ impl MediaPlayer {
                             .pb(px(6.))
                             .text_xs()
                             .text_color(Theme::text_muted())
-                            .child("Show the picture full screen on these displays, as many as you like. The monitor button in the status bar switches them on and off."),
+                            .child("Show video full screen on these displays."),
                     )
                     .children(choices)
                     .when(!self.outputs_on && !self.output_setting.is_empty(), |el| {
@@ -410,19 +410,9 @@ impl MediaPlayer {
                                 .pt(px(4.))
                                 .text_xs()
                                 .text_color(Theme::warning())
-                                .child(format!("Outputs are switched off. Turn them on with the monitor button or {}.", window.keystroke_text_for(&ToggleOutputs))),
+                                .child(format!("Outputs are off ({})", window.keystroke_text_for(&ToggleOutputs))),
                         )
                     }),
-            )
-            .child(
-                div()
-                    .px(px(12.))
-                    .py(px(8.))
-                    .border_t_1()
-                    .border_color(Theme::border_variant())
-                    .text_xs()
-                    .text_color(Theme::text_placeholder())
-                    .child("Up and Down to move, Enter to switch on or off, Esc to close"),
             );
 
         Some(
