@@ -32,6 +32,7 @@ use symphonia::core::units::{Time, TimeBase, Timestamp};
 
 use super::audio::{AudioOutput, Clock, Converter};
 use super::opus::{OPUS_RATE, Opus};
+use super::picture::{self, Outline};
 use super::upscale::{self, Stage};
 use super::video::{self, DecodedFrame, VideoDecoder};
 
@@ -307,10 +308,34 @@ pub struct Player {
     last_shown: std::cell::Cell<Option<(u64, f64)>>,
     /// When the current pre-roll began (open or seek).
     preroll_since: std::cell::Cell<std::time::Instant>,
+    /// Set when playing a still image or an animated GIF.
+    picture: Option<Outline>,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Shared {
+            generation: AtomicU64::new(0),
+            seek_target: Mutex::new(0.0),
+            frames: Mutex::new(VecDeque::new()),
+            frames_cv: Condvar::new(),
+            demux_done: AtomicU64::new(NO_GENERATION),
+            video_done: AtomicU64::new(NO_GENERATION),
+            error: Mutex::new(None),
+            stop: AtomicBool::new(false),
+            output_limit: AtomicU64::new(0),
+            max_frames: std::sync::atomic::AtomicUsize::new(MAX_QUEUED_FRAMES),
+            upscale: AtomicBool::new(false),
+            upscale_status: Mutex::new(upscale::Status::Off),
+        }
+    }
 }
 
 impl Player {
     pub fn open(path: &Path, volume: f32, muted: bool) -> Result<Self> {
+        if picture::is_picture(path) {
+            return Self::open_picture(path);
+        }
         let mut format = open_format(path)?;
 
         let mut info = MediaInfo {
@@ -346,20 +371,7 @@ impl Player {
             video_track = None;
         }
 
-        let shared = Arc::new(Shared {
-            generation: AtomicU64::new(0),
-            seek_target: Mutex::new(0.0),
-            frames: Mutex::new(VecDeque::new()),
-            frames_cv: Condvar::new(),
-            demux_done: AtomicU64::new(NO_GENERATION),
-            video_done: AtomicU64::new(NO_GENERATION),
-            error: Mutex::new(None),
-            stop: AtomicBool::new(false),
-            output_limit: AtomicU64::new(0),
-            max_frames: std::sync::atomic::AtomicUsize::new(MAX_QUEUED_FRAMES),
-            upscale: AtomicBool::new(false),
-            upscale_status: Mutex::new(upscale::Status::Off),
-        });
+        let shared = Arc::new(Shared::new());
 
         let mut audio_out = None;
         let mut audio_pipeline = None;
@@ -447,10 +459,43 @@ impl Player {
             paused: false,
             last_shown: Default::default(),
             preroll_since: std::cell::Cell::new(std::time::Instant::now()),
+            picture: None,
+        })
+    }
+
+    /// A still image or animated GIF: frames come from a picture thread
+    /// instead of a demuxer and decoder, timed by the wall clock.
+    fn open_picture(path: &Path) -> Result<Self> {
+        let outline = picture::outline(path)?;
+        let info = MediaInfo {
+            path: path.to_path_buf(),
+            title: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            duration: outline.duration,
+            video: Some(VideoInfo { codec: outline.format, decoder: "image (software)", width: outline.width, height: outline.height }),
+            ..Default::default()
+        };
+        let shared = Arc::new(Shared::new());
+        {
+            let (shared, path, outline) = (shared.clone(), path.to_path_buf(), outline.clone());
+            thread::Builder::new().name("picture".into()).spawn(move || picture_thread(&path, &outline, &shared))?;
+        }
+        Ok(Self {
+            info,
+            shared,
+            clock: Arc::new(Clock::wall()),
+            audio: None,
+            paused: false,
+            last_shown: Default::default(),
+            preroll_since: std::cell::Cell::new(std::time::Instant::now()),
+            picture: Some(outline),
         })
     }
 
     pub fn position(&self) -> f64 {
+        // A still has no timeline.
+        if self.picture.as_ref().is_some_and(Outline::is_still) {
+            return 0.0;
+        }
         let pos = self.clock.now();
         match self.info.duration {
             Some(d) => pos.clamp(0.0, d),
@@ -595,6 +640,13 @@ impl Player {
     }
 
     pub fn is_finished(&self) -> bool {
+        match &self.picture {
+            // A still stays up until the user moves on.
+            Some(p) if p.is_still() => return false,
+            // An animation's last frame shows for its full delay.
+            Some(p) if self.clock.now() < p.duration.unwrap_or(0.0) - SAME_TIME => return false,
+            _ => {}
+        }
         let generation = self.shared.current();
         if self.shared.demux_done.load(Ordering::Acquire) != generation {
             return false;
@@ -637,6 +689,10 @@ pub struct Summary {
 }
 
 pub fn probe(path: &Path) -> Result<Summary> {
+    if picture::is_picture(path) {
+        let outline = picture::outline(path)?;
+        return Ok(Summary { title: None, artist: None, duration: outline.duration, has_video: true });
+    }
     let mut format = open_format(path)?;
     let mut info = MediaInfo::default();
     read_tags(format.as_mut(), &mut info, false);
@@ -926,46 +982,112 @@ fn demux_thread(
     }
 }
 
+/// Queue one decoded frame for display, upscaled first if that is switched
+/// on, waiting while the queue is full. False when a seek or stop made the
+/// frame moot (the caller stops pushing that generation).
+fn queue_frame(shared: &Shared, stage: &mut Stage, generation: u64, pts: f64, width: u32, height: u32, bgra: Vec<u8>) -> bool {
+    // Upscaled here, off the UI thread, to the size it is shown at.
+    let (width, height, bgra) = if shared.upscale.load(Ordering::Relaxed) {
+        let packed = shared.output_limit.load(Ordering::Relaxed);
+        let limit = (packed != 0).then_some(((packed >> 32) as u32, packed as u32));
+        let (frame, status) = stage.process(pts, width, height, bgra, limit);
+        *shared.upscale_status.lock().unwrap() = status;
+        frame
+    } else {
+        *shared.upscale_status.lock().unwrap() = upscale::Status::Off;
+        (width, height, bgra)
+    };
+    let target = *shared.seek_target.lock().unwrap();
+    let mut q = shared.frames.lock().unwrap();
+    // Of the frames at or before the seek target only the latest can
+    // ever be shown (it is the one on screen at the target), so a
+    // newer one replaces older ones instead of waiting behind them.
+    // With a one-frame queue, waiting would never end.
+    let held = |e: &VideoFrame| e.generation == generation && e.pts <= target + SAME_TIME;
+    if pts <= target + SAME_TIME {
+        q.retain(|e| !held(e) || e.pts >= pts);
+    }
+    // The one frame held at or before the target does not count: the
+    // picker needs its successor to know it is the one to show.
+    while q.iter().filter(|e| !held(e)).count() >= shared.max_frames.load(Ordering::Relaxed)
+        && shared.current() == generation
+        && !shared.stopped()
+    {
+        q = shared.frames_cv.wait_timeout(q, StdDuration::from_millis(100)).unwrap().0;
+    }
+    if shared.current() != generation || shared.stopped() {
+        return false;
+    }
+    // Decoders may emit in decode order; keep the queue in PTS order.
+    let at = q.iter().position(|e| e.pts > pts).unwrap_or(q.len());
+    q.insert(at, VideoFrame { pts, generation, width, height, bgra });
+    true
+}
+
+/// Feeds a picture's frames into the queue like a video decoder would:
+/// from the frame on screen at the seek target onwards, then waits for the
+/// next seek. Frames are decoded once, in order, and kept, so scrubbing
+/// back is instant.
+fn picture_thread(path: &Path, outline: &Outline, shared: &Shared) {
+    let mut stage = Stage::default();
+    let mut decoded: Vec<Vec<u8>> = Vec::new();
+    let mut frames = None;
+    loop {
+        if shared.stopped() {
+            return;
+        }
+        let generation = shared.current();
+        let target = *shared.seek_target.lock().unwrap();
+        let first = outline.starts.partition_point(|&s| s <= target + SAME_TIME).saturating_sub(1);
+        let mut interrupted = false;
+        for (i, &start) in outline.starts.iter().enumerate().skip(first) {
+            while decoded.len() <= i {
+                let next = match frames.as_mut() {
+                    Some(f) => f,
+                    None => match picture::frames(path) {
+                        Ok(f) => frames.insert(f),
+                        Err(e) => {
+                            *shared.error.lock().unwrap() = Some(format!("{e:#}"));
+                            return;
+                        }
+                    },
+                };
+                match next.next() {
+                    Some(Ok(px)) => decoded.push(px),
+                    Some(Err(e)) => {
+                        *shared.error.lock().unwrap() = Some(format!("{e:#}"));
+                        return;
+                    }
+                    // Fewer frames than the outline counted: end here.
+                    None => break,
+                }
+            }
+            let Some(px) = decoded.get(i) else { break };
+            if !queue_frame(shared, &mut stage, generation, start, outline.width, outline.height, px.clone()) {
+                interrupted = true;
+                break;
+            }
+        }
+        if interrupted {
+            continue;
+        }
+        shared.video_done.store(generation, Ordering::Release);
+        shared.demux_done.store(generation, Ordering::Release);
+        let mut q = shared.frames.lock().unwrap();
+        while shared.current() == generation && !shared.stopped() {
+            q = shared.frames_cv.wait_timeout(q, StdDuration::from_millis(100)).unwrap().0;
+        }
+    }
+}
+
 fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time_base: TimeBase, shared: Arc<Shared>) {
     let mut stage = Stage::default();
     let mut push = |frames: Vec<DecodedFrame>, generation: u64| {
         for f in frames {
             let pts = time_base.calc_time(Timestamp::new(f.pts)).map_or(0.0, |t| t.as_secs_f64());
-            // Upscaled here, off the UI thread, to the size it is shown at.
-            let (width, height, bgra) = if shared.upscale.load(Ordering::Relaxed) {
-                let packed = shared.output_limit.load(Ordering::Relaxed);
-                let limit = (packed != 0).then_some(((packed >> 32) as u32, packed as u32));
-                let (frame, status) = stage.process(pts, f.width, f.height, f.bgra, limit);
-                *shared.upscale_status.lock().unwrap() = status;
-                frame
-            } else {
-                *shared.upscale_status.lock().unwrap() = upscale::Status::Off;
-                (f.width, f.height, f.bgra)
-            };
-            let target = *shared.seek_target.lock().unwrap();
-            let mut q = shared.frames.lock().unwrap();
-            // Of the frames at or before the seek target only the latest can
-            // ever be shown (it is the one on screen at the target), so a
-            // newer one replaces older ones instead of waiting behind them.
-            // With a one-frame queue, waiting would never end.
-            let held = |e: &VideoFrame| e.generation == generation && e.pts <= target + SAME_TIME;
-            if pts <= target + SAME_TIME {
-                q.retain(|e| !held(e) || e.pts >= pts);
-            }
-            // The one frame held at or before the target does not count: the
-            // picker needs its successor to know it is the one to show.
-            while q.iter().filter(|e| !held(e)).count() >= shared.max_frames.load(Ordering::Relaxed)
-                && shared.current() == generation
-                && !shared.stopped()
-            {
-                q = shared.frames_cv.wait_timeout(q, StdDuration::from_millis(100)).unwrap().0;
-            }
-            if shared.current() != generation || shared.stopped() {
+            if !queue_frame(&shared, &mut stage, generation, pts, f.width, f.height, f.bgra) {
                 return;
             }
-            // Decoders may emit in decode order; keep the queue in PTS order.
-            let at = q.iter().position(|e| e.pts > pts).unwrap_or(q.len());
-            q.insert(at, VideoFrame { pts, generation, width, height, bgra });
         }
     };
     let mut applied_limit = 0u64;
@@ -1130,6 +1252,78 @@ mod tests {
                 assert!((at - expected).abs() < 0.02, "{name}: seek to {target} started at {at}, expected the keyframe at {expected}");
             }
         }
+    }
+
+    /// Wait up to `budget_ms` for the frame the player shows next.
+    fn next_frame(p: &Player, budget_ms: u64) -> VideoFrame {
+        let deadline = std::time::Instant::now() + StdDuration::from_millis(budget_ms);
+        loop {
+            if let Some(f) = p.take_frame() {
+                return f;
+            }
+            assert!(std::time::Instant::now() < deadline, "no frame within {budget_ms} ms");
+            thread::sleep(StdDuration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn an_animated_gif_plays_and_scrubs_like_a_video() {
+        use crate::media::picture::tests::{animated_gif, colour, temp_dir};
+        let dir = temp_dir("player");
+        let gif = animated_gif(&dir);
+        let bgra = |i: usize| {
+            let [r, g, b, a] = colour(i);
+            [b, g, r, a]
+        };
+        let mut p = Player::open(&gif, 0.0, true).unwrap();
+        assert_eq!(p.info.duration, Some(1.0));
+        let v = p.info.video.as_ref().unwrap();
+        assert_eq!((v.codec, v.width, v.height), ("GIF", 32, 24));
+        assert_eq!(next_frame(&p, 2000).bgra[..4], bgra(0), "first frame");
+
+        // Paused scrubbing: each target shows the frame on screen then
+        // (frames start at 0, 0.1, 0.3 and 0.6 s), backwards included.
+        p.set_paused(true);
+        for (target, frame) in [(0.35, 2), (0.65, 3), (0.05, 0), (0.15, 1), (0.6, 3)] {
+            p.seek(target);
+            let f = next_frame(&p, 2000);
+            assert_eq!(f.bgra[..4], bgra(frame), "seek to {target}s showed the wrong frame (pts {})", f.pts);
+            assert!((p.position() - target).abs() < 1e-9);
+        }
+
+        // Played from 0.6 s: the last frame holds for its whole 400 ms, then
+        // the clip ends.
+        p.set_paused(false);
+        let started = std::time::Instant::now();
+        while !p.is_finished() {
+            assert!(started.elapsed() < StdDuration::from_secs(3), "never finished");
+            let _ = p.take_frame();
+            thread::sleep(StdDuration::from_millis(5));
+        }
+        assert!(started.elapsed() >= StdDuration::from_millis(350), "ended after {:?}, before the last frame's delay", started.elapsed());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_still_image_shows_and_stays() {
+        use crate::media::picture::tests::temp_dir;
+        let dir = temp_dir("still");
+        let path = dir.join("still.png");
+        image::RgbaImage::from_pixel(20, 10, image::Rgba([250, 100, 0, 255])).save(&path).unwrap();
+        let p = Player::open(&path, 0.0, true).unwrap();
+        assert_eq!(p.info.duration, None);
+        assert_eq!(p.info.video.as_ref().map(|v| v.codec), Some("PNG"));
+        let f = next_frame(&p, 2000);
+        assert_eq!((f.width, f.height, &f.bgra[..4]), (20, 10, &[0, 100, 250, 255][..]));
+        // Nothing ends it and its clock does not run.
+        let until = std::time::Instant::now() + StdDuration::from_millis(300);
+        while std::time::Instant::now() < until {
+            assert!(!p.is_finished(), "a still finished on its own");
+            assert_eq!(p.position(), 0.0);
+            thread::sleep(StdDuration::from_millis(5));
+        }
+        assert!(probe(&path).is_ok_and(|s| s.has_video && s.duration.is_none()));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

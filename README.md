@@ -23,6 +23,8 @@ the Raspberry Pi 5. The Windows build has not been tested yet.
 - Real-time GPU upscaling (optional) for video smaller than the screen:
   MetalFX on Apple GPUs, AMD FSR 1 on other GPUs; the settings name the
   upscaler in use (see [Upscaling](#upscaling))
+- Images: PNG and JPEG stills, and animated GIFs that play and scrub like
+  video
 - Command palette and fuzzy file finder, keyboard-first controls
 - Hardware media keys and the system Now Playing view (macOS Control
   Center, Windows media overlay, Linux MPRIS)
@@ -60,6 +62,7 @@ The stack:
 | Audio output and resampling | [cpal](https://github.com/RustAudio/cpal), [rubato](https://github.com/HEnquist/rubato) |
 | macOS hardware video | VideoToolbox through the [objc2](https://github.com/madsmtm/objc2) bindings |
 | Raspberry Pi hardware video | own V4L2 request-API backend, with [v4l2r](https://github.com/Gnurou/v4l2r) and the [cros-codecs](https://github.com/chromeos/cros-codecs) HEVC parser |
+| Images | [image](https://github.com/image-rs/image) and [gif](https://github.com/image-rs/image-gif) |
 | Media keys and Now Playing | [souvlaki](https://github.com/Sinono3/souvlaki) |
 | GPU upscaling | MetalFX through objc2; [wgpu](https://github.com/gfx-rs/wgpu) running a WGSL port of AMD FSR 1 |
 
@@ -91,6 +94,13 @@ PCM, ADPCM, on every platform. HE-AAC is not supported yet.
 
 When a file's video codec is not supported, its audio still plays and the
 player says why. The info panel (Cmd/Ctrl+R) shows which decoder is in use.
+
+**Images:** PNG and JPEG show as stills, with no timeline, until you move
+on. Animated GIFs play like video: they have a duration, play and pause,
+and scrub on the seek bar, with each frame shown for its GIF delay (delays
+under 20 ms count as 100 ms, as in browsers). A GIF plays once; repeat one
+loops it. Decoded GIF frames are kept for instant scrubbing, so GIFs over
+1 GB decoded are refused.
 
 ### Performance
 
@@ -273,6 +283,7 @@ across machines.
 | `src/media/video/` | video decoder trait, reorder buffer, colour conversion, backends |
 | `src/media/video/hevc/` | Raspberry Pi V4L2 HEVC decoder |
 | `src/media/mp4_timing.rs` | MP4 composition offsets and edit lists |
+| `src/media/picture.rs` | PNG, JPEG and GIF: outlines, frame timing, decoding |
 | `src/media/upscale/` | GPU upscaling: MetalFX, and the FSR 1 compute shaders (`fsr1.wgsl`) |
 | `vendor/` | patched copies of upstream crates (each has a `PATCHED.md`) |
 

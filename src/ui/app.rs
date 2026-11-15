@@ -1737,7 +1737,7 @@ impl MediaPlayer {
             .gap(px(6.))
             .w(px(340.))
             .child(div().text_2xl().text_color(Theme::text()).mb(px(2.)).child("airsplice-player"))
-            .child(div().text_sm().text_color(Theme::text_placeholder()).mb(px(16.)).child("Drop audio or video files anywhere in the window."))
+            .child(div().text_sm().text_color(Theme::text_placeholder()).mb(px(16.)).child("Drop audio, video or image files anywhere in the window."))
             .child(row("Open Files", format!("{cmd}O")))
             .child(row("Command Palette", format!("{shift}{cmd}P")))
             .child(row("Find in Playlist", format!("{cmd}P")))
@@ -2944,6 +2944,32 @@ mod tests {
         });
         tick_until(&view, vcx, "the paused frame at its own size", |v| v.frame.as_ref().is_some_and(|f| f.size(0).width.0 as u32 == source.0));
         assert!(view.read_with(vcx, |v, _| v.player.as_ref().unwrap().is_paused()), "still paused");
+    }
+
+    #[gpui::test]
+    fn an_animated_gif_scrubs_in_the_player(cx: &mut gpui::TestAppContext) {
+        use crate::media::picture::tests::{animated_gif, colour, temp_dir};
+        cx.update(bind_keys);
+        let dir = temp_dir("app");
+        let gif = animated_gif(&dir);
+        let (view, vcx) = cx.add_window_view({
+            let gif = gif.clone();
+            |window, cx| MediaPlayer::new(vec![gif], None, window, cx)
+        });
+        let shows = |i: usize| {
+            let [r, g, b, a] = colour(i);
+            move |v: &MediaPlayer| v.frame.as_ref().and_then(|f| f.as_bytes(0)).is_some_and(|px| px[..4] == [b, g, r, a])
+        };
+        tick_until(&view, vcx, "the first frame", shows(0));
+        assert_eq!(view.read_with(vcx, |v, _| v.player.as_ref().unwrap().info.duration), Some(1.0), "a timeline, like a video");
+
+        // Paused, then scrubbed: the frame on screen follows the seek bar.
+        view.update_in(vcx, |v, window, cx| v.play_pause(&PlayPause, window, cx));
+        for (target, frame) in [(0.65, 3), (0.35, 2), (0.15, 1)] {
+            view.update_in(vcx, |v, _, cx| v.seek_to(target, cx));
+            tick_until(&view, vcx, &format!("frame {frame} at {target}s"), shows(frame));
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[gpui::test]

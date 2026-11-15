@@ -60,6 +60,7 @@ dependencies = [
  "cros-codecs",
  "dirs 7.0.0",
  "env_logger",
+ "gif",
  "gpui",
  "image",
  "libc",
