@@ -36,6 +36,8 @@ pub struct Session {
     /// Seconds a still image shows before the playlist moves on; 0 keeps
     /// it up until skipped.
     pub still_seconds: u32,
+    /// Move on to the next playlist entry when one ends.
+    pub autoplay: bool,
 }
 
 /// One open tab: its file and where it was left.
@@ -64,6 +66,7 @@ impl Default for Session {
             outputs_on: true,
             upscaling: false,
             still_seconds: 10,
+            autoplay: true,
         }
     }
 }
@@ -194,6 +197,7 @@ mod tests {
             outputs_on: false,
             upscaling: true,
             still_seconds: 45,
+            autoplay: false,
         };
         store.save(&session).unwrap();
         assert_eq!(store.load(), session);

@@ -11,19 +11,34 @@ use super::*;
 
 pub(super) const SETTINGS_CONTEXT: &str = "Settings";
 
-/// The still durations the settings step through, in seconds; 0 keeps a
-/// still up until skipped.
-pub(super) const STILL_PRESETS: &[u32] = &[0, 1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300];
+/// The longest a still can be set to show, in seconds (an hour).
+pub(super) const MAX_STILL_SECONDS: u32 = 3600;
 
-/// The preset `by` steps from `secs` (which need not be a preset),
-/// stopping at the ends, or wrapping when `wrap`.
-pub(super) fn step_still(secs: u32, by: isize, wrap: bool) -> u32 {
-    let at = STILL_PRESETS.iter().position(|&p| p >= secs).unwrap_or(STILL_PRESETS.len() - 1) as isize;
-    // A value between presets steps to its neighbours.
-    let at = if STILL_PRESETS[at as usize] > secs && by > 0 { at - 1 } else { at };
-    let len = STILL_PRESETS.len() as isize;
-    let next = if wrap { (at + by).rem_euclid(len) } else { (at + by).clamp(0, len - 1) };
-    STILL_PRESETS[next as usize]
+/// `secs` moved by `by` seconds, within 0 (until skipped) and the maximum.
+pub(super) fn step_still(secs: u32, by: i64) -> u32 {
+    (secs as i64 + by).clamp(0, MAX_STILL_SECONDS as i64) as u32
+}
+
+/// The seconds typed so far after `key` (a digit or backspace); `None`
+/// when the key does not edit a number.
+pub(super) fn type_still(typed: &str, key: &str) -> Option<String> {
+    let mut typed = typed.to_string();
+    match key {
+        "backspace" => {
+            typed.pop();
+        }
+        d if d.len() == 1 && d.chars().all(|c| c.is_ascii_digit()) => {
+            if typed == "0" {
+                typed.clear();
+            }
+            typed.push_str(d);
+            if typed.parse::<u32>().is_ok_and(|v| v > MAX_STILL_SECONDS) {
+                typed = MAX_STILL_SECONDS.to_string();
+            }
+        }
+        _ => return None,
+    }
+    Some(typed)
 }
 
 fn still_label(secs: u32) -> String {
@@ -39,6 +54,8 @@ const DISPLAY_POLL: Duration = Duration::from_millis(500);
 
 pub(super) struct SettingsScreen {
     pub(super) selected: usize,
+    /// Digits typed into the still duration, while editing it.
+    pub(super) typed: Option<String>,
 }
 
 /// A connected display, as the settings and the footer menu name it.
@@ -264,9 +281,17 @@ impl MediaPlayer {
             return;
         }
         self.picker = None;
-        self.settings = Some(SettingsScreen { selected: 0 });
+        self.settings = Some(SettingsScreen { selected: 0, typed: None });
         window.focus(&self.settings_focus);
         cx.notify();
+    }
+
+    /// Select a settings row, ending any typing.
+    fn settings_select(&mut self, ix: usize) {
+        if let Some(s) = self.settings.as_mut() {
+            s.selected = ix;
+            s.typed = None;
+        }
     }
 
     pub(super) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -281,14 +306,16 @@ impl MediaPlayer {
             && len > 0
         {
             s.selected = (s.selected as isize + by).rem_euclid(len) as usize;
+            s.typed = None;
             cx.notify();
         }
     }
 
     fn settings_toggle(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(s) = self.settings.as_mut() {
+        let was_typing = self.settings.as_mut().and_then(|s| {
             s.selected = ix;
-        }
+            s.typed.take()
+        });
         match ix {
             0 => {
                 // Nothing to switch on without a GPU that can do it.
@@ -296,7 +323,15 @@ impl MediaPlayer {
                     self.set_upscaling(!self.upscaling, cx);
                 }
             }
-            1 => self.set_still_seconds(step_still(self.still_seconds, 1, true), cx),
+            // Enter on the stills row starts typing seconds, or ends it.
+            1 => {
+                if was_typing.is_none()
+                    && let Some(s) = self.settings.as_mut()
+                {
+                    s.typed = Some(String::new());
+                }
+                cx.notify();
+            }
             _ => {
                 let Some(screen) = self.screens(window, cx).into_iter().nth(ix - FIRST_SCREEN_ROW) else { return };
                 self.toggle_output(screen.uuid, window, cx);
@@ -304,11 +339,30 @@ impl MediaPlayer {
         }
     }
 
-    /// Left and Right: change the still duration when that row is selected.
-    fn settings_adjust(&mut self, by: isize, cx: &mut Context<Self>) {
-        if self.settings.as_ref().is_some_and(|s| s.selected == 1) {
-            self.set_still_seconds(step_still(self.still_seconds, by, false), cx);
+    /// Left and Right: a second less or more, when the stills row is
+    /// selected.
+    fn settings_adjust(&mut self, by: i64, cx: &mut Context<Self>) {
+        if let Some(s) = self.settings.as_mut()
+            && s.selected == 1
+        {
+            s.typed = None;
+            self.set_still_seconds(step_still(self.still_seconds, by), cx);
         }
+    }
+
+    /// Digits typed while the stills row is selected set the seconds
+    /// directly; Backspace deletes one. Applied as you type.
+    fn settings_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let ks = &event.keystroke;
+        if ks.modifiers.control || ks.modifiers.platform || ks.modifiers.alt {
+            return;
+        }
+        let Some(s) = self.settings.as_mut().filter(|s| s.selected == 1) else { return };
+        let Some(typed) = type_still(s.typed.as_deref().unwrap_or(""), &ks.key) else { return };
+        let secs = typed.parse().unwrap_or(0);
+        s.typed = Some(typed);
+        cx.stop_propagation();
+        self.set_still_seconds(secs, cx);
     }
 
     pub(super) fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -353,6 +407,7 @@ impl MediaPlayer {
 
         // Stills: row 1.
         let secs = self.still_seconds;
+        let typed = settings.typed.clone();
         let still_row = div()
             .id("still-choice")
             .h(px(32.))
@@ -365,11 +420,39 @@ impl MediaPlayer {
             .when(selected == 1, |el| el.bg(Theme::selected()))
             .child(div().flex_1().min_w_0().truncate().text_color(Theme::text()).child("Show stills for"))
             .child(icon_button("still-less", Icon::Minus, false, cx.listener(move |this, _, _, cx| {
-                this.set_still_seconds(step_still(secs, -1, false), cx)
+                this.settings_select(1);
+                this.set_still_seconds(step_still(secs, -1), cx)
             })))
-            .child(div().w(px(96.)).flex_none().text_center().text_color(Theme::text()).child(still_label(secs)))
+            .child(
+                // Click to type a number of seconds.
+                div()
+                    .id("still-value")
+                    .w(px(96.))
+                    .h(px(24.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(if typed.is_some() { Theme::accent() } else { Theme::border_variant() })
+                    .cursor_text()
+                    .text_color(Theme::text())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(s) = this.settings.as_mut() {
+                            s.selected = 1;
+                            s.typed = Some(String::new());
+                        }
+                        cx.notify();
+                    }))
+                    .map(|el| match &typed {
+                        Some(t) => el.child(div().flex().items_center().child(t.clone()).child(caret()).child(" s")),
+                        None => el.child(still_label(secs)),
+                    }),
+            )
             .child(icon_button("still-more", Icon::Plus, false, cx.listener(move |this, _, _, cx| {
-                this.set_still_seconds(step_still(secs, 1, false), cx)
+                this.settings_select(1);
+                this.set_still_seconds(step_still(secs, 1), cx)
             })));
 
         let row = |ix: usize, screen: &Screen| {
@@ -405,6 +488,7 @@ impl MediaPlayer {
                 this.settings_toggle(ix, window, cx)
             }))
             .on_action(cx.listener(|this, _: &PickerDismiss, window, cx| this.close_settings(window, cx)))
+            .on_key_down(cx.listener(Self::settings_key))
             .on_action(cx.listener(|this, _: &SettingsLess, _, cx| this.settings_adjust(-1, cx)))
             .on_action(cx.listener(|this, _: &SettingsMore, _, cx| this.settings_adjust(1, cx)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -506,12 +590,16 @@ mod tests {
     }
 
     #[test]
-    fn still_durations_step_through_the_presets() {
-        assert_eq!((step_still(10, 1, false), step_still(10, -1, false)), (15, 5));
-        assert_eq!(step_still(0, -1, false), 0, "stops at until skipped");
-        assert_eq!(step_still(300, 1, false), 300, "stops at the longest");
-        assert_eq!((step_still(300, 1, true), step_still(0, -1, true)), (0, 300), "Enter wraps");
-        assert_eq!((step_still(12, 1, false), step_still(12, -1, false)), (15, 10), "a value between presets");
+    fn still_durations_are_whole_seconds_typed_or_stepped() {
+        assert_eq!((step_still(10, 1), step_still(10, -1)), (11, 9));
+        assert_eq!(step_still(0, -1), 0, "stops at until skipped");
+        assert_eq!(step_still(MAX_STILL_SECONDS, 1), MAX_STILL_SECONDS, "stops at an hour");
+        let typed = ["1", "2", "7"].iter().fold(String::new(), |t, k| type_still(&t, k).unwrap());
+        assert_eq!(typed, "127");
+        assert_eq!(type_still("127", "backspace").as_deref(), Some("12"));
+        assert_eq!(type_still("0", "5").as_deref(), Some("5"), "a leading zero is replaced");
+        assert_eq!(type_still("999", "9").as_deref(), Some("3600"), "capped at an hour");
+        assert_eq!(type_still("12", "a"), None, "not a digit");
         assert_eq!((still_label(0), still_label(45)), ("Until skipped".to_string(), "45 s".to_string()));
     }
 

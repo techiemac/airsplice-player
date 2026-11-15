@@ -23,6 +23,7 @@ use super::output::{self, OutputView};
 use super::session::{Session, SessionStore, TabState};
 use super::theme::{Theme, mono_font};
 use crate::media::upscale::{self, Status as UpscaleStatus};
+use crate::media::picture::is_picture;
 use crate::media::{Image, Player, Summary, probe};
 
 mod settings;
@@ -70,6 +71,7 @@ actions!(
         OpenSettings,
         SettingsLess,
         SettingsMore,
+        ToggleAutoplay,
     ]
 );
 
@@ -247,6 +249,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Volume Down", Box::new(VolumeDown)),
         ("Toggle Mute", Box::new(ToggleMute)),
         ("Cycle Repeat Mode", Box::new(CycleRepeat)),
+        ("Toggle Autoplay", Box::new(ToggleAutoplay)),
         ("Open Files…", Box::new(OpenFiles)),
         ("Toggle Playlist Panel", Box::new(ToggleSidebar)),
         ("Toggle Info Panel", Box::new(ToggleInfoPanel)),
@@ -288,6 +291,15 @@ pub struct MediaPlayer {
     /// Seconds a still shows before the playlist moves on; 0: until
     /// skipped (a setting).
     still_seconds: u32,
+    /// Move on to the next playlist entry when one ends (the playlist
+    /// pane's switch). Off, playback stops at the end of each entry.
+    autoplay: bool,
+    /// The entry the playlist will play next, already open in the
+    /// background and cued, so moving on is instant.
+    preloaded: Option<(PathBuf, Loaded)>,
+    /// When the entry on screen was opened: preloading waits a moment so
+    /// it does not compete with that start.
+    opened_at: Instant,
     /// The display size the paused frame was last refreshed for, and when
     /// the size last changed: a paused frame is decoded again once the
     /// size settles, so upscaling follows resizes and the switch.
@@ -368,6 +380,9 @@ impl MediaPlayer {
             outputs_px: (0, 0),
             upscaling: session.upscaling,
             still_seconds: session.still_seconds,
+            autoplay: session.autoplay,
+            preloaded: None,
+            opened_at: Instant::now(),
             limit: (0, 0),
             limit_changed: Instant::now(),
             refreshed_for: None,
@@ -541,6 +556,7 @@ impl MediaPlayer {
             outputs_on: self.outputs_on,
             upscaling: self.upscaling,
             still_seconds: self.still_seconds,
+            autoplay: self.autoplay,
         }
     }
 
@@ -582,7 +598,9 @@ impl MediaPlayer {
         self.sync_os_media(window, cx);
         // Background tabs are paused; this picks up the frame each one is
         // cued on, so switching to it shows a picture at once.
-        for loaded in self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()) {
+        self.preload_next(window);
+        let preloaded = self.preloaded.as_mut().map(|(_, l)| l);
+        for loaded in self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).chain(preloaded) {
             if let Some(frame) = loaded.player.as_ref().and_then(Player::take_frame)
                 && let Some(old) = loaded.frame.replace(to_render_image(frame.width, frame.height, frame.bgra))
             {
@@ -637,10 +655,53 @@ impl MediaPlayer {
         }
     }
 
+    /// The playlist entry that follows the one on screen when it ends, by
+    /// the autoplay switch and repeat mode; `None` if playback stops there
+    /// (or repeats the same entry).
+    fn upcoming(&self) -> Option<usize> {
+        let ix = self.current?;
+        let len = self.playlist.len();
+        if !self.autoplay || self.repeat == Repeat::One {
+            return None;
+        }
+        match self.repeat {
+            Repeat::All if len > 1 => Some((ix + 1) % len),
+            Repeat::Off if ix + 1 < len => Some(ix + 1),
+            _ => None,
+        }
+    }
+
+    /// Keep the upcoming entry open in the background, cued on its first
+    /// frame, so the playlist moves on without a load (a large image takes
+    /// a while to decode). Dropped when the upcoming entry changes.
+    fn preload_next(&mut self, window: &mut Window) {
+        let want = self.upcoming().and_then(|ix| self.playlist.get(ix).cloned());
+        if self.preloaded.as_ref().map(|(p, _)| p) == want.as_ref() {
+            return;
+        }
+        if want.is_some() && self.opened_at.elapsed() < Duration::from_millis(1500) {
+            return;
+        }
+        if let Some((_, l)) = self.preloaded.take() {
+            l.release(window);
+        }
+        if let Some(path) = want {
+            let loaded = self.load_in_background(&path, 0.0);
+            self.preloaded = Some((path, loaded));
+        }
+    }
+
+    fn toggle_autoplay(&mut self, _: &ToggleAutoplay, _: &mut Window, cx: &mut Context<Self>) {
+        self.autoplay = !self.autoplay;
+        cx.notify();
+    }
+
     fn on_track_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let len = self.playlist.len();
-        let Some(ix) = self.current.filter(|_| self.repeat != Repeat::One) else {
-            // Repeat one, or a tab whose file has left the playlist.
+        // Repeat one loops the entry; with autoplay off (or a tab whose file
+        // has left the playlist) playback stops at the end.
+        let ix = self.current.filter(|_| self.repeat != Repeat::One && self.autoplay);
+        let Some(ix) = ix else {
             match self.player.as_mut() {
                 Some(p) if self.repeat == Repeat::One => p.seek(0.0),
                 Some(p) => {
@@ -652,11 +713,7 @@ impl MediaPlayer {
             return;
         };
         match self.repeat {
-            Repeat::One => {
-                if let Some(p) = self.player.as_mut() {
-                    p.seek(0.0);
-                }
-            }
+            Repeat::One => {}
             Repeat::All => self.play_index((ix + 1) % len, window, cx),
             Repeat::Off if ix + 1 < len => self.play_index(ix + 1, window, cx),
             Repeat::Off => {
@@ -677,8 +734,25 @@ impl MediaPlayer {
     fn open_index(&mut self, ix: usize, autoplay: bool, start_at: f64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = self.playlist.get(ix).cloned() else { return };
         self.unload(window);
-        let loaded = self.load(&path, autoplay, start_at);
+        let loaded = match self.preloaded.take() {
+            // Already open and cued: take it over instead of opening again.
+            Some((p, mut loaded)) if p == path && start_at == 0.0 => {
+                if let Some(player) = loaded.player.as_mut() {
+                    player.set_background(false);
+                    player.set_volume(self.volume, self.muted);
+                    player.set_paused(!autoplay);
+                }
+                loaded
+            }
+            other => {
+                if let Some((_, l)) = other {
+                    l.release(window);
+                }
+                self.load(&path, autoplay, start_at)
+            }
+        };
         self.install(loaded);
+        self.opened_at = Instant::now();
         self.current = Some(ix);
         match self.active {
             Some(a) => self.tabs[a].path = path,
@@ -1006,7 +1080,8 @@ impl MediaPlayer {
         self.still_seconds = secs;
         let duration = self.still_duration();
         let parked = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut().and_then(|l| l.player.as_mut()));
-        for p in self.player.iter_mut().chain(parked) {
+        let preloaded = self.preloaded.as_mut().and_then(|(_, l)| l.player.as_mut());
+        for p in self.player.iter_mut().chain(parked).chain(preloaded) {
             p.set_still_duration(duration);
         }
         cx.notify();
@@ -1017,7 +1092,8 @@ impl MediaPlayer {
     fn set_upscaling(&mut self, on: bool, cx: &mut Context<Self>) {
         self.upscaling = on;
         let parked = self.tabs.iter().filter_map(|t| t.parked.as_ref().and_then(|l| l.player.as_ref()));
-        for p in self.player.iter().chain(parked) {
+        let preloaded = self.preloaded.as_ref().and_then(|(_, l)| l.player.as_ref());
+        for p in self.player.iter().chain(parked).chain(preloaded) {
             p.set_upscaling(on);
         }
         // A paused frame is decoded again, with or without upscaling.
@@ -1496,10 +1572,15 @@ impl MediaPlayer {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(Theme::text_muted())
                     .child({
+                        // Stills count for the time they show, when timed.
+                        let still = (self.still_seconds > 0).then_some(self.still_seconds as f64);
                         let durations: Option<f64> = self
                             .playlist
                             .iter()
-                            .map(|p| self.summaries.get(p).and_then(|s| s.duration))
+                            .map(|p| {
+                                let s = self.summaries.get(p);
+                                s.and_then(|s| s.duration).or_else(|| still.filter(|_| s.is_some_and(|s| s.has_video) && is_picture(p)))
+                            })
                             .sum();
                         match durations {
                             Some(total) if !self.playlist.is_empty() => {
@@ -1509,9 +1590,32 @@ impl MediaPlayer {
                         }
                     }),
             )
-            .child(icon_button("pl-add", Icon::Plus, false, cx.listener(|this, _, window, cx| {
-                this.open_files(&OpenFiles, window, cx)
-            })));
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .id("pl-autoplay")
+                            .debug_selector(|| "pl-autoplay".into())
+                            .px(px(6.))
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.))
+                            .text_xs()
+                            .cursor_pointer()
+                            .text_color(if self.autoplay { Theme::accent() } else { Theme::text_placeholder() })
+                            .when(self.autoplay, |el| el.bg(Theme::selected()))
+                            .hover(|s| s.bg(Theme::hover()))
+                            .on_click(cx.listener(|this, _, window, cx| this.toggle_autoplay(&ToggleAutoplay, window, cx)))
+                            .child("Autoplay"),
+                    )
+                    .child(icon_button("pl-add", Icon::Plus, false, cx.listener(|this, _, window, cx| {
+                        this.open_files(&OpenFiles, window, cx)
+                    }))),
+            );
 
         let body: AnyElement = if self.playlist.is_empty() {
             div()
@@ -2200,6 +2304,7 @@ impl Render for MediaPlayer {
             .on_action(cx.listener(Self::toggle_fullscreen))
             .on_action(cx.listener(Self::toggle_outputs))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::toggle_autoplay))
             .on_action(cx.listener(Self::stop))
             .on_action(cx.listener(Self::close_active_tab))
             .on_action(cx.listener(Self::next_tab))
@@ -3011,14 +3116,18 @@ mod tests {
         tick_until(&view, vcx, "the still on screen", |v| v.frame.is_some());
         assert_eq!(view.read_with(vcx, |v, _| (v.still_seconds, v.player.as_ref().unwrap().info.duration)), (10, Some(10.0)), "10 s by default");
 
-        // Settings: the stills row is second; Left and Right step, Enter
-        // steps up and wraps. Saved, and applied to the still on screen.
+        // Settings: the stills row is second; Left and Right change it by a
+        // second, digits type it. Saved, and applied to the still on screen.
         vcx.simulate_keystrokes("secondary-, down right");
-        assert_eq!(view.read_with(vcx, |v, _| v.still_seconds), 15);
+        assert_eq!(view.read_with(vcx, |v, _| v.still_seconds), 11);
         vcx.simulate_keystrokes("left left");
-        assert_eq!(view.read_with(vcx, |v, _| (v.still_seconds, v.snapshot(false).still_seconds)), (5, 5));
-        vcx.simulate_keystrokes("enter escape");
-        assert_eq!(view.read_with(vcx, |v, _| (v.still_seconds, v.player.as_ref().unwrap().info.duration)), (10, Some(10.0)));
+        assert_eq!(view.read_with(vcx, |v, _| (v.still_seconds, v.snapshot(false).still_seconds)), (9, 9));
+        vcx.simulate_keystrokes("4 7");
+        assert_eq!(view.read_with(vcx, |v, _| (v.still_seconds, v.player.as_ref().unwrap().info.duration)), (47, Some(47.0)));
+        vcx.simulate_keystrokes("backspace");
+        assert_eq!(view.read_with(vcx, |v, _| v.still_seconds), 4);
+        vcx.simulate_keystrokes("1 0 escape");
+        assert_eq!(view.read_with(vcx, |v, _| (v.still_seconds, v.settings.is_none())), (410, true));
 
         // At 1 s the playlist moves on to the video by itself.
         view.update_in(vcx, |v, _, cx| v.set_still_seconds(1, cx));
@@ -3032,6 +3141,84 @@ mod tests {
         });
         tick_until(&view, vcx, "the still again", |v| v.frame.is_some() && v.current == Some(0));
         assert_eq!(view.read_with(vcx, |v, _| v.player.as_ref().unwrap().info.duration), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Three one-colour stills in a fresh folder.
+    fn slides(name: &str) -> (PathBuf, Vec<PathBuf>) {
+        let dir = crate::media::picture::tests::temp_dir(name);
+        let paths = (0..3)
+            .map(|i| {
+                let p = dir.join(format!("slide{i}.png"));
+                image::RgbaImage::from_pixel(16, 9, image::Rgba([40 * i as u8, 90, 90, 255])).save(&p).unwrap();
+                p
+            })
+            .collect();
+        (dir, paths)
+    }
+
+    #[gpui::test]
+    fn autoplay_decides_whether_the_playlist_moves_on(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (dir, files) = slides("autoplay");
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(files, None, window, cx));
+        view.update_in(vcx, |v, _, cx| v.set_still_seconds(1, cx));
+        assert!(view.read_with(vcx, |v, _| v.autoplay), "on by default");
+        tick_until(&view, vcx, "the second slide", |v| v.current == Some(1));
+
+        // Off (the playlist pane's switch): the slide ends and stays.
+        vcx.run_until_parked();
+        let switch = vcx.debug_bounds("pl-autoplay").expect("autoplay switch in the playlist pane").center();
+        vcx.simulate_click(switch, gpui::Modifiers::none());
+        assert!(view.read_with(vcx, |v, _| !v.autoplay && !v.snapshot(false).autoplay), "off, and saved");
+        tick_until(&view, vcx, "the slide to end", |v| v.ended);
+        assert_eq!(view.read_with(vcx, |v, _| v.current), Some(1), "stayed on it");
+
+        // Repeat one still loops with autoplay off.
+        view.update_in(vcx, |v, window, cx| {
+            v.repeat = Repeat::One;
+            v.play_index(1, window, cx);
+        });
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(1600) {
+            view.update_in(vcx, |v, window, cx| v.tick(window, cx));
+            assert!(!view.read_with(vcx, |v, _| v.ended), "repeat one stopped");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn the_next_entry_is_preloaded_so_moving_on_is_instant(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (dir, files) = slides("preload");
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(files, None, window, cx));
+        view.update_in(vcx, |v, _, cx| v.set_still_seconds(2, cx));
+        // While the first slide shows, the second is opened and cued.
+        tick_until(&view, vcx, "the next slide preloaded and cued", |v| {
+            v.preloaded.as_ref().is_some_and(|(p, l)| *p == v.playlist[1] && l.frame.is_some())
+        });
+        tick_until(&view, vcx, "the playlist to move on", |v| v.current == Some(1));
+        // Its picture is on screen in the same tick: nothing was loaded.
+        assert!(view.read_with(vcx, |v, _| v.frame.is_some() && v.player.as_ref().is_some_and(|p| !p.is_paused())));
+        // The preload moves on to the entry after.
+        tick_until(&view, vcx, "the third slide preloaded", |v| v.preloaded.as_ref().is_some_and(|(p, _)| *p == v.playlist[2]));
+
+        // Nothing comes after the last entry (repeat off), so nothing is
+        // preloaded; with autoplay off neither.
+        view.update_in(vcx, |v, window, cx| v.play_index(2, window, cx));
+        view.update_in(vcx, |v, window, cx| {
+            v.opened_at = Instant::now() - Duration::from_secs(5);
+            v.tick(window, cx);
+        });
+        assert!(view.read_with(vcx, |v, _| v.preloaded.is_none()));
+        view.update_in(vcx, |v, window, cx| {
+            v.autoplay = false;
+            v.play_index(0, window, cx);
+            v.opened_at = Instant::now() - Duration::from_secs(5);
+            v.tick(window, cx);
+        });
+        assert!(view.read_with(vcx, |v, _| v.preloaded.is_none()));
         let _ = std::fs::remove_dir_all(dir);
     }
 
