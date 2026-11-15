@@ -101,8 +101,10 @@ with a seek bar like a clip of that length, then the playlist moves on. Animated
 like video: they have a duration, play
 and pause, and scrub on the seek bar, with each frame shown for its delay
 (10 ms or less counts as 100 ms, as in browsers). An animation plays once;
-repeat one loops it. Decoded frames are kept for instant scrubbing, so
-animations over 1 GB decoded are refused.
+repeat one loops it. Stills are decoded no larger than the biggest window
+showing them, so a large photo costs memory for its display size, not its
+file size; animations keep every decoded frame for instant scrubbing, so
+ones over 1 GB decoded are refused.
 
 ### Performance
 

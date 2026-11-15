@@ -149,6 +149,36 @@ pub fn outline(path: &Path) -> Result<Outline> {
     Ok(Outline { format, width, height, starts: vec![0.0], duration: None })
 }
 
+/// The size a `width` x `height` picture is shown at inside `limit`
+/// (physical pixels), keeping its shape; `None` when it already fits.
+pub fn fit_size(width: u32, height: u32, limit: (u32, u32)) -> Option<(u32, u32)> {
+    if limit.0 == 0 || limit.1 == 0 || (width <= limit.0 && height <= limit.1) {
+        return None;
+    }
+    let scale = (limit.0 as f64 / width as f64).min(limit.1 as f64 / height as f64);
+    Some((((width as f64 * scale).round() as u32).max(1), ((height as f64 * scale).round() as u32).max(1)))
+}
+
+/// A still image decoded and, if bigger than `limit`, shrunk to fit it,
+/// as BGRA. The shrinking happens on the decoder's own pixel format (RGB
+/// for a JPEG), so no full-size RGBA copy is ever made: the peak is the
+/// decoded image alone.
+pub fn still(path: &Path, limit: (u32, u32)) -> Result<(u32, u32, Vec<u8>)> {
+    let file = BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
+    let image = image::ImageReader::new(file).with_guessed_format()?.decode().context("decoding the image")?;
+    let (width, height) = (image.width(), image.height());
+    let image = match fit_size(width, height, limit) {
+        Some((w, h)) => match image {
+            image::DynamicImage::ImageRgb8(rgb) => image::DynamicImage::ImageRgb8(image::imageops::thumbnail(&rgb, w, h)),
+            image::DynamicImage::ImageRgba8(rgba) => image::DynamicImage::ImageRgba8(image::imageops::thumbnail(&rgba, w, h)),
+            other => image::DynamicImage::ImageRgba8(image::imageops::thumbnail(&other.to_rgba8(), w, h)),
+        },
+        None => image,
+    };
+    let (w, h) = (image.width(), image.height());
+    Ok((w, h, to_bgra(image.into_rgba8().into_raw())))
+}
+
 fn to_bgra(mut rgba: Vec<u8>) -> Vec<u8> {
     for px in rgba.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
@@ -316,6 +346,29 @@ pub(crate) mod tests {
         assert_eq!(outline(&still).unwrap(), Outline { format: "WebP", width: 10, height: 6, starts: vec![0.0], duration: None });
         let f: Vec<_> = frames(&still).unwrap().map(Result::unwrap).collect();
         assert_eq!((f.len(), &f[0][..4]), (1, &[3, 2, 1, 255][..]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn big_pictures_shrink_to_fit_the_display_keeping_their_shape() {
+        assert_eq!(fit_size(6708, 4471, (2400, 1300)), Some((1950, 1300)), "height-bound");
+        assert_eq!(fit_size(6708, 4471, (2400, 2400)), Some((2400, 1600)), "width-bound");
+        assert_eq!(fit_size(800, 600, (2400, 1300)), None, "already fits");
+        assert_eq!(fit_size(6708, 4471, (0, 0)), None, "display size not known yet");
+    }
+
+    #[test]
+    fn a_still_decodes_straight_to_the_size_it_is_shown() {
+        let dir = temp_dir("still-fit");
+        for (name, rgba) in [("rgb.jpg", false), ("rgba.png", true)] {
+            let path = dir.join(name);
+            let img = RgbaImage::from_pixel(1000, 500, Rgba([200, 100, 50, 255]));
+            if rgba { img.save(&path).unwrap() } else { image::DynamicImage::ImageRgba8(img).to_rgb8().save(&path).unwrap() }
+            let (w, h, px) = still(&path, (400, 400)).unwrap();
+            assert_eq!((w, h, px.len()), (400, 200, 400 * 200 * 4), "{name}");
+            assert!(px[0].abs_diff(50) <= 3 && px[2].abs_diff(200) <= 3, "{name}: BGRA order: {:?}", &px[..4]);
+            assert_eq!(still(&path, (2000, 2000)).unwrap().0, 1000, "{name}: small enough already");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

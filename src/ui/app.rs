@@ -23,7 +23,7 @@ use super::output::{self, OutputView};
 use super::session::{Session, SessionStore, TabState};
 use super::theme::{Theme, mono_font};
 use crate::media::upscale::{self, Status as UpscaleStatus};
-use crate::media::picture::is_picture;
+use crate::media::picture::{self, is_picture};
 use crate::media::{Image, Player, Summary, probe};
 
 mod settings;
@@ -383,7 +383,12 @@ impl MediaPlayer {
             autoplay: session.autoplay,
             preloaded: None,
             opened_at: Instant::now(),
-            limit: (0, 0),
+            // Known before anything is opened, so the first file (from the
+            // command line or a restored session) starts at the right size.
+            limit: {
+                let (size, scale) = (window.viewport_size(), window.scale_factor());
+                ((f32::from(size.width) * scale) as u32, (f32::from(size.height) * scale) as u32)
+            },
             limit_changed: Instant::now(),
             refreshed_for: None,
             // Long ago, so the first tick opens a remembered output.
@@ -767,7 +772,10 @@ impl MediaPlayer {
     }
 
     fn load(&self, path: &Path, autoplay: bool, start_at: f64) -> Loaded {
-        match Player::open(path, self.volume, self.muted) {
+        // Opened at the current display size, so stills (preloaded ones too)
+        // are decoded no bigger than they are shown.
+        let limit = (self.limit.0 > 0 && self.limit.1 > 0).then_some(self.limit);
+        match Player::open_sized(path, self.volume, self.muted, limit) {
             Ok(mut player) => {
                 player.set_upscaling(self.upscaling);
                 player.set_still_duration(self.still_duration());
@@ -1106,8 +1114,12 @@ impl MediaPlayer {
     /// the size it was decoded at. Once the display size has settled (or
     /// upscaling was switched), decode it again by seeking to where it is.
     fn refresh_paused_frame(&mut self) {
+        let shown = self.frame.as_ref().map(|f| f.size(0)).map(|s| (s.width.0 as u32, s.height.0 as u32));
         let Some(p) = self.player.as_mut() else { return };
-        if !p.is_paused() || p.info.video.is_none() || self.limit_changed.elapsed() < Duration::from_millis(250) {
+        // A still is decoded at the size it is shown at, so it needs this
+        // even while playing.
+        let still = p.is_still();
+        if !(p.is_paused() || still) || p.info.video.is_none() || self.limit_changed.elapsed() < Duration::from_millis(250) {
             return;
         }
         let key = (self.limit, self.upscaling);
@@ -1117,6 +1129,15 @@ impl MediaPlayer {
         self.refreshed_for = Some(key);
         // Only when the picture would actually change.
         let source = p.info.video.as_ref().map(|v| (v.width, v.height)).unwrap_or_default();
+        if still {
+            let fitted = picture::fit_size(source.0, source.1, self.limit).unwrap_or(source);
+            let upscaled = if self.upscaling { upscale::target_size(fitted, self.limit) } else { None };
+            if shown.is_some_and(|s| s != upscaled.unwrap_or(fitted)) {
+                let at = p.position();
+                p.seek(at);
+            }
+            return;
+        }
         let showing = match p.upscale_status() {
             UpscaleStatus::Active { to, .. } => Some(to),
             UpscaleStatus::TooSlow | UpscaleStatus::Failed(_) => return,
@@ -3246,6 +3267,33 @@ mod tests {
         // The image's box is the stage; ObjectFit::Contain then fits the
         // picture inside it (pillarboxed), instead of cropping it.
         assert_eq!(frame, stage, "image box {frame:?} is not the stage {stage:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_big_still_is_decoded_at_the_size_it_is_shown(cx: &mut gpui::TestAppContext) {
+        use crate::media::picture::tests::temp_dir;
+        cx.update(bind_keys);
+        let dir = temp_dir("big-still");
+        let big = dir.join("big.png");
+        image::RgbaImage::from_pixel(3000, 2000, image::Rgba([60, 120, 180, 255])).save(&big).unwrap();
+        let (view, vcx) = cx.add_window_view({
+            let big = big.clone();
+            |window, cx| MediaPlayer::new(vec![big], None, window, cx)
+        });
+        let frame_size = |v: &MediaPlayer| v.frame.as_ref().map(|f| f.size(0)).map(|s| (s.width.0 as u32, s.height.0 as u32));
+        let fits = |v: &MediaPlayer| {
+            let (w, h) = frame_size(v).unwrap_or((0, 0));
+            w > 0 && w <= v.limit.0 && h <= v.limit.1 && (w == v.limit.0 || h == v.limit.1)
+        };
+        vcx.simulate_resize(gpui::size(px(500.), px(400.)));
+        tick_until(&view, vcx, "the still at the window's size", |v| fits(v));
+        let small = view.read_with(vcx, |v, _| frame_size(v).unwrap());
+        assert!(small.0 < 3000, "decoded at {small:?}, not full size");
+
+        // A bigger window: decoded again at the new size, on screen all along.
+        vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+        tick_until(&view, vcx, "the still at the bigger size", |v| v.frame.is_some() && fits(v) && frame_size(v) != Some(small));
         let _ = std::fs::remove_dir_all(dir);
     }
 

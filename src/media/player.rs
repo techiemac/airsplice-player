@@ -336,8 +336,19 @@ impl Shared {
 
 impl Player {
     pub fn open(path: &Path, volume: f32, muted: bool) -> Result<Self> {
+        Self::open_sized(path, volume, muted, None)
+    }
+
+    /// Open, knowing the largest size the picture is shown at (physical
+    /// pixels): decoders that can produce smaller frames, and still images,
+    /// start at that size instead of full size.
+    pub fn open_sized(path: &Path, volume: f32, muted: bool, limit: Option<(u32, u32)>) -> Result<Self> {
+        let shared = Arc::new(Shared::new());
+        if let Some((w, h)) = limit.filter(|(w, h)| *w > 0 && *h > 0) {
+            shared.output_limit.store((w as u64) << 32 | h as u64, Ordering::Relaxed);
+        }
         if picture::is_picture(path) {
-            return Self::open_picture(path);
+            return Self::open_picture(path, shared);
         }
         let mut format = open_format(path)?;
 
@@ -373,8 +384,6 @@ impl Player {
         if video_decoder.is_none() {
             video_track = None;
         }
-
-        let shared = Arc::new(Shared::new());
 
         let mut audio_out = None;
         let mut audio_pipeline = None;
@@ -469,7 +478,7 @@ impl Player {
 
     /// A still image or animated GIF: frames come from a picture thread
     /// instead of a demuxer and decoder, timed by the wall clock.
-    fn open_picture(path: &Path) -> Result<Self> {
+    fn open_picture(path: &Path, shared: Arc<Shared>) -> Result<Self> {
         let outline = picture::outline(path)?;
         let info = MediaInfo {
             path: path.to_path_buf(),
@@ -478,7 +487,6 @@ impl Player {
             video: Some(VideoInfo { codec: outline.format, decoder: "image (software)", width: outline.width, height: outline.height }),
             ..Default::default()
         };
-        let shared = Arc::new(Shared::new());
         {
             let (shared, path, outline) = (shared.clone(), path.to_path_buf(), outline.clone());
             thread::Builder::new().name("picture".into()).spawn(move || picture_thread(&path, &outline, &shared))?;
@@ -499,6 +507,11 @@ impl Player {
     /// How long a still image shows (`None`: until the user moves on). A
     /// still with a duration has a timeline like a clip of that length.
     /// No effect on anything but stills.
+    /// A still image (as opposed to an animation or a video).
+    pub fn is_still(&self) -> bool {
+        self.picture.as_ref().is_some_and(Outline::is_still)
+    }
+
     pub fn set_still_duration(&mut self, secs: Option<f64>) {
         if self.picture.as_ref().is_some_and(Outline::is_still) {
             self.still_secs = secs.filter(|s| *s > 0.0);
@@ -1060,6 +1073,9 @@ fn queue_frame(shared: &Shared, stage: &mut Stage, generation: u64, pts: f64, wi
 /// next seek. Frames are decoded once, in order, and kept, so scrubbing
 /// back is instant.
 fn picture_thread(path: &Path, outline: &Outline, shared: &Shared) {
+    if outline.is_still() {
+        return still_thread(path, shared);
+    }
     let mut stage = Stage::default();
     let mut decoded: Vec<Vec<u8>> = Vec::new();
     let mut frames = None;
@@ -1104,6 +1120,38 @@ fn picture_thread(path: &Path, outline: &Outline, shared: &Shared) {
         }
         shared.video_done.store(generation, Ordering::Release);
         shared.demux_done.store(generation, Ordering::Release);
+        let mut q = shared.frames.lock().unwrap();
+        while shared.current() == generation && !shared.stopped() {
+            q = shared.frames_cv.wait_timeout(q, StdDuration::from_millis(100)).unwrap().0;
+        }
+    }
+}
+
+/// A still image: decoded at most at the size it is shown at (the output
+/// limit when it starts), and queued without keeping a copy. A seek, or the
+/// app asking again after the display grew, decodes it afresh; the picture
+/// on screen stays up meanwhile.
+fn still_thread(path: &Path, shared: &Shared) {
+    let mut stage = Stage::default();
+    loop {
+        if shared.stopped() {
+            return;
+        }
+        let generation = shared.current();
+        let packed = shared.output_limit.load(Ordering::Relaxed);
+        let limit = ((packed >> 32) as u32, packed as u32);
+        match picture::still(path, limit) {
+            Ok((w, h, px)) => {
+                if queue_frame(shared, &mut stage, generation, 0.0, w, h, px) {
+                    shared.video_done.store(generation, Ordering::Release);
+                    shared.demux_done.store(generation, Ordering::Release);
+                }
+            }
+            Err(e) => {
+                *shared.error.lock().unwrap() = Some(format!("{e:#}"));
+                return;
+            }
+        }
         let mut q = shared.frames.lock().unwrap();
         while shared.current() == generation && !shared.stopped() {
             q = shared.frames_cv.wait_timeout(q, StdDuration::from_millis(100)).unwrap().0;
@@ -1367,6 +1415,21 @@ mod tests {
             thread::sleep(StdDuration::from_millis(5));
         }
         assert!(p.position() > 0.25, "finished at {}", p.position());
+        // Opened knowing the display size, a big still is decoded no larger
+        // than it is shown; without one, at full size.
+        let big = dir.join("big.png");
+        image::RgbaImage::from_pixel(1200, 800, image::Rgba([9, 99, 199, 255])).save(&big).unwrap();
+        let sized = Player::open_sized(&big, 0.0, true, Some((300, 300))).unwrap();
+        let f = next_frame(&sized, 2000);
+        assert_eq!((f.width, f.height, &f.bgra[..4]), (300, 200, &[199, 99, 9, 255][..]));
+        assert_eq!(sized.info.video.as_ref().map(|v| (v.width, v.height)), Some((1200, 800)), "the info still says the file's size");
+        let full = Player::open(&big, 0.0, true).unwrap();
+        assert_eq!((next_frame(&full, 2000).width, full.is_still()), (1200, true));
+        // A seek decodes it again (nothing is kept besides what is on screen).
+        let mut sized = sized;
+        sized.seek(0.0);
+        assert_eq!(next_frame(&sized, 2000).width, 300);
+
         // Back to "until skipped".
         p.set_still_duration(None);
         assert_eq!((p.info.duration, p.position(), p.is_finished()), (None, 0.0, false));
