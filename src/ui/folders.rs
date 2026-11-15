@@ -188,7 +188,25 @@ fn settled_at(stamp: &Stamp, now: SystemTime) -> bool {
     }
 }
 
-/// Every media file under `dir`, recursively, sorted by path.
+/// Folder order: within each folder its own files first, by name, then its
+/// subfolders, by name, each in the same order. The usual "play this
+/// folder" order, and it keeps each subfolder's entries together.
+pub fn tree_cmp(a: &Path, b: &Path) -> std::cmp::Ordering {
+    let (a, b): (Vec<_>, Vec<_>) = (a.components().collect(), b.components().collect());
+    for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+        if x != y {
+            let (a_dir, b_dir) = (k + 1 < a.len(), k + 1 < b.len());
+            return match (a_dir, b_dir) {
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                _ => x.cmp(y),
+            };
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Every media file under `dir`, recursively, in folder order.
 pub fn list(dir: &Path) -> Listing {
     fn walk(dir: &Path, out: &mut Vec<(PathBuf, Stamp)>) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)?.flatten() {
@@ -206,7 +224,7 @@ pub fn list(dir: &Path) -> Listing {
     }
     let mut out = Vec::new();
     walk(dir, &mut out).ok()?;
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.sort_by(|a, b| tree_cmp(&a.0, &b.0));
     Some(out)
 }
 
@@ -243,11 +261,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("airsplice-player-list-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        for name in ["b.mp4", "a.MKV", "notes.txt", "sub/c.mp3", "d.gif", "e.webp", "f.JPG"] {
+        for name in ["b.mp4", "a.MKV", "notes.txt", "sub/c.mp3", "d.gif", "e.webp", "f.JPG", "z.mp4"] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
         let names: Vec<_> = list(&dir).unwrap().into_iter().map(|(p, _)| p.strip_prefix(&dir).unwrap().to_path_buf()).collect();
-        assert_eq!(names, [PathBuf::from("a.MKV"), "b.mp4".into(), "d.gif".into(), "e.webp".into(), "f.JPG".into(), "sub/c.mp3".into()]);
+        // The folder's own files, z.mp4 included, before its subfolder's.
+        assert_eq!(names, [PathBuf::from("a.MKV"), "b.mp4".into(), "d.gif".into(), "e.webp".into(), "f.JPG".into(), "z.mp4".into(), "sub/c.mp3".into()]);
         assert!(list(&dir.join("missing")).is_none(), "a missing folder is not an empty one");
         let _ = std::fs::remove_dir_all(dir);
     }

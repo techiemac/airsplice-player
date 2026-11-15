@@ -8,3 +8,4 @@ pub mod os_media;
 pub mod output;
 pub mod session;
 pub mod theme;
+pub mod tree;

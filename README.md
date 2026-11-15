@@ -13,7 +13,9 @@ the Raspberry Pi 5. The Windows build has not been tested yet.
 
 - Playlist with tag titles, durations and total length; drop files or
   folders anywhere in the window. Added folders stay in sync: files copied
-  into them later join the playlist, deleted ones leave it
+  into them later join the playlist, deleted ones leave it. Folders and
+  subfolders show as a collapsible tree, each folder's own files first; a
+  folder opens when playback reaches an entry inside it
 - Tabs: open files in background tabs, each loaded and paused on its first
   frame, then cut between them instantly
 - External outputs: the picture full screen on any number of displays,

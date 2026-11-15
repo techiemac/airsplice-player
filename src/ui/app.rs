@@ -22,6 +22,7 @@ use super::os_media::{NowPlaying, OsMedia, PlayState};
 use super::output::{self, OutputView};
 use super::session::{Session, SessionStore, TabState};
 use super::theme::{Theme, mono_font};
+use super::tree::{self, Row};
 use crate::media::upscale::{self, Status as UpscaleStatus};
 use crate::media::picture::{self, is_picture};
 use crate::media::{Image, Player, Summary, probe};
@@ -294,6 +295,9 @@ pub struct MediaPlayer {
     /// Move on to the next playlist entry when one ends (the playlist
     /// pane's switch). Off, playback stops at the end of each entry.
     autoplay: bool,
+    /// Folders collapsed in the playlist pane. Sorted, for a stable
+    /// session file.
+    collapsed: std::collections::BTreeSet<PathBuf>,
     /// The entry the playlist will play next, already open in the
     /// background and cued, so moving on is instant.
     preloaded: Option<(PathBuf, Loaded)>,
@@ -381,6 +385,7 @@ impl MediaPlayer {
             upscaling: session.upscaling,
             still_seconds: session.still_seconds,
             autoplay: session.autoplay,
+            collapsed: session.collapsed_folders.iter().cloned().collect(),
             preloaded: None,
             opened_at: Instant::now(),
             // Known before anything is opened, so the first file (from the
@@ -562,6 +567,7 @@ impl MediaPlayer {
             upscaling: self.upscaling,
             still_seconds: self.still_seconds,
             autoplay: self.autoplay,
+            collapsed_folders: self.collapsed.iter().cloned().collect(),
         }
     }
 
@@ -696,6 +702,13 @@ impl MediaPlayer {
         }
     }
 
+    fn toggle_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(&folder) {
+            self.collapsed.insert(folder);
+        }
+        cx.notify();
+    }
+
     fn toggle_autoplay(&mut self, _: &ToggleAutoplay, _: &mut Window, cx: &mut Context<Self>) {
         self.autoplay = !self.autoplay;
         cx.notify();
@@ -758,6 +771,11 @@ impl MediaPlayer {
         };
         self.install(loaded);
         self.opened_at = Instant::now();
+        // An entry played inside a collapsed folder (autoplay moving into
+        // it, say) opens that folder, so what is on screen is in view.
+        for folder in tree::ancestors_of(&path, self.folders.roots()) {
+            self.collapsed.remove(&folder);
+        }
         self.current = Some(ix);
         match self.active {
             Some(a) => self.tabs[a].path = path,
@@ -1218,7 +1236,7 @@ impl MediaPlayer {
                 let ix = in_folder
                     .iter()
                     .copied()
-                    .find(|&i| self.playlist[i] > file)
+                    .find(|&i| folders::tree_cmp(&self.playlist[i], &file).is_gt())
                     .or(in_folder.last().map(|i| i + 1))
                     .unwrap_or(self.playlist.len());
                 self.insert_entry(ix, file);
@@ -1658,7 +1676,34 @@ impl MediaPlayer {
                 .flex_1()
                 .overflow_y_scroll()
                 .py(px(2.))
-                .children(self.playlist.iter().enumerate().map(|(ix, path)| {
+                .children(tree::rows(&self.playlist, self.folders.roots(), &|f| self.collapsed.contains(f)).into_iter().map(|row| {
+                    let (ix, depth) = match row {
+                        Row::Entry { ix, depth } => (ix, depth),
+                        Row::Folder { path, name, depth, count, collapsed } => {
+                            let id = SharedString::from(format!("folder:{}", path.display()));
+                            let selector = format!("folder {name}");
+                            return div()
+                                .id(id)
+                                .debug_selector(move || selector)
+                                .h(px(26.))
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .pl(px(6. + depth as f32 * 12.))
+                                .pr(px(10.))
+                                .border_l_2()
+                                .border_color(gpui::transparent_black())
+                                .hover(|s| s.bg(Theme::hover()))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| this.toggle_folder(path.clone(), cx)))
+                                .child(icon(if collapsed { Icon::ChevronRight } else { Icon::ChevronDown }, px(12.), Theme::text_placeholder()))
+                                .child(icon(Icon::Folder, px(14.), Theme::text_muted()))
+                                .child(div().flex_1().min_w_0().text_sm().truncate().text_color(Theme::text_muted()).child(name))
+                                .child(div().flex_none().text_xs().text_color(Theme::text_placeholder()).child(count.to_string()))
+                                .into_any_element();
+                        }
+                    };
+                    let path = &self.playlist[ix];
                     let active = self.current == Some(ix);
                     let playing = active && self.player.as_ref().is_some_and(|p| !p.is_paused());
                     let summary = self.summaries.get(path);
@@ -1679,7 +1724,7 @@ impl MediaPlayer {
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .pl(px(12.))
+                        .pl(px(12. + depth as f32 * 12.))
                         .pr(px(10.))
                         .border_l_2()
                         .border_color(if active { Theme::accent() } else { gpui::transparent_black() })
@@ -1730,6 +1775,7 @@ impl MediaPlayer {
                                     this.remove_track(ix, window, cx);
                                 }))),
                         )
+                        .into_any_element()
                 }))
                 .into_any_element()
         };
@@ -3294,6 +3340,48 @@ mod tests {
         // A bigger window: decoded again at the new size, on screen all along.
         vcx.simulate_resize(gpui::size(px(900.), px(700.)));
         tick_until(&view, vcx, "the still at the bigger size", |v| v.frame.is_some() && fits(v) && frame_size(v) != Some(small));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn nested_folders_show_as_a_tree_that_opens_for_what_plays(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let dir = crate::media::picture::tests::temp_dir("tree");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for (i, name) in ["a.png", "sub/b.png", "sub/c.png"].into_iter().enumerate() {
+            image::RgbaImage::from_pixel(8, 8, image::Rgba([60 * i as u8, 0, 0, 255])).save(dir.join(name)).unwrap();
+            // Dated an hour ago: folders skip files that may still be copying.
+            let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+            std::fs::File::options().write(true).open(dir.join(name)).unwrap().set_modified(old).unwrap();
+        }
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let (view, vcx) = cx.add_window_view({
+            let dir = dir.clone();
+            |window, cx| MediaPlayer::new(vec![dir], None, window, cx)
+        });
+        view.update_in(vcx, |v, _, cx| v.set_still_seconds(1, cx));
+        let shape = |v: &MediaPlayer| {
+            tree::rows(&v.playlist, v.folders.roots(), &|f| v.collapsed.contains(f))
+                .into_iter()
+                .map(|r| match r {
+                    Row::Folder { name, depth, count, collapsed, .. } => format!("{depth}{} {name} {count}", if collapsed { "+" } else { "-" }),
+                    Row::Entry { ix, depth } => format!("{depth} {}", file_name(&v.playlist[ix])),
+                })
+                .collect::<Vec<_>>()
+        };
+        let root = view.read_with(vcx, |v, _| file_name(&v.folders.roots()[0]));
+        assert_eq!(view.read_with(vcx, |v, _| shape(v)), [format!("0- {root} 3"), "1 a.png".into(), "1- sub 2".into(), "2 b.png".into(), "2 c.png".into()]);
+
+        // Clicking the folder row collapses it (and is saved).
+        vcx.run_until_parked();
+        let sub = vcx.debug_bounds("folder sub").expect("a row for the subfolder").center();
+        vcx.simulate_click(sub, gpui::Modifiers::none());
+        assert_eq!(view.read_with(vcx, |v, _| shape(v))[2], "1+ sub 2");
+        assert_eq!(view.read_with(vcx, |v, _| v.snapshot(false).collapsed_folders.len()), 1);
+
+        // Autoplay moving into the collapsed folder opens it.
+        tick_until(&view, vcx, "autoplay into the subfolder", |v| v.current == Some(1));
+        assert_eq!(view.read_with(vcx, |v, _| shape(v))[2], "1- sub 2", "opened for the entry now playing");
         let _ = std::fs::remove_dir_all(dir);
     }
 
