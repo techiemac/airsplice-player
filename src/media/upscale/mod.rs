@@ -103,11 +103,14 @@ pub fn target_size(src: (u32, u32), limit: (u32, u32)) -> Option<(u32, u32)> {
 }
 
 type Factory = Box<dyn FnMut() -> Option<Box<dyn Upscaler>> + Send>;
+type Clock = Box<dyn FnMut() -> Instant + Send>;
 
 /// Upscaling in one video thread: creates the upscaler when first needed,
 /// and stops for the file if it errors or cannot keep up.
 pub struct Stage {
     factory: Factory,
+    /// Times each upscale; a fake one in tests.
+    clock: Clock,
     upscaler: Option<Box<dyn Upscaler>>,
     tried: bool,
     stopped: Option<Status>,
@@ -125,7 +128,11 @@ impl Default for Stage {
 
 impl Stage {
     pub fn with_factory(factory: Factory) -> Self {
-        Self { factory, upscaler: None, tried: false, stopped: None, slow: 0, interval: None, last_pts: None }
+        Self::with_factory_and_clock(factory, Box::new(Instant::now))
+    }
+
+    pub fn with_factory_and_clock(factory: Factory, clock: Clock) -> Self {
+        Self { factory, clock, upscaler: None, tried: false, stopped: None, slow: 0, interval: None, last_pts: None }
     }
 
     /// Upscale one frame for a display box of `limit` (physical pixels),
@@ -153,10 +160,10 @@ impl Stage {
             self.stopped = Some(status.clone());
             return pass(bgra, status);
         };
-        let started = Instant::now();
+        let started = (self.clock)();
         match upscaler.upscale(&bgra, width, height, out_w, out_h) {
             Ok(out) => {
-                let took = started.elapsed().as_secs_f64();
+                let took = (self.clock)().duration_since(started).as_secs_f64();
                 let budget = BUDGET_SHARE * self.interval.unwrap_or(1.0 / 30.0);
                 self.slow = if took > budget { self.slow + 1 } else { 0 };
                 if self.slow >= SLOW_FRAMES {
@@ -192,6 +199,7 @@ pub fn psnr(a: &[u8], b: &[u8]) -> f64 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[test]
@@ -204,15 +212,17 @@ pub(crate) mod tests {
         assert_eq!(target_size((0, 0), (1920, 1080)), None);
     }
 
-    /// Doubles each pixel; sleeps to stand in for a slow GPU.
+    /// Doubles each pixel. Instead of taking real time it moves a fake
+    /// clock on by `cost`, so timing tests do not depend on the machine.
     struct Fake {
-        delay: Duration,
+        cost: Duration,
+        now: Arc<Mutex<Instant>>,
         fail: bool,
     }
 
     impl Upscaler for Fake {
         fn upscale(&mut self, bgra: &[u8], w: u32, _h: u32, ow: u32, oh: u32) -> anyhow::Result<Vec<u8>> {
-            std::thread::sleep(self.delay);
+            *self.now.lock().unwrap() += self.cost;
             anyhow::ensure!(!self.fail, "device lost");
             let mut out = vec![0; (ow * oh * 4) as usize];
             for y in 0..oh {
@@ -226,8 +236,13 @@ pub(crate) mod tests {
         }
     }
 
-    fn stage(delay: Duration, fail: bool) -> Stage {
-        Stage::with_factory(Box::new(move || Some(Box::new(Fake { delay, fail }) as Box<dyn Upscaler>)))
+    fn stage(cost: Duration, fail: bool) -> Stage {
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let clock = now.clone();
+        Stage::with_factory_and_clock(
+            Box::new(move || Some(Box::new(Fake { cost, now: now.clone(), fail }) as Box<dyn Upscaler>)),
+            Box::new(move || *clock.lock().unwrap()),
+        )
     }
 
     #[test]
