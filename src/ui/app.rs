@@ -317,6 +317,9 @@ pub struct MediaPlayer {
     /// size settles, so upscaling follows resizes and the switch.
     limit: (u32, u32),
     limit_changed: Instant,
+    /// Whether the player was paused before the latest click on the video,
+    /// so a double-click can undo its first click.
+    paused_before_click: Option<bool>,
     refreshed_for: Option<((u32, u32), bool)>,
     /// Output windows asked for but not open yet.
     outputs_opening: Vec<String>,
@@ -412,6 +415,7 @@ impl MediaPlayer {
                 ((f32::from(size.width) * scale) as u32, (f32::from(size.height) * scale) as u32)
             },
             limit_changed: Instant::now(),
+            paused_before_click: None,
             refreshed_for: None,
             // Long ago, so the first tick opens a remembered output.
             output_checked: Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or_else(Instant::now),
@@ -1404,6 +1408,26 @@ impl MediaPlayer {
         cx.notify();
     }
 
+    /// A click on the video plays or pauses it; a double-click toggles full
+    /// screen. The double-click's first click has already played or paused,
+    /// so the second puts playback back the way it was.
+    fn stage_clicked(&mut self, count: usize, window: &mut Window, cx: &mut Context<Self>) {
+        match count {
+            1 => {
+                self.paused_before_click = self.player.as_ref().map(Player::is_paused);
+                self.play_pause(&PlayPause, window, cx);
+            }
+            2 => {
+                window.toggle_fullscreen();
+                if let (Some(p), Some(paused)) = (self.player.as_mut(), self.paused_before_click.take()) {
+                    p.set_paused(paused);
+                }
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
     fn toggle_fullscreen(&mut self, _: &ToggleFullscreen, window: &mut Window, _: &mut Context<Self>) {
         window.toggle_fullscreen();
     }
@@ -1924,13 +1948,7 @@ impl MediaPlayer {
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
-                .on_click(cx.listener(|this, e: &ClickEvent, window, cx| {
-                    if e.click_count() == 2 {
-                        window.toggle_fullscreen();
-                    } else {
-                        this.play_pause(&PlayPause, window, cx);
-                    }
-                }))
+                .on_click(cx.listener(|this, e: &ClickEvent, window, cx| this.stage_clicked(e.click_count(), window, cx)))
                 // Absolutely placed, so the image's box is exactly the stage
                 // whatever its shape: in the flex layout a tall picture's box
                 // grew past the stage and was cropped.
@@ -3360,6 +3378,22 @@ mod tests {
         });
         assert!(view.read_with(vcx, |v, _| v.preloaded.is_none()));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_double_click_on_the_video_leaves_playback_as_it_was(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(vec![fixture("video_only.mp4")], None, window, cx));
+        tick_until(&view, vcx, "the first frame", |v| v.frame.is_some());
+        let paused = |vcx: &mut gpui::VisualTestContext| view.read_with(vcx, |v, _| v.player.as_ref().unwrap().is_paused());
+        // A restored or command-line file opens playing.
+        for start_paused in [false, true] {
+            view.update_in(vcx, |v, _, _| v.player.as_mut().unwrap().set_paused(start_paused));
+            view.update_in(vcx, |v, window, cx| v.stage_clicked(1, window, cx));
+            assert_eq!(paused(vcx), !start_paused, "a single click toggles playback");
+            view.update_in(vcx, |v, window, cx| v.stage_clicked(2, window, cx));
+            assert_eq!(paused(vcx), start_paused, "the double-click undoes its first click");
+        }
     }
 
     #[gpui::test]
