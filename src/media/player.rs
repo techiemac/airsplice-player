@@ -302,6 +302,39 @@ fn seek_to_keyframe(
     }
 }
 
+/// Decode errors in a row, so a stream the decoder cannot handle is
+/// reported rather than leaving the picture black. A single bad packet is
+/// only logged.
+#[derive(Default)]
+struct Failures {
+    in_a_row: u32,
+    first: Option<String>,
+}
+
+impl Failures {
+    /// After this many errors with no frame in between, the video is
+    /// reported as undecodable.
+    const LIMIT: u32 = 3;
+
+    /// Note one packet's outcome (frames out, or the error); the reason to
+    /// report, once, when errors reach the limit.
+    fn record(&mut self, outcome: std::result::Result<usize, String>) -> Option<String> {
+        match outcome {
+            Ok(0) => None,
+            Ok(_) => {
+                *self = Self::default();
+                None
+            }
+            Err(e) => {
+                log::debug!("video decode error: {e}");
+                self.in_a_row += 1;
+                let first = self.first.get_or_insert(e);
+                (self.in_a_row == Self::LIMIT).then(|| first.clone())
+            }
+        }
+    }
+}
+
 pub struct Player {
     pub info: MediaInfo,
     shared: Arc<Shared>,
@@ -1243,6 +1276,7 @@ fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time
         }
     };
     let mut catch_up = CatchUp::default();
+    let mut failures = Failures::default();
     let mut last_report = std::time::Instant::now();
     let mut applied_limit = 0u64;
     while let Ok(msg) = rx.recv() {
@@ -1276,9 +1310,12 @@ fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time
                     applied_limit = packed;
                     decoder.set_output_limit((packed != 0).then_some(((packed >> 32) as u32, packed as u32)));
                 }
-                match decoder.decode(&data, pts) {
-                    Ok(frames) => push(frames, generation),
-                    Err(e) => log::debug!("video decode error: {e}"),
+                let decoded = decoder.decode(&data, pts);
+                if let Some(why) = failures.record(decoded.as_ref().map(Vec::len).map_err(|e| format!("{e:#}"))) {
+                    *shared.error.lock().unwrap() = Some(format!("Can't decode the video: {why}"));
+                }
+                if let Ok(frames) = decoded {
+                    push(frames, generation);
                 }
             }
             VideoMsg::Reset { discard_before } => {
@@ -1602,6 +1639,19 @@ mod tests {
         assert_eq!(info.title, "Test Tone");
         assert_eq!(info.artist.as_deref(), Some("Fixture Band"));
         assert_eq!(info.album.as_deref(), Some("Fixtures"));
+    }
+
+    #[test]
+    fn repeated_decode_errors_are_reported_once_with_the_first_reason() {
+        let mut f = Failures::default();
+        let err = |s: &str| Err(s.to_string());
+        assert_eq!(f.record(err("bad packet")), None, "one bad packet is only logged");
+        assert_eq!(f.record(Ok(1)), None);
+        assert_eq!((f.record(err("a")), f.record(Ok(0)), f.record(err("b"))), (None, None, None), "nothing out is not a frame");
+        assert_eq!(f.record(err("c")).as_deref(), Some("a"), "third in a row: the first reason");
+        assert_eq!(f.record(err("d")), None, "reported once");
+        f.record(Ok(2));
+        assert_eq!((f.record(err("e")), f.record(err("f")), f.record(err("g")).as_deref()), (None, None, Some("e")), "counted again after a frame");
     }
 
     #[test]

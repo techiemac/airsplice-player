@@ -5,7 +5,7 @@
 use std::ffi::c_void;
 use std::ptr::{NonNull, null, null_mut};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 
 use anyhow::{Result, anyhow, bail};
 use objc2_core_foundation::{CFData, CFDictionary, CFNumber, CFNumberType, CFRetained, CFString};
@@ -38,6 +38,9 @@ use super::{DecodedFrame, KeyframeCheck, Reorder, VideoDecoder, keyframe_check};
 struct Output {
     frames: Mutex<Vec<DecodedFrame>>,
     discard_before: AtomicI64,
+    /// The status of the last frame VideoToolbox could not decode, until
+    /// `decode` reports it; 0 for none.
+    failed: AtomicI32,
 }
 
 pub struct VtDecoder {
@@ -94,6 +97,7 @@ impl VtDecoder {
             output: Box::new(Output {
                 frames: Mutex::new(Vec::new()),
                 discard_before: AtomicI64::new(i64::MIN),
+                failed: AtomicI32::new(0),
             }),
             // VideoToolbox emits decode order; H.264 and HEVC may reorder.
             reorder: Reorder::new(match params.codec {
@@ -197,7 +201,11 @@ unsafe extern "C-unwind" fn on_frame(
     // session is.
     let output = unsafe { &*(refcon as *const Output) };
     let pts = frame_refcon as i64;
-    if status != 0 || image.is_null() || flags.contains(VTDecodeInfoFlags::FrameDropped) {
+    if status != 0 {
+        output.failed.store(status, Ordering::Relaxed);
+        return;
+    }
+    if image.is_null() || flags.contains(VTDecodeInfoFlags::FrameDropped) {
         return;
     }
     if pts < output.discard_before.load(Ordering::Relaxed) {
@@ -246,6 +254,12 @@ impl VideoDecoder for VtDecoder {
         if self.session.is_none() {
             // VP9: describe the stream from its first keyframe.
             let config = vp9_keyframe(data).ok_or_else(|| anyhow!("VideoToolbox: VP9 stream does not start with a keyframe"))?;
+            // VideoToolbox decodes VP9 profiles 0 and 2 (4:2:0) only; it
+            // takes the others and returns nothing.
+            if config.profile % 2 == 1 {
+                let chroma = if config.chroma_subsampling == 2 { "4:2:2" } else { "4:4:4" };
+                bail!("VP9 {chroma} video (profile {}) is not supported", config.profile);
+            }
             self.atom = Some(("vpcC", vpcc(&config)));
             self.open_session()?;
         }
@@ -297,7 +311,11 @@ impl VideoDecoder for VtDecoder {
         // SAFETY: valid session and sample.
         let status = unsafe { session.decode_frame(&sample, VTDecodeFrameFlags(0), pts as *mut c_void, null_mut()) };
         if status != 0 {
-            log::debug!("VideoToolbox decode status {status}");
+            bail!("VideoToolbox could not decode a frame ({status})");
+        }
+        let failed = self.output.failed.swap(0, Ordering::Relaxed);
+        if failed != 0 {
+            bail!("VideoToolbox could not decode a frame ({failed})");
         }
         Ok(self.collect())
     }

@@ -37,6 +37,9 @@ ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=48000:d=3" -filter_complex "$V10" -ma
   -c:v libx265 -x265-params log-level=error:info=0 -profile:v main10 -c:a libopus -b:a 48k hevc_10bit_opus.mkv
 ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=48000:d=3" -filter_complex "$V" -map "[v]" -map 0:a \
   -c:v libvpx -b:v 200k -g 25 -c:a libopus -b:a 48k vp8_opus.webm
+# VP9 4:4:4 (profile 1): VideoToolbox decodes only 4:2:0 VP9.
+ffmpeg "${q[@]}" -f lavfi -i "sine=f=440:r=48000:d=3" -filter_complex "${V/yuv420p/yuv444p}" -map "[v]" -map 0:a \
+  -c:v libvpx-vp9 -b:v 200k -g 25 -c:a libopus -b:a 48k vp9_444_opus.webm
 
 # Moving content with B-frames, to check decoders emit display order.
 ffmpeg "${q[@]}" -f lavfi -i "testsrc2=s=160x120:r=25:d=2" -c:v libx264 -bf 3 -b_strategy 0 -g 25 -pix_fmt yuv420p bframes_h264.mp4

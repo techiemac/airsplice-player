@@ -186,10 +186,31 @@ fn unsupported_video_falls_back_to_audio() {
     // VP8: no decoder on any platform.
     let Some(player) = open("vp8_opus.webm") else { return };
     assert!(player.info.video.is_none());
-    let why = player.info.video_unsupported.as_deref().unwrap();
-    assert!(why.contains("video"), "{why}");
+    assert_eq!(player.info.video_unsupported.as_deref(), Some("VP8 video is not supported"));
     assert!(player.info.audio.is_some());
     play_to_end(&player, Duration::from_secs(8));
+}
+
+/// VP9 4:4:4: VideoToolbox accepts it and returns nothing, which used to
+/// leave the picture black without a word. It must say why, here or (with
+/// no VP9 decoder at all) when the file opens.
+#[test]
+fn vp9_four_four_four_says_why_it_has_no_picture() {
+    let Some(player) = open("vp9_444_opus.webm") else { return };
+    if let Some(why) = &player.info.video_unsupported {
+        assert!(why.contains("VP9"), "{why}");
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let why = loop {
+        if let Some(e) = player.error() {
+            break e;
+        }
+        assert!(Instant::now() < deadline, "no error for undecodable VP9 4:4:4");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(why, "Can't decode the video: VP9 4:4:4 video (profile 1) is not supported");
+    assert!(player.info.audio.is_some(), "the sound still plays");
 }
 
 #[test]

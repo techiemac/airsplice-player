@@ -152,7 +152,7 @@ fn vp9_in_webm() {
 fn codecs_without_a_software_decoder_say_so() {
     for name in ["hevc_aac.mp4", "vp9_opus.webm"] {
         let err = decode_video(name, Backend::Software).err().unwrap_or_else(|| panic!("{name} has no software decoder"));
-        assert!(err.to_string().contains("no software decoder"), "{name}: {err}");
+        assert!(err.to_string().ends_with("video is not supported"), "{name}: {err}");
     }
 }
 

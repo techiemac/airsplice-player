@@ -17,7 +17,7 @@ use symphonia::core::codecs::video::well_known::extra_data::{
     VIDEO_EXTRA_DATA_ID_AV1_DECODER_CONFIG, VIDEO_EXTRA_DATA_ID_AVC_DECODER_CONFIG,
     VIDEO_EXTRA_DATA_ID_HEVC_DECODER_CONFIG,
 };
-use symphonia::core::codecs::video::well_known::{CODEC_ID_AV1, CODEC_ID_H264, CODEC_ID_HEVC, CODEC_ID_VP9};
+use symphonia::core::codecs::video::well_known::{CODEC_ID_AV1, CODEC_ID_H264, CODEC_ID_HEVC, CODEC_ID_VP8, CODEC_ID_VP9};
 use symphonia::core::codecs::video::{VideoCodecId, VideoCodecParameters};
 
 pub struct DecodedFrame {
@@ -86,7 +86,8 @@ pub fn codec_name(id: VideoCodecId) -> &'static str {
         CODEC_ID_HEVC => "HEVC",
         CODEC_ID_AV1 => "AV1",
         CODEC_ID_VP9 => "VP9",
-        _ => "video",
+        CODEC_ID_VP8 => "VP8",
+        _ => "this",
     }
 }
 
@@ -141,7 +142,7 @@ pub fn make_software_decoder(params: &VideoCodecParameters) -> Result<Box<dyn Vi
             Ok(Box::new(h264::H264Decoder::new(avcc)?))
         }
         CODEC_ID_AV1 => Ok(Box::new(av1::Av1Decoder::new(extra(VIDEO_EXTRA_DATA_ID_AV1_DECODER_CONFIG))?)),
-        other => bail!("no software decoder for {} video", codec_name(other)),
+        other => bail!("{} video is not supported", codec_name(other)),
     }
 }
 
