@@ -123,9 +123,19 @@ struct Shared {
     /// Upscale frames on the GPU to the output limit (the settings switch).
     upscale: AtomicBool,
     upscale_status: Mutex<upscale::Status>,
+    /// Video frames that were due on screen but never got there: left
+    /// undecoded, decoded too late, or replaced before the UI took them.
+    /// Only ever incremented when a frame is lost, so it costs nothing
+    /// while playback keeps up.
+    lost_frames: AtomicU64,
 }
 
 impl Shared {
+    fn lose(&self, frames: usize) {
+        if frames > 0 {
+            self.lost_frames.fetch_add(frames as u64, Ordering::Relaxed);
+        }
+    }
     fn current(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -367,6 +377,7 @@ impl Shared {
             max_frames: std::sync::atomic::AtomicUsize::new(MAX_QUEUED_FRAMES),
             upscale: AtomicBool::new(false),
             upscale_status: Mutex::new(upscale::Status::Off),
+            lost_frames: AtomicU64::new(0),
         }
     }
 }
@@ -635,6 +646,17 @@ impl Player {
         self.shared.upscale_status.lock().unwrap().clone()
     }
 
+    /// Video frames lost so far because playback could not keep up. Only
+    /// counted while the clock runs, so seeks and pauses add nothing.
+    pub fn lost_frames(&self) -> u64 {
+        self.shared.lost_frames.load(Ordering::Relaxed)
+    }
+
+    /// Times the audio ran dry mid-stream so far.
+    pub fn audio_dropouts(&self) -> u64 {
+        self.audio.as_ref().map_or(0, |o| o.state.lock().unwrap().dropouts)
+    }
+
     pub fn levels(&self) -> [f32; 2] {
         self.audio.as_ref().map_or([0.0; 2], |o| o.state.lock().unwrap().peak)
     }
@@ -660,15 +682,24 @@ impl Player {
             }
         }
         let now = self.clock.now();
+        // Frames passed over while the clock runs were never seen: the UI
+        // (or the decoder) fell behind. Pre-roll frames before a seek
+        // target are passed over by design and do not count.
+        let running = self.clock.running().is_some();
+        let mut lost = 0;
         let mut frames = self.shared.frames.lock().unwrap();
-        let mut best = None;
+        let mut best: Option<VideoFrame> = None;
         let last_shown = self.last_shown.get().filter(|(g, _)| *g == generation).map(|(_, pts)| pts);
         while let Some(front) = frames.front() {
-            if front.generation != generation || last_shown.is_some_and(|l| front.pts <= l) {
-                // Stale, or older than what is on screen: a frame that
-                // arrived late must never make the picture step backwards.
+            if front.generation != generation {
+                frames.pop_front();
+            } else if last_shown.is_some_and(|l| front.pts <= l) {
+                // Older than what is on screen: a frame that arrived late
+                // must never make the picture step backwards.
+                lost += usize::from(running);
                 frames.pop_front();
             } else if front.pts <= now + 0.004 {
+                lost += usize::from(running && best.as_ref().is_some_and(|b| b.pts >= target - SAME_TIME));
                 best = frames.pop_front();
             } else {
                 break;
@@ -695,6 +726,7 @@ impl Player {
             best = frames.pop_front();
         }
         drop(frames);
+        self.shared.lose(lost);
         self.shared.frames_cv.notify_all();
         if let Some(f) = &best {
             self.last_shown.set(Some((generation, f.pts)));
@@ -1106,7 +1138,9 @@ fn queue_frame(
     // picker needs its successor to know it is the one to show.
     loop {
         if let Some(now) = now() {
+            let before = q.len();
             q.retain(|e| e.generation != generation || e.pts >= now - MAX_VIDEO_LAG);
+            shared.lose(before - q.len());
         }
         if q.iter().filter(|e| !held(e)).count() < shared.max_frames.load(Ordering::Relaxed)
             || shared.current() != generation
@@ -1296,7 +1330,10 @@ fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time
                 }
                 match step {
                     Step::Decode => {}
-                    Step::Drop | Step::Skip => continue,
+                    Step::Drop | Step::Skip => {
+                        shared.lose(1);
+                        continue;
+                    }
                     Step::Resume => {
                         log::debug!("video was behind: skipped {} packets to the keyframe at {:.2}s", catch_up.skipped, secs(pts));
                         if let Err(e) = decoder.reset(pts) {
@@ -1770,5 +1807,6 @@ mod tests {
         assert!(queue_frame(&shared, &mut stage, 0, 3.0, frame(), &|| Some(3.0)));
         let q = shared.frames.lock().unwrap();
         assert_eq!(q.iter().map(|f| f.pts).collect::<Vec<_>>(), [3.0]);
+        assert_eq!(shared.lost_frames.load(Ordering::Relaxed), 1, "the dropped frame is counted as lost");
     }
 }

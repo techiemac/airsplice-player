@@ -29,10 +29,12 @@ fn main() -> anyhow::Result<()> {
     gaps.sort_by(f64::total_cmp);
     let median_gap = gaps.get(gaps.len() / 2).copied().unwrap_or(0.0);
     println!(
-        "{path}: played {played:.2}s, shown {shown} frames ({:.1} fps), median frame gap {:.1} ms, max lateness {:.0} ms",
+        "{path}: played {played:.2}s, shown {shown} frames ({:.1} fps), median frame gap {:.1} ms, max lateness {:.0} ms, {} lost, {} audio dropouts",
         shown as f64 / played,
         median_gap * 1000.0,
-        max_late * 1000.0
+        max_late * 1000.0,
+        player.lost_frames(),
+        player.audio_dropouts()
     );
     Ok(())
 }

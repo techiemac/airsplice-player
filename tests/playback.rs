@@ -343,3 +343,24 @@ fn video_that_outlasts_its_audio_plays_to_the_end_and_finishes() {
     assert_eq!(last.colour, "blue");
     assert!(shown.iter().filter(|s| s.pts > 2.0).count() >= 20, "the last second was skipped, not played");
 }
+
+#[test]
+fn frames_the_screen_misses_are_counted_but_seeks_are_not() {
+    let mut player = open("video_only.mp4").unwrap();
+    // Seeks pass over frames by design; that is not falling behind.
+    player.set_paused(true);
+    player.seek(2.3);
+    wait_for_frame(&player, Duration::from_secs(5), |f| f.pts > 2.2);
+    player.seek(0.2);
+    wait_for_frame(&player, Duration::from_secs(5), |f| f.pts < 0.5);
+    assert_eq!(player.lost_frames(), 0);
+
+    // The screen stops taking frames for half a second while playing (a
+    // stalled UI): the queued frames that came due were never seen.
+    player.set_paused(false);
+    wait_for_frame(&player, Duration::from_secs(5), |f| f.pts > 0.3);
+    thread::sleep(Duration::from_millis(500));
+    assert!(player.take_frame().is_some());
+    let lost = player.lost_frames();
+    assert!(lost >= 5, "{lost} frames counted lost over a 0.5 s stall at 25 fps");
+}

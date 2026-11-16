@@ -37,6 +37,12 @@ pub struct AudioState {
     /// buffer is empty the clock keeps running on the silence played, so
     /// video that outlasts the audio still plays to its end.
     pub ended: bool,
+    /// Times the device ran dry mid-stream (the decoder fell behind), a
+    /// gap the listener hears. Read by the UI's performance warning.
+    pub dropouts: u64,
+    /// The last callback was filled, so running dry now is a dropout (not
+    /// the wait for the first audio after open or a seek).
+    flowing: bool,
 }
 
 pub struct AudioOutput {
@@ -123,6 +129,8 @@ impl AudioOutput {
             peak: [0.0; 2],
             latency_frames: 0,
             ended: false,
+            dropouts: 0,
+            flowing: false,
         }));
 
         let build_with = |config: &StreamConfig| match format {
@@ -168,36 +176,54 @@ where
             let latency = ts.playback.duration_since(ts.callback).as_secs_f64();
             let mut st = state.lock().unwrap();
             st.latency_frames = (latency * rate) as u64;
-            let gain = if st.muted { 0.0 } else { st.volume * st.volume };
-            let silence = T::from_sample(0.0f32);
-            if st.paused || !st.primed {
-                out.fill(silence);
-                st.peak = [0.0; 2];
-                return;
-            }
-            let available = st.buf.len().min(out.len());
-            let available = available - available % channels;
-            let mut peak = [0.0f32; 2];
-            for (i, slot) in out[..available].iter_mut().enumerate() {
-                let s = st.buf.pop_front().unwrap_or(0.0) * gain;
-                let p = &mut peak[(i % channels).min(1)];
-                *p = p.max(s.abs());
-                *slot = T::from_sample(s);
-            }
-            out[available..].fill(silence);
-            // Running dry mid-stream (a slow decoder) holds the clock so the
-            // picture waits for the sound; after the end, silence counts.
-            let played = if st.ended { out.len() } else { available };
-            st.consumed_frames += (played / channels) as u64;
-            // Decay so the meter falls smoothly instead of snapping to zero.
-            for (held, new) in st.peak.iter_mut().zip(peak) {
-                *held = new.max(*held * 0.85);
-            }
+            fill(&mut st, out, channels);
         },
         |err| log::error!("audio stream error: {err}"),
         None,
     )?;
     Ok(stream)
+}
+
+/// One device callback's worth of samples: drains the queue into `out`,
+/// fills the rest with silence, advances the clock and counts a dropout
+/// when the queue runs dry mid-stream.
+fn fill<T>(st: &mut AudioState, out: &mut [T], channels: usize)
+where
+    T: SizedSample + FromSample<f32>,
+{
+    let gain = if st.muted { 0.0 } else { st.volume * st.volume };
+    let silence = T::from_sample(0.0f32);
+    if st.paused || !st.primed {
+        st.flowing &= st.primed;
+        out.fill(silence);
+        st.peak = [0.0; 2];
+        return;
+    }
+    let available = st.buf.len().min(out.len());
+    let available = available - available % channels;
+    let mut peak = [0.0f32; 2];
+    for (i, slot) in out[..available].iter_mut().enumerate() {
+        let s = st.buf.pop_front().unwrap_or(0.0) * gain;
+        let p = &mut peak[(i % channels).min(1)];
+        *p = p.max(s.abs());
+        *slot = T::from_sample(s);
+    }
+    out[available..].fill(silence);
+    if !st.ended {
+        let full = available == out.len();
+        if !full && st.flowing {
+            st.dropouts += 1;
+        }
+        st.flowing = full;
+    }
+    // Running dry mid-stream (a slow decoder) holds the clock so the
+    // picture waits for the sound; after the end, silence counts.
+    let played = if st.ended { out.len() } else { available };
+    st.consumed_frames += (played / channels) as u64;
+    // Decay so the meter falls smoothly instead of snapping to zero.
+    for (held, new) in st.peak.iter_mut().zip(peak) {
+        *held = new.max(*held * 0.85);
+    }
 }
 
 /// The media clock. Audio-driven when the file has audio, wall-clock driven
@@ -279,6 +305,7 @@ impl Clock {
                 st.primed = !*preroll;
                 st.ended = false;
                 st.buf.clear();
+                st.flowing = false;
                 st.consumed_frames = 0;
                 st.base_secs = secs;
                 st.generation = generation;
@@ -439,5 +466,83 @@ mod tests {
         assert!(frames > 46_000 && frames <= 48_000, "{frames}");
         // After the startup delay a DC input stays DC.
         assert!(out[out.len() / 2..].iter().all(|s| (s - 0.1).abs() < 0.01));
+    }
+}
+
+#[cfg(test)]
+mod dropout_tests {
+    use super::*;
+
+    fn state(queued: usize) -> AudioState {
+        AudioState {
+            buf: std::iter::repeat_n(0.1, queued).collect(),
+            consumed_frames: 0,
+            base_secs: 0.0,
+            generation: 0,
+            paused: false,
+            primed: true,
+            volume: 1.0,
+            muted: false,
+            peak: [0.0; 2],
+            latency_frames: 0,
+            ended: false,
+            dropouts: 0,
+            flowing: false,
+        }
+    }
+
+    #[test]
+    fn running_dry_mid_stream_is_a_dropout() {
+        let mut st = state(6);
+        let mut out = [0.0f32; 4];
+        fill(&mut st, &mut out, 2);
+        assert_eq!(st.dropouts, 0);
+        // Two samples left for four slots: a gap the listener hears.
+        fill(&mut st, &mut out, 2);
+        assert_eq!(st.dropouts, 1);
+        // Still dry: the same gap, not a new one.
+        fill(&mut st, &mut out, 2);
+        assert_eq!(st.dropouts, 1);
+        st.buf.extend([0.1; 8]);
+        fill(&mut st, &mut out, 2);
+        fill(&mut st, &mut out, 2);
+        fill(&mut st, &mut out, 2);
+        assert_eq!(st.dropouts, 2);
+    }
+
+    #[test]
+    fn waiting_for_the_first_audio_and_the_end_are_not_dropouts() {
+        let mut out = [0.0f32; 4];
+        // Nothing queued yet after open or a seek.
+        let mut st = state(0);
+        fill(&mut st, &mut out, 2);
+        assert_eq!(st.dropouts, 0);
+        // A seek empties a flowing queue and pre-rolls.
+        let mut st = state(4);
+        fill(&mut st, &mut out, 2);
+        st.primed = false;
+        st.buf.clear();
+        fill(&mut st, &mut out, 2);
+        st.primed = true;
+        fill(&mut st, &mut out, 2);
+        assert_eq!(st.dropouts, 0);
+        // The end of the file.
+        let mut st = state(4);
+        fill(&mut st, &mut out, 2);
+        st.ended = true;
+        fill(&mut st, &mut out, 2);
+        assert_eq!(st.dropouts, 0);
+    }
+
+    #[test]
+    fn a_pause_is_not_a_dropout() {
+        let mut st = state(8);
+        let mut out = [0.0f32; 4];
+        fill(&mut st, &mut out, 2);
+        st.paused = true;
+        fill(&mut st, &mut out, 2);
+        st.paused = false;
+        fill(&mut st, &mut out, 2);
+        assert_eq!(st.dropouts, 0);
     }
 }

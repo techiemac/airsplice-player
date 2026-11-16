@@ -34,6 +34,8 @@ the Raspberry Pi 5. The Windows build has not been tested yet.
 - Session restore: playlist, open tabs and their positions, volume, repeat
   mode and panel layout come back (paused) on the next launch
 - Hardware video decoding on macOS and Raspberry Pi
+- A warning in the status bar while playback drops frames or the audio
+  drops out
 - Surround Opus; AAC encoder delay trimmed using MP4 edit lists
 - Seeks land on the requested time, decoding forward from the previous
   keyframe

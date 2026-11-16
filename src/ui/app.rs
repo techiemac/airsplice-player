@@ -21,6 +21,7 @@ use super::icons::Icon;
 use super::letterbox;
 use super::os_media::{NowPlaying, OsMedia, PlayState};
 use super::output::{self, OutputView};
+use super::perf::{self, PerfWatch};
 use super::session::{Session, SessionStore, TabState};
 use super::theme::{Theme, mono_font};
 use super::tree::{self, Row};
@@ -363,6 +364,9 @@ pub struct MediaPlayer {
     longest_gap: Duration,
     last_draw: Instant,
     frame_pending: bool,
+    /// Whether the status bar warns that playback is not keeping up, judged
+    /// from the counts above once per window.
+    perf: PerfWatch,
     /// Tags and durations for playlist entries, filled in the background.
     summaries: std::collections::HashMap<PathBuf, Summary>,
     /// Folders added to the playlist, watched for files added later.
@@ -456,6 +460,7 @@ impl MediaPlayer {
             longest_gap: Duration::ZERO,
             last_draw: Instant::now(),
             frame_pending: false,
+            perf: PerfWatch::default(),
             summaries: Default::default(),
             folders: Folders::default(),
             removed_from_folders: Default::default(),
@@ -686,8 +691,10 @@ impl MediaPlayer {
             }
             self.frame_pending = true;
             self.fps_count += 1;
-            let elapsed = self.fps_since.elapsed();
-            if elapsed >= Duration::from_secs(2) {
+        }
+        let elapsed = self.fps_since.elapsed();
+        if elapsed >= perf::WINDOW {
+            if self.fps_count > 0 {
                 let secs = elapsed.as_secs_f64();
                 log::debug!(
                     "presented {:.1} frames/s, rendered {:.1}/s, {} never rendered, longest gap {} ms",
@@ -696,12 +703,13 @@ impl MediaPlayer {
                     self.never_drawn,
                     self.longest_gap.as_millis()
                 );
-                self.fps_count = 0;
-                self.draw_count = 0;
-                self.never_drawn = 0;
-                self.longest_gap = Duration::ZERO;
-                self.fps_since = Instant::now();
             }
+            // Two atomic reads and one uncontended lock every two seconds;
+            // the footer only re-renders when the warning comes or goes.
+            changed |= self.perf.close(player.lost_frames(), player.audio_dropouts(), self.never_drawn, self.draw_count, elapsed);
+            (self.fps_count, self.draw_count, self.never_drawn) = (0, 0, 0);
+            self.longest_gap = Duration::ZERO;
+            self.fps_since = Instant::now();
         }
         let position = player.position();
         if (position - self.drawn_position).abs() >= 0.04 || (!player.is_paused() && player.info.audio.is_some()) {
@@ -877,11 +885,24 @@ impl MediaPlayer {
     /// Make `loaded` the state on screen.
     fn install(&mut self, loaded: Loaded) {
         self.player = loaded.player;
+        let counts = self.player.as_ref().map_or((0, 0), |p| (p.lost_frames(), p.audio_dropouts()));
+        self.perf.start(counts.0, counts.1);
+        self.start_window();
         self.frame = loaded.frame;
         self.cover = loaded.cover;
         self.error = loaded.error;
         self.ended = loaded.ended;
         self.drawn_position = -1.0;
+    }
+
+    /// Start a new window of render counts (for the debug log and the
+    /// performance warning).
+    fn start_window(&mut self) {
+        self.fps_count = 0;
+        self.draw_count = 0;
+        self.never_drawn = 0;
+        self.longest_gap = Duration::ZERO;
+        self.fps_since = Instant::now();
     }
 
     fn take_installed(&mut self) -> Loaded {
@@ -2275,6 +2296,19 @@ impl MediaPlayer {
                     })))
                     .child(div().text_color(Theme::text()).child(state))
                     .when_some(summary, |el, s| el.child(div().truncate().child(s)))
+                    .when_some(self.perf.shown().filter(|_| self.player.is_some()), |el, trouble| {
+                        el.child(
+                            div()
+                                .debug_selector(|| "sb-perf".into())
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .gap(px(4.))
+                                .text_color(Theme::warning())
+                                .child(icon(Icon::Warning, px(12.), Theme::warning()))
+                                .child(trouble.label()),
+                        )
+                    })
                     .when_some(self.error.clone(), |el, e| el.child(div().truncate().text_color(Theme::error()).child(e)))
                     .when_some(self.notice.clone(), |el, n| el.child(div().truncate().text_color(Theme::warning()).child(n))),
             )
@@ -3390,6 +3424,43 @@ mod tests {
         });
         assert!(view.read_with(vcx, |v, _| v.preloaded.is_none()));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn the_status_bar_warns_while_playback_falls_behind(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(vec![fixture("video_only.mp4")], None, window, cx));
+        tick_until(&view, vcx, "the first frame", |v| v.frame.is_some());
+        view.update(vcx, |v, _| v.player.as_mut().unwrap().set_paused(true));
+        // Close windows through the real tick: paused, nothing is lost.
+        let close_window = |vcx: &mut gpui::VisualTestContext| {
+            view.update_in(vcx, |v, window, cx| {
+                v.fps_since = Instant::now() - perf::WINDOW;
+                v.tick(window, cx);
+            });
+            vcx.run_until_parked();
+        };
+        close_window(vcx);
+        assert!(vcx.debug_bounds("sb-perf").is_none(), "no warning while playback keeps up");
+
+        // A window in which five frames never reached the screen.
+        view.update(vcx, |v, cx| {
+            let p = v.player.as_ref().unwrap();
+            let (lost, dropouts) = (p.lost_frames(), p.audio_dropouts());
+            assert!(v.perf.close(lost + 5, dropouts, 0, 120, perf::WINDOW));
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("sb-perf").is_some(), "the warning shows");
+        assert_eq!(view.read_with(vcx, |v, _| v.perf.shown().map(|t| t.label())), Some("Dropping frames"));
+
+        // It stays through two clean windows, so it never flickers, and
+        // goes after the third.
+        close_window(vcx);
+        close_window(vcx);
+        assert!(vcx.debug_bounds("sb-perf").is_some(), "still shown after two clean windows");
+        close_window(vcx);
+        assert!(vcx.debug_bounds("sb-perf").is_none(), "gone after three");
     }
 
     #[gpui::test]
