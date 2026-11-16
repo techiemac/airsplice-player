@@ -1,0 +1,4 @@
+# The three largest vectors are not committed; fetch.sh downloads them.
+vp80-01-intra-1411.ivf*
+vp80-03-segmentation-04.ivf*
+vp80-03-segmentation-1427.ivf*

@@ -183,12 +183,45 @@ fn pause_freezes_the_audio_clock() {
 
 #[test]
 fn unsupported_video_falls_back_to_audio() {
-    // VP8: no decoder on any platform.
-    let Some(player) = open("vp8_opus.webm") else { return };
+    // VP9 has no software decoder: where there is no hardware one either,
+    // the sound still plays.
+    let Some(player) = open("vp9_opus.webm") else { return };
+    let Some(why) = player.info.video_unsupported.as_deref() else {
+        eprintln!("skipping: VP9 decodes here");
+        return;
+    };
     assert!(player.info.video.is_none());
-    assert_eq!(player.info.video_unsupported.as_deref(), Some("VP8 video is not supported"));
+    assert_eq!(why, "VP9 video needs a hardware decoder, and none is available here");
     assert!(player.info.audio.is_some());
     play_to_end(&player, Duration::from_secs(8));
+}
+
+/// VP8 decodes in software on every platform: plain, with hidden alternate
+/// reference frames, and at a size that is not a whole number of blocks.
+#[test]
+fn vp8_plays_in_sync_and_seeks() {
+    for (name, size) in [("vp8_altref.webm", (320, 240)), ("vp8_odd_size.webm", (321, 181)), ("vp8_opus.webm", (320, 240))] {
+        let Some(mut player) = open(name) else { continue };
+        assert_eq!(player.info.video_unsupported, None, "{name}");
+        let v = player.info.video.clone().unwrap_or_else(|| panic!("{name}: no picture"));
+        assert_eq!((v.codec, v.width, v.height), ("VP8", size.0, size.1), "{name}");
+        assert!(v.decoder.contains("software"), "{name}: {}", v.decoder);
+        let shown = play_to_end(&player, Duration::from_secs(8));
+        assert_in_sync(name, &shown);
+        assert!(player.error().is_none(), "{name}: {:?}", player.error());
+
+        // Seeks start at the keyframe a second in and show the target frame.
+        player.set_paused(true);
+        player.seek(1.4);
+        let f = wait_for_frame(&player, Duration::from_secs(5), |f| f.pts > 1.3);
+        assert!((f.pts - 1.4).abs() < 0.05, "{name}: showed {:.3}s for a seek to 1.4s", f.pts);
+        assert_eq!((f.width, f.height), size, "{name}: frame size");
+        assert_eq!(colour(&f), "green", "{name}: frame at {:.3}s after seek", f.pts);
+        player.seek(0.5);
+        let f = wait_for_frame(&player, Duration::from_secs(5), |f| f.pts < 1.0 && f.pts > 0.4);
+        assert_eq!(colour(&f), "red", "{name}: frame at {:.3}s after seeking back", f.pts);
+        assert!(player.error().is_none(), "{name}: {:?}", player.error());
+    }
 }
 
 /// VP9 4:4:4: VideoToolbox accepts it and returns nothing, which used to

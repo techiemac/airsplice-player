@@ -1,11 +1,12 @@
 //! Video decoding against fixtures with known content:
-//! 1 s red, 1 s green, 1 s blue at 25 fps, 320x240.
+//! 1 s red, 1 s green, 1 s blue at 25 fps, 320x240 unless a test says otherwise.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use airsplice_player::media::mp4_timing;
 use airsplice_player::media::video::{DecodedFrame, VideoDecoder, make_hardware_decoder, make_software_decoder};
+use symphonia::core::codecs::video::VideoCodecParameters;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
@@ -68,6 +69,10 @@ fn centre_rgb(f: &DecodedFrame) -> (u8, u8, u8) {
 
 /// Returns false if the backend is not available on this platform.
 fn assert_red_green_blue(name: &str, backend: Backend) -> bool {
+    assert_red_green_blue_sized(name, backend, (320, 240))
+}
+
+fn assert_red_green_blue_sized(name: &str, backend: Backend, size: (u32, u32)) -> bool {
     let Some(frames) = decode_video(name, backend).unwrap_or_else(|e| panic!("{name} ({backend:?}): {e:#}")) else {
         eprintln!("skipping {name} on {backend:?}: not available on this platform");
         return false;
@@ -76,7 +81,8 @@ fn assert_red_green_blue(name: &str, backend: Backend) -> bool {
     assert_eq!(frames.len(), 75, "{name}: frame count");
     let start = frames[0].0;
     for (i, (pts, f)) in frames.iter().enumerate() {
-        assert_eq!((f.width, f.height), (320, 240), "{name}: frame size");
+        assert_eq!((f.width, f.height), size, "{name}: frame size");
+        assert_eq!(f.bgra.len(), (size.0 * size.1 * 4) as usize, "{name}: frame {i} buffer");
         let expected = start + i as f64 / 25.0;
         assert!((pts - expected).abs() < 0.002, "{name}: frame {i} pts {pts:.3}, want {expected:.3}");
         let (r, g, b) = centre_rgb(f);
@@ -146,6 +152,100 @@ fn hevc_ten_bit_in_matroska() {
 #[test]
 fn vp9_in_webm() {
     expect_hardware(assert_red_green_blue("vp9_opus.webm", Backend::Hardware), "VP9");
+}
+
+/// A fixture's video parameters and its video packets (timestamp, data) in
+/// file order.
+fn video_packets(name: &str) -> (VideoCodecParameters, Vec<(i64, Vec<u8>)>) {
+    let path = fixture(name);
+    let mss = MediaSourceStream::new(Box::new(File::open(&path).unwrap()), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension(path.extension().unwrap().to_str().unwrap());
+    let mut format =
+        symphonia::default::get_probe().probe(&hint, mss, FormatOptions::default(), MetadataOptions::default()).unwrap();
+    let track = format.default_track(TrackType::Video).unwrap().clone();
+    let mut packets = Vec::new();
+    while let Some(p) = format.next_packet().unwrap() {
+        if p.track_id == track.id {
+            packets.push((p.pts.get(), p.data.to_vec()));
+        }
+    }
+    (track.codec_params.as_ref().unwrap().video().unwrap().clone(), packets)
+}
+
+/// Whether a VP8 frame is shown (`show_frame`, bit 4 of the frame tag).
+fn vp8_shown(data: &[u8]) -> bool {
+    data[0] & 0x10 != 0
+}
+
+#[test]
+fn vp8_in_webm() {
+    assert_red_green_blue("vp8_opus.webm", Backend::Software);
+}
+
+#[test]
+fn vp8_has_no_hardware_decoder_and_that_is_not_an_error() {
+    // An error here would be logged as a failed hardware decoder on every
+    // VP8 file opened.
+    let (params, _) = video_packets("vp8_opus.webm");
+    assert!(matches!(make_hardware_decoder(&params), Ok(None)));
+}
+
+/// 321x181: the decoder works in whole 16x16 blocks and chroma rounds up to
+/// 161x91, so the picture must be cropped to exactly the stored size.
+#[test]
+fn vp8_with_an_odd_frame_size() {
+    assert_red_green_blue_sized("vp8_odd_size.webm", Backend::Software, (321, 181));
+    // The last column and row, the ones without a full chroma sample pair.
+    let frames = decode_video("vp8_odd_size.webm", Backend::Software).unwrap().unwrap();
+    for (i, (_, f)) in frames.iter().enumerate() {
+        let (b, g, r) = (f.bgra[f.bgra.len() - 4], f.bgra[f.bgra.len() - 3], f.bgra[f.bgra.len() - 2]);
+        let want = [(255, 0, 0), (0, 255, 0), (0, 0, 255)][i / 25];
+        let close = |a: u8, b: u8| a.abs_diff(b) <= 6;
+        assert!(close(r, want.0) && close(g, want.1) && close(b, want.2), "frame {i} corner is ({r},{g},{b}), want {want:?}");
+    }
+}
+
+/// Alternate reference frames are packets of their own that show nothing,
+/// stamped with the time of the frame after them: a file has more packets
+/// than pictures, and each picture keeps its own packet's timestamp.
+#[test]
+fn vp8_hidden_frames_are_decoded_but_not_shown() {
+    let (params, packets) = video_packets("vp8_altref.webm");
+    let hidden = packets.iter().filter(|(_, data)| !vp8_shown(data)).count();
+    assert_eq!((packets.len(), hidden), (78, 3), "the fixture has hidden frames");
+    let mut dec = make_software_decoder(&params).unwrap();
+    let mut shown = Vec::new();
+    for (pts, data) in &packets {
+        let frames = dec.decode(data, *pts).unwrap();
+        assert_eq!(frames.len(), usize::from(vp8_shown(data)), "packet at {pts} ms");
+        shown.extend(frames.iter().map(|f| f.pts));
+    }
+    assert!(dec.flush().unwrap().is_empty(), "nothing is held back");
+    // 25 fps on Matroska's millisecond clock.
+    assert_eq!(shown, (0..75).map(|i| i * 40).collect::<Vec<i64>>());
+    // The pictures themselves depend on the hidden frames being decoded.
+    assert_red_green_blue("vp8_altref.webm", Backend::Software);
+}
+
+#[test]
+fn vp8_resumes_at_a_keyframe_after_a_reset() {
+    let (params, packets) = video_packets("vp8_altref.webm");
+    let mut dec = make_software_decoder(&params).unwrap();
+    for (pts, data) in packets.iter().filter(|p| p.0 < 500) {
+        dec.decode(data, *pts).unwrap();
+    }
+    // A seek to 1.4 s, fed from the middle of the first GOP: inter frames
+    // with no keyframe behind them are skipped (not errors), and frames from
+    // the keyframe at 1 s up to the target are decoded but not returned.
+    dec.reset(1400).unwrap();
+    let mut shown = Vec::new();
+    for (pts, data) in packets.iter().filter(|p| p.0 >= 600) {
+        shown.extend(dec.decode(data, *pts).unwrap());
+    }
+    assert_eq!(shown.iter().map(|f| f.pts).collect::<Vec<_>>(), (35..75).map(|i| i * 40).collect::<Vec<i64>>());
+    let (r, g, b) = centre_rgb(&shown[0]);
+    assert!(r < 6 && g > 249 && b < 6, "first frame after the seek is ({r},{g},{b}), want green");
 }
 
 #[test]

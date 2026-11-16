@@ -1,0 +1,9 @@
+[package]
+name = "airsplice-vp8"
+version = "0.1.0"
+edition = "2024"
+description = "A pure-Rust VP8 video decoder (RFC 6386)"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]

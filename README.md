@@ -93,7 +93,7 @@ PCM, ADPCM, on every platform. HE-AAC is not supported yet.
 | HEVC 8/10-bit | hardware | hardware | not supported |
 | AV1 8/10-bit | hardware on M3 and later, otherwise software | software | software |
 | VP9 | hardware (4:2:0 only) | not supported | not supported |
-| VP8 | not supported | not supported | not supported |
+| VP8 | software | software | software |
 
 When a file's video codec is not supported, its audio still plays and the
 player says why. The info panel (Cmd/Ctrl+R) shows which decoder is in use.

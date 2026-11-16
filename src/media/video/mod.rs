@@ -2,7 +2,8 @@
 //! frames tagged with the presentation timestamp they were fed.
 //!
 //! The OS hardware decoder is preferred where one exists (VideoToolbox on
-//! macOS); otherwise H.264 uses OpenH264 and AV1 uses rav1d.
+//! macOS); otherwise H.264 uses OpenH264 and AV1 uses rav1d. VP8 always uses
+//! this project's own decoder.
 
 pub mod av1;
 pub mod bitstream;
@@ -10,6 +11,7 @@ pub mod h264;
 pub mod hevc;
 #[cfg(target_os = "macos")]
 pub mod videotoolbox;
+pub mod vp8;
 pub mod yuv;
 
 use anyhow::{Result, anyhow, bail};
@@ -113,7 +115,11 @@ pub fn make_decoder(params: &VideoCodecParameters) -> Result<Box<dyn VideoDecode
 #[allow(unused_variables)]
 pub fn make_hardware_decoder(params: &VideoCodecParameters) -> Result<Option<Box<dyn VideoDecoder>>> {
     #[cfg(target_os = "macos")]
-    return Ok(Some(Box::new(videotoolbox::VtDecoder::new(params)?)));
+    return match params.codec {
+        // VideoToolbox has no VP8 decoder; that is no failure to log.
+        CODEC_ID_VP8 => Ok(None),
+        _ => Ok(Some(Box::new(videotoolbox::VtDecoder::new(params)?))),
+    };
     #[cfg(target_os = "linux")]
     return match params.codec {
         // Stateless V4L2 HEVC decoders (Raspberry Pi 4 and 5).
@@ -142,6 +148,7 @@ pub fn make_software_decoder(params: &VideoCodecParameters) -> Result<Box<dyn Vi
             Ok(Box::new(h264::H264Decoder::new(avcc)?))
         }
         CODEC_ID_AV1 => Ok(Box::new(av1::Av1Decoder::new(extra(VIDEO_EXTRA_DATA_ID_AV1_DECODER_CONFIG))?)),
+        CODEC_ID_VP8 => Ok(Box::new(vp8::Vp8Decoder::new())),
         other => bail!("{} video is not supported", codec_name(other)),
     }
 }
@@ -167,6 +174,7 @@ pub fn keyframe_check(params: &VideoCodecParameters) -> Result<KeyframeCheck> {
         }
         CODEC_ID_AV1 => Ok(Box::new(av1::is_keyframe)),
         CODEC_ID_VP9 => Ok(Box::new(|data| bitstream::vp9_keyframe(data).is_some())),
+        CODEC_ID_VP8 => Ok(Box::new(airsplice_vp8::is_keyframe)),
         other => bail!("{} video is not supported", codec_name(other)),
     }
 }

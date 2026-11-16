@@ -55,6 +55,7 @@ dependencies = [
 name = "airsplice-player"
 version = "0.3.0"
 dependencies = [
+ "airsplice-vp8",
  "anyhow",
  "cpal",
  "cros-codecs",
@@ -90,6 +91,10 @@ dependencies = [
  "v4l2r",
  "wgpu",
 ]
+
+[[package]]
+name = "airsplice-vp8"
+version = "0.1.0"
 
 [[package]]
 name = "aligned"

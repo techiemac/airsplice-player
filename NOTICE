@@ -8,6 +8,9 @@ licenses. The vendored crates in vendor/ keep their original licenses:
   vendor/xattr                    MIT OR Apache-2.0 (modified; see PATCHED.md)
   vendor/symphonia-codec-aac      MPL-2.0 (modified; see PATCHED.md)
 
+crates/vp8/tests/vectors holds the libvpx VP8 test vectors from the WebM
+project, used under the WebM project's BSD license.
+
 src/media/upscale/fsr1.wgsl is a WGSL port of AMD FidelityFX Super
 Resolution 1.0 (ffx_fsr1.h), used under the MIT License:
 

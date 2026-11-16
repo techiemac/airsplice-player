@@ -1448,11 +1448,14 @@ mod tests {
         // Keyframes: seek_hevc.mp4 every 2 s (on whole seconds, where
         // Symphonia's MP4 reader lands one packet past them); the others
         // every second.
-        let cases: [(&str, f64, &[f64]); 4] = [
+        let cases: [(&str, f64, &[f64]); 5] = [
             ("seek_hevc.mp4", 2.0, &[0.5, 2.0, 3.0, 4.0, 5.0, 6.5, 8.0, 9.5]),
             ("h264_aac.mp4", 1.0, &[0.5, 1.0, 1.5, 2.0, 2.7]),
             ("hevc_10bit_opus.mkv", 1.0, &[0.5, 1.0, 1.5, 2.0, 2.7]),
             ("bframes_hevc.mkv", 1.0, &[0.3, 1.0, 1.6]),
+            // Each keyframe is followed by a hidden frame with the time of
+            // the frame after it.
+            ("vp8_altref.webm", 1.0, &[0.5, 1.0, 1.04, 1.5, 2.0, 2.7]),
         ];
         for (name, interval, targets) in cases {
             for &target in targets {
