@@ -46,12 +46,55 @@ pub struct AudioOutput {
     pub channels: usize,
 }
 
+/// An audio output device the user can choose.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutputDevice {
+    /// Stable across reconnects and restarts; what the setting stores.
+    pub id: String,
+    pub name: String,
+}
+
+/// The output devices connected now, in the order the system lists them.
+pub fn output_devices() -> Vec<OutputDevice> {
+    let host = cpal::default_host();
+    let devices = match host.output_devices() {
+        Ok(devices) => devices,
+        Err(e) => {
+            log::warn!("listing audio outputs: {e}");
+            return Vec::new();
+        }
+    };
+    let mut list: Vec<OutputDevice> = Vec::new();
+    for device in devices {
+        let Ok(id) = device.id() else { continue };
+        let name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| id.id().to_string());
+        let id = id.to_string();
+        if !list.iter().any(|d| d.id == id) {
+            list.push(OutputDevice { id, name });
+        }
+    }
+    list
+}
+
+/// The device with stable id `id`, if it is connected; else the system's
+/// default output.
+fn output_device(host: &cpal::Host, id: Option<&str>) -> Result<cpal::Device> {
+    if let Some(id) = id {
+        match id.parse::<cpal::DeviceId>().ok().and_then(|parsed| host.device_by_id(&parsed)) {
+            Some(device) => return Ok(device),
+            None => log::info!("audio output {id} is not connected; using the system default"),
+        }
+    }
+    host.default_output_device().ok_or_else(|| anyhow!("no audio output device"))
+}
+
 impl AudioOutput {
-    pub fn open(volume: f32, muted: bool) -> Result<Self> {
+    /// Open the output device with stable id `device` (see
+    /// [`output_devices`]), or the system default when that is `None` or
+    /// not connected.
+    pub fn open(device: Option<&str>, volume: f32, muted: bool) -> Result<Self> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| anyhow!("no audio output device"))?;
+        let device = output_device(&host, device)?;
         let supported = device
             .default_output_config()
             .context("querying the default audio output config")?;

@@ -24,6 +24,7 @@ pub enum Icon {
     Info,
     Search,
     ChevronRight,
+    ChevronDown,
     Folder,
     FolderOpen,
     Display,
@@ -56,6 +57,7 @@ impl Icon {
             Icon::Info => "info",
             Icon::Search => "search",
             Icon::ChevronRight => "chevron-right",
+            Icon::ChevronDown => "chevron-down",
             Icon::Folder => "folder",
             Icon::FolderOpen => "folder-open",
             Icon::Display => "display",
@@ -84,6 +86,7 @@ impl Icon {
             Icon::Info => r##"<circle cx="12" cy="12" r="9"/><path d="M12 16v-5M12 8h.01"/>"##,
             Icon::Search => r##"<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>"##,
             Icon::ChevronRight => r##"<path d="M9 6l6 6-6 6"/>"##,
+            Icon::ChevronDown => r##"<path d="M6 9l6 6 6-6"/>"##,
             Icon::FolderOpen => r##"<path d="M3 17.5V6.5A1.5 1.5 0 0 1 4.5 5h4.6l2 2h7.4A1.5 1.5 0 0 1 20 8.5V10"/><path d="M3.3 18.4l2.4-6.7A1.5 1.5 0 0 1 7.1 10.7h13.3a1 1 0 0 1 .95 1.3l-2.1 6a1.5 1.5 0 0 1-1.4 1H4.5a1.2 1.2 0 0 1-1.2-.6z"/>"##,
             Icon::Folder => r##"<path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4.6l2 2h8.4A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"/>"##,
             Icon::Display => r##"<rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>"##,
@@ -93,7 +96,7 @@ impl Icon {
         }
     }
 
-    const ALL: [Icon; 23] = [
+    const ALL: [Icon; 24] = [
         Icon::Play,
         Icon::Pause,
         Icon::SkipBack,
@@ -111,6 +114,7 @@ impl Icon {
         Icon::Info,
         Icon::Search,
         Icon::ChevronRight,
+        Icon::ChevronDown,
         Icon::Folder,
         Icon::FolderOpen,
         Icon::Display,

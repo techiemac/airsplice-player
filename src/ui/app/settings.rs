@@ -6,8 +6,13 @@
 //! display is connected the picture is full screen on it; when it is
 //! unplugged its window closes, and it comes back when the display does,
 //! without anyone touching the controls.
+//!
+//! Sound goes to one audio output device: the system default unless one
+//! is chosen here, also by stable id. A chosen device that is not
+//! connected falls back to the default.
 
 use super::*;
+use gpui::{anchored, deferred, relative};
 
 pub(super) const SETTINGS_CONTEXT: &str = "Settings";
 
@@ -45,7 +50,8 @@ fn still_label(secs: u32) -> String {
     if secs == 0 { "Until skipped".into() } else { format!("{secs} s") }
 }
 
-/// Settings rows: upscaling, stills, then one per display.
+/// Settings rows: upscaling, stills, one per display, then the audio
+/// output.
 const FIRST_SCREEN_ROW: usize = 2;
 
 /// How often the connected displays are checked, so an output display
@@ -56,9 +62,12 @@ pub(super) struct SettingsScreen {
     pub(super) selected: usize,
     /// Digits typed into the still duration, while editing it.
     pub(super) typed: Option<String>,
+    /// The audio output list, while it is open: the highlighted choice
+    /// (0 for the system default, then one per device).
+    pub(super) audio_menu: Option<usize>,
 }
 
-/// A connected display, as the settings and the footer menu name it.
+/// A connected display, as the settings name it.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Screen {
     /// Stable across reconnects and restarts; what the setting stores.
@@ -68,6 +77,10 @@ pub(super) struct Screen {
     /// The controls are on this display.
     pub(super) here: bool,
 }
+
+/// How often the audio output devices are listed while the settings are
+/// open, so one plugged in or out shows up.
+const AUDIO_DEVICE_POLL: Duration = Duration::from_secs(2);
 
 /// One fullscreen output window and the display it is on.
 pub(super) struct Output {
@@ -268,9 +281,108 @@ impl MediaPlayer {
         Some(format!("{noun}: {}", parts.join(", ")))
     }
 
-    /// The detail shown next to a display in the settings and footer menu.
+    /// The detail shown next to a display in the settings.
     pub(super) fn screen_detail(&self, s: &Screen) -> String {
         if s.here { format!("{}, covers this window", s.size) } else { s.size.clone() }
+    }
+
+    // ---- audio output -------------------------------------------------------
+
+    /// List the audio output devices again.
+    pub(super) fn refresh_audio_devices(&mut self) {
+        self.audio_devices = audio::output_devices();
+        self.audio_devices_at = Instant::now();
+    }
+
+    /// Called every tick; lists the audio outputs every
+    /// [`AUDIO_DEVICE_POLL`] while the settings are open.
+    pub(super) fn poll_audio_devices(&mut self, cx: &mut Context<Self>) {
+        if self.settings.is_some() && self.audio_devices_at.elapsed() >= AUDIO_DEVICE_POLL {
+            let before = self.audio_devices.clone();
+            self.refresh_audio_devices();
+            if self.audio_devices != before {
+                cx.notify();
+            }
+        }
+    }
+
+    /// Send sound to the device with stable id `id`, or the system default
+    /// for `None`. Remembered. Every open file with sound holds a stream on
+    /// the old device, so each is reopened where it was.
+    pub(super) fn set_audio_output(&mut self, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.audio_output == id {
+            return;
+        }
+        self.audio_output = id;
+        let has_sound = |l: &Loaded| l.player.as_ref().is_some_and(|p| p.info.audio.is_some());
+
+        let installed = self.take_installed();
+        let installed = if has_sound(&installed) { self.reopen(installed, false, window) } else { installed };
+        self.install(installed);
+        for ix in 0..self.tabs.len() {
+            if let Some(parked) = self.tabs[ix].parked.take() {
+                let parked = if has_sound(&parked) { self.reopen(parked, true, window) } else { parked };
+                self.tabs[ix].parked = Some(parked);
+            }
+        }
+        // Opened again, on the new device, when next wanted.
+        if let Some((_, l)) = self.preloaded.take_if(|(_, l)| has_sound(l)) {
+            l.release(window);
+        }
+        self.update_title(window);
+        cx.notify();
+    }
+
+    /// `old` opened again from where it was, playing or paused as it was.
+    /// Its picture stays up until the new one decodes a frame.
+    fn reopen(&self, old: Loaded, background: bool, window: &mut Window) -> Loaded {
+        let Some(player) = &old.player else { return old };
+        let (path, position, paused) = (player.info.path.clone(), player.position(), player.is_paused());
+        let mut new = if background { self.load_in_background(&path, position) } else { self.load(&path, !paused, position) };
+        // If it could not open again, its error says why.
+        if new.player.is_some() {
+            new.ended = old.ended;
+        }
+        new.frame = old.frame;
+        if let Some(cover) = old.cover {
+            let _ = window.drop_image(cover);
+        }
+        new
+    }
+
+    /// The audio output choices: the system default, then each device
+    /// connected, as (stable id, name).
+    fn audio_choices(&self) -> Vec<(Option<String>, String)> {
+        std::iter::once((None, "System default".to_string()))
+            .chain(self.audio_devices.iter().map(|d| (Some(d.id.clone()), d.name.clone())))
+            .collect()
+    }
+
+    /// Where the chosen output is in [`Self::audio_choices`]; the system
+    /// default when the chosen device is not connected.
+    fn audio_choice_ix(&self) -> usize {
+        self.audio_output.as_ref().and_then(|id| self.audio_devices.iter().position(|d| d.id == *id)).map_or(0, |i| i + 1)
+    }
+
+    /// Open the audio output list, highlighting the current choice, or
+    /// close it.
+    fn toggle_audio_menu(&mut self, cx: &mut Context<Self>) {
+        let current = self.audio_choice_ix();
+        if let Some(s) = self.settings.as_mut() {
+            s.audio_menu = if s.audio_menu.is_some() { None } else { Some(current) };
+            cx.notify();
+        }
+    }
+
+    /// Choose audio output `ix` from the list, and close it.
+    fn pick_audio(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(s) = self.settings.as_mut() {
+            s.audio_menu = None;
+        }
+        if let Some((id, _)) = self.audio_choices().into_iter().nth(ix) {
+            self.set_audio_output(id, window, cx);
+        }
+        cx.notify();
     }
 
     // ---- settings screen ----------------------------------------------------
@@ -281,7 +393,8 @@ impl MediaPlayer {
             return;
         }
         self.picker = None;
-        self.settings = Some(SettingsScreen { selected: 0, typed: None });
+        self.refresh_audio_devices();
+        self.settings = Some(SettingsScreen { selected: 0, typed: None, audio_menu: None });
         window.focus(&self.settings_focus);
         cx.notify();
     }
@@ -291,6 +404,7 @@ impl MediaPlayer {
         if let Some(s) = self.settings.as_mut() {
             s.selected = ix;
             s.typed = None;
+            s.audio_menu = None;
         }
     }
 
@@ -301,7 +415,16 @@ impl MediaPlayer {
     }
 
     fn settings_move(&mut self, by: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let len = (FIRST_SCREEN_ROW + self.screens(window, cx).len()) as isize;
+        // Up and Down move through the audio output list while it is open.
+        let choices = self.audio_choices().len() as isize;
+        if let Some(s) = self.settings.as_mut()
+            && let Some(at) = s.audio_menu.as_mut()
+        {
+            *at = (*at as isize + by).rem_euclid(choices) as usize;
+            cx.notify();
+            return;
+        }
+        let len = (FIRST_SCREEN_ROW + self.screens(window, cx).len() + 1) as isize;
         if let Some(s) = self.settings.as_mut()
             && len > 0
         {
@@ -312,6 +435,11 @@ impl MediaPlayer {
     }
 
     fn settings_toggle(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter in the open audio output list picks the highlighted one.
+        if let Some(at) = self.settings.as_ref().and_then(|s| s.audio_menu) {
+            self.pick_audio(at, window, cx);
+            return;
+        }
         let was_typing = self.settings.as_mut().and_then(|s| {
             s.selected = ix;
             s.typed.take()
@@ -333,8 +461,13 @@ impl MediaPlayer {
                 cx.notify();
             }
             _ => {
-                let Some(screen) = self.screens(window, cx).into_iter().nth(ix - FIRST_SCREEN_ROW) else { return };
-                self.toggle_output(screen.uuid, window, cx);
+                let screens = self.screens(window, cx);
+                let first_audio = FIRST_SCREEN_ROW + screens.len();
+                if ix == first_audio {
+                    self.toggle_audio_menu(cx);
+                } else if let Some(screen) = screens.into_iter().nth(ix - FIRST_SCREEN_ROW) {
+                    self.toggle_output(screen.uuid, window, cx);
+                }
             }
         }
     }
@@ -368,7 +501,8 @@ impl MediaPlayer {
     pub(super) fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let settings = self.settings.as_ref()?;
         let screens = self.screens(window, cx);
-        let selected = settings.selected.min(screens.len() + FIRST_SCREEN_ROW - 1);
+        let first_audio = FIRST_SCREEN_ROW + screens.len();
+        let selected = settings.selected.min(first_audio);
         let checkbox = |on: bool, enabled: bool| {
             div()
                 .size(px(14.))
@@ -477,6 +611,81 @@ impl MediaPlayer {
         };
         let choices = screens.iter().enumerate().map(|(ix, s)| row(ix, s)).collect::<Vec<_>>();
 
+        // Audio output: one choice, so a dropdown.
+        let audio_options = self.audio_choices();
+        let current = self.audio_choice_ix();
+        let chosen_connected = self.audio_output.as_ref().is_none_or(|_| current > 0);
+        let audio_button = div()
+            .id("audio-choice")
+            .debug_selector(|| "audio-choice".into())
+            .h(px(32.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .rounded(px(4.))
+            .border_1()
+            .border_color(if settings.audio_menu.is_some() { Theme::accent() } else { Theme::border_variant() })
+            .text_sm()
+            .when(selected == first_audio, |el| el.bg(Theme::selected()))
+            .hover(|s| s.bg(Theme::hover()))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| this.settings_toggle(first_audio, window, cx)))
+            .child(div().flex_1().min_w_0().truncate().text_color(Theme::text()).child(audio_options[current].1.clone()))
+            .child(icon(Icon::ChevronDown, px(14.), Theme::text_muted()));
+        let audio_menu = settings.audio_menu.map(|highlighted| {
+            let items = audio_options.iter().enumerate().map(|(ix, (_, name))| {
+                div()
+                    .id(("audio-item", ix))
+                    .h(px(28.))
+                    .px(px(8.))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(4.))
+                    .text_sm()
+                    .text_color(Theme::text())
+                    .when(ix == highlighted, |el| el.bg(Theme::selected()))
+                    .hover(|s| s.bg(Theme::hover()))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| this.pick_audio(ix, window, cx)))
+                    .child(div().size(px(14.)).flex_none().when(ix == current, |el| el.child(icon(Icon::Check, px(14.), Theme::accent()))))
+                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+            });
+            // Just under the button, over whatever is below it.
+            div().absolute().top(relative(1.)).left_0().child(deferred(
+                anchored().snap_to_window_with_margin(px(8.)).child(
+                    div()
+                        .id("audio-menu")
+                        .debug_selector(|| "audio-menu".into())
+                        .occlude()
+                        .mt(px(4.))
+                        .w(px(496.))
+                        .max_h(px(240.))
+                        .overflow_y_scroll()
+                        .p(px(4.))
+                        .flex()
+                        .flex_col()
+                        .bg(Theme::elevated_bg())
+                        .border_1()
+                        .border_color(Theme::border())
+                        .rounded(px(6.))
+                        .shadow_lg()
+                        // A click elsewhere closes the list and does
+                        // nothing else.
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            if let Some(s) = this.settings.as_mut() {
+                                s.audio_menu = None;
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
+                        .children(items),
+                ),
+            ))
+        });
+
         let panel = div()
             .id("settings")
             .key_context(SETTINGS_CONTEXT)
@@ -487,7 +696,16 @@ impl MediaPlayer {
                 let ix = this.settings.as_ref().map_or(0, |s| s.selected);
                 this.settings_toggle(ix, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &PickerDismiss, window, cx| this.close_settings(window, cx)))
+            .on_action(cx.listener(|this, _: &PickerDismiss, window, cx| {
+                // Escape closes the audio output list first.
+                match this.settings.as_mut().filter(|s| s.audio_menu.is_some()) {
+                    Some(s) => {
+                        s.audio_menu = None;
+                        cx.notify();
+                    }
+                    None => this.close_settings(window, cx),
+                }
+            }))
             .on_key_down(cx.listener(Self::settings_key))
             .on_action(cx.listener(|this, _: &SettingsLess, _, cx| this.settings_adjust(-1, cx)))
             .on_action(cx.listener(|this, _: &SettingsMore, _, cx| this.settings_adjust(1, cx)))
@@ -560,6 +778,26 @@ impl MediaPlayer {
                                 .text_xs()
                                 .text_color(Theme::warning())
                                 .child(format!("Outputs are off ({})", window.keystroke_text_for(&ToggleOutputs))),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .px(px(12.))
+                    .pb(px(12.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(Theme::text()).child("Audio output"))
+                    .child(div().relative().child(audio_button).children(audio_menu))
+                    .when(!chosen_connected, |el| {
+                        el.child(
+                            div()
+                                .px(px(8.))
+                                .pt(px(4.))
+                                .text_xs()
+                                .text_color(Theme::warning())
+                                .child("Chosen output not connected. Using the system default."),
                         )
                     }),
             );

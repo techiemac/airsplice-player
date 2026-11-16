@@ -31,6 +31,9 @@ pub struct Session {
     /// The outputs' on/off switch. On by default, so choosing a display
     /// in the settings shows the picture there straight away.
     pub outputs_on: bool,
+    /// Stable id of the audio output device; `None` follows the system's
+    /// default output.
+    pub audio_output: Option<String>,
     /// Upscale video on the GPU to the size it is shown at.
     pub upscaling: bool,
     /// Seconds a still image shows before the playlist moves on; 0 keeps
@@ -68,6 +71,7 @@ impl Default for Session {
             removed_from_folders: Vec::new(),
             output_displays: Vec::new(),
             outputs_on: true,
+            audio_output: None,
             upscaling: false,
             still_seconds: 10,
             autoplay: true,
@@ -201,6 +205,7 @@ mod tests {
             removed_from_folders: vec![track],
             output_displays: vec!["6f1c-display".into(), "a07e-display".into()],
             outputs_on: false,
+            audio_output: Some("coreaudio:BuiltInSpeakerDevice".into()),
             upscaling: true,
             still_seconds: 45,
             autoplay: false,

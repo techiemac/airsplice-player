@@ -22,6 +22,7 @@ the Raspberry Pi 5. The Windows build has not been tested yet.
   including the one the controls are on. Choose them in the settings and
   switch them on and off from the status bar; the choice is remembered, and
   each output comes back by itself when its display is reconnected
+- Audio output: the system default, or a device chosen in the settings
 - Real-time GPU upscaling (optional) for video smaller than the screen:
   MetalFX on Apple GPUs, AMD FSR 1 on other GPUs; the settings name the
   upscaler in use (see [Upscaling](#upscaling))
@@ -232,6 +233,7 @@ same decoder and may work.
 | How long stills show | Settings: type the seconds, or Left / Right | Settings: type the seconds, or Left / Right |
 | Autoplay (move on to the next entry) | Autoplay in the playlist pane | Autoplay in the playlist pane |
 | Choose output displays | Settings | Settings |
+| Choose the audio output | Settings | Settings |
 | Outputs on / off | Cmd+Shift+F, or the monitor button in the status bar | Ctrl+Shift+F, or the monitor button |
 | Settings | Cmd+, the gear in the status bar, or the app menu | Ctrl+, or the gear in the status bar |
 | Open files | Cmd+O | Ctrl+O |

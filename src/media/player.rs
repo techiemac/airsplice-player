@@ -340,13 +340,14 @@ impl Shared {
 
 impl Player {
     pub fn open(path: &Path, volume: f32, muted: bool) -> Result<Self> {
-        Self::open_sized(path, volume, muted, None)
+        Self::open_sized(path, None, volume, muted, None)
     }
 
     /// Open, knowing the largest size the picture is shown at (physical
     /// pixels): decoders that can produce smaller frames, and still images,
-    /// start at that size instead of full size.
-    pub fn open_sized(path: &Path, volume: f32, muted: bool, limit: Option<(u32, u32)>) -> Result<Self> {
+    /// start at that size instead of full size. Sound goes to the output
+    /// device with stable id `audio_device`, or the system default.
+    pub fn open_sized(path: &Path, audio_device: Option<&str>, volume: f32, muted: bool, limit: Option<(u32, u32)>) -> Result<Self> {
         let shared = Arc::new(Shared::new());
         if let Some((w, h)) = limit.filter(|(w, h)| *w > 0 && *h > 0) {
             shared.output_limit.store((w as u64) << 32 | h as u64, Ordering::Relaxed);
@@ -399,7 +400,7 @@ impl Player {
                 .ok_or_else(|| anyhow!("audio track has no codec parameters"))?;
             let decoder = AudioDec::new(params)?;
             let (src_rate, src_channels) = decoder.format(params)?;
-            let out = AudioOutput::open(volume, muted).context("audio output unavailable")?;
+            let out = AudioOutput::open(audio_device, volume, muted).context("audio output unavailable")?;
             info.audio = Some(AudioInfo {
                 codec: decoder.name(),
                 sample_rate: src_rate,
@@ -1511,7 +1512,7 @@ mod tests {
         // than it is shown; without one, at full size.
         let big = dir.join("big.png");
         image::RgbaImage::from_pixel(1200, 800, image::Rgba([9, 99, 199, 255])).save(&big).unwrap();
-        let sized = Player::open_sized(&big, 0.0, true, Some((300, 300))).unwrap();
+        let sized = Player::open_sized(&big, None, 0.0, true, Some((300, 300))).unwrap();
         let f = next_frame(&sized, 2000);
         assert_eq!((f.width, f.height, &f.bgra[..4]), (300, 200, &[199, 99, 9, 255][..]));
         assert_eq!(sized.info.video.as_ref().map(|v| (v.width, v.height)), Some((1200, 800)), "the info still says the file's size");

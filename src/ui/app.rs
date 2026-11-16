@@ -26,7 +26,7 @@ use super::theme::{Theme, mono_font};
 use super::tree::{self, Row};
 use crate::media::upscale::{self, Status as UpscaleStatus};
 use crate::media::picture::{self, is_picture};
-use crate::media::{Image, Player, Summary, probe};
+use crate::media::{Image, Player, Summary, audio, probe};
 
 mod settings;
 use settings::{Output, SETTINGS_CONTEXT, SettingsScreen};
@@ -293,6 +293,13 @@ pub struct MediaPlayer {
     /// The largest output window, in physical pixels; video is decoded
     /// and upscaled for whichever is bigger, this or the main window.
     outputs_px: (u32, u32),
+    /// Stable id of the audio output device chosen in the settings;
+    /// `None` follows the system default.
+    audio_output: Option<String>,
+    /// The audio output devices connected, as last listed for the settings.
+    audio_devices: Vec<audio::OutputDevice>,
+    /// When `audio_devices` was listed.
+    audio_devices_at: Instant,
     /// Upscale video on the GPU to the size it is shown at (a setting).
     upscaling: bool,
     /// Seconds a still shows before the playlist moves on; 0: until
@@ -401,6 +408,9 @@ impl MediaPlayer {
             outputs_opening: Vec::new(),
             outputs_on: session.outputs_on,
             outputs_px: (0, 0),
+            audio_output: session.audio_output.clone(),
+            audio_devices: Vec::new(),
+            audio_devices_at: Instant::now(),
             upscaling: session.upscaling,
             still_seconds: session.still_seconds,
             autoplay: session.autoplay,
@@ -590,6 +600,7 @@ impl MediaPlayer {
             removed_from_folders: self.removed_from_folders.iter().cloned().collect(),
             output_displays: self.output_setting.clone(),
             outputs_on: self.outputs_on,
+            audio_output: self.audio_output.clone(),
             upscaling: self.upscaling,
             still_seconds: self.still_seconds,
             autoplay: self.autoplay,
@@ -632,6 +643,7 @@ impl MediaPlayer {
             self.apply_scan(scan, window, cx);
         }
         self.poll_output(window, cx);
+        self.poll_audio_devices(cx);
         self.save_session(false);
         self.sync_os_media(window, cx);
         // Background tabs are paused; this picks up the frame each one is
@@ -834,7 +846,7 @@ impl MediaPlayer {
         // Opened at the current display size, so stills (preloaded ones too)
         // are decoded no bigger than they are shown.
         let limit = (self.limit.0 > 0 && self.limit.1 > 0).then_some(self.limit);
-        match Player::open_sized(path, self.volume, self.muted, limit) {
+        match Player::open_sized(path, self.audio_output.as_deref(), self.volume, self.muted, limit) {
             Ok(mut player) => {
                 player.set_upscaling(self.upscaling);
                 player.set_still_duration(self.still_duration());
@@ -3378,6 +3390,63 @@ mod tests {
         });
         assert!(view.read_with(vcx, |v, _| v.preloaded.is_none()));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn choosing_an_audio_output_reopens_the_file_where_it_was(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(vec![fixture("h264_aac.mp4")], None, window, cx));
+        tick_until(&view, vcx, "the first frame", |v| v.frame.is_some());
+        view.update_in(vcx, |v, _, _| {
+            let p = v.player.as_mut().unwrap();
+            p.set_paused(true);
+            p.seek(1.5);
+        });
+        tick_until(&view, vcx, "the frame at 1.5 s", |v| (v.player.as_ref().unwrap().position() - 1.5).abs() < 0.1 && v.frame.is_some());
+        let before = view.read_with(vcx, |v, _| v.frame.clone()).unwrap();
+        assert_eq!(view.read_with(vcx, |v, _| v.snapshot(false).audio_output), None, "the system default to start with");
+
+        // A device that is not really there: the file still opens, on the
+        // system default, and the choice is kept for when it is connected.
+        vcx.simulate_keystrokes("secondary-,");
+        view.update(vcx, |v, _| {
+            v.audio_devices = vec![audio::OutputDevice { id: "coreaudio:desk".into(), name: "Desk speakers".into() }];
+            v.audio_devices_at = Instant::now();
+        });
+        // Past upscaling, stills and the one display, Enter opens the list
+        // on the current choice, under the button.
+        vcx.simulate_keystrokes("down down down enter");
+        assert_eq!(view.read_with(vcx, |v, _| v.settings.as_ref().unwrap().audio_menu), Some(0));
+        let button = vcx.debug_bounds("audio-choice").expect("audio output button");
+        let menu = vcx.debug_bounds("audio-menu").expect("audio output list");
+        assert!(menu.top() >= button.bottom() && (menu.left() - button.left()).abs() < px(1.), "{menu:?} under {button:?}");
+        // Escape closes only the list; so does a click elsewhere.
+        vcx.simulate_keystrokes("escape");
+        assert!(view.read_with(vcx, |v, _| v.settings.as_ref().is_some_and(|s| s.audio_menu.is_none())));
+        vcx.simulate_keystrokes("enter");
+        vcx.simulate_click(button.origin - gpui::point(px(0.), px(20.)), gpui::Modifiers::none());
+        assert!(view.read_with(vcx, |v, _| v.settings.as_ref().is_some_and(|s| s.audio_menu.is_none())));
+        assert_eq!(view.read_with(vcx, |v, _| v.audio_output.clone()), None, "nothing chosen yet");
+        // Down to the device, Enter chooses it.
+        vcx.simulate_keystrokes("enter down enter");
+        view.read_with(vcx, |v, _| {
+            assert!(v.settings.as_ref().unwrap().audio_menu.is_none(), "the list closes");
+            assert_eq!(v.audio_output.as_deref(), Some("coreaudio:desk"));
+            assert_eq!(v.snapshot(false).audio_output.as_deref(), Some("coreaudio:desk"));
+            assert!(v.error.is_none(), "{:?}", v.error);
+            assert!(v.frame.as_ref().is_some_and(|f| Arc::ptr_eq(f, &before)), "the picture stays up meanwhile");
+            let p = v.player.as_ref().unwrap();
+            assert!(p.is_paused() && (p.position() - 1.5).abs() < 0.1, "paused where it was");
+        });
+        // Only a file opened again decodes a new frame while paused.
+        tick_until(&view, vcx, "the reopened file's frame", |v| v.frame.as_ref().is_some_and(|f| !Arc::ptr_eq(f, &before)));
+        assert!(view.read_with(vcx, |v, _| (v.player.as_ref().unwrap().position() - 1.5).abs() < 0.1));
+
+        // The list opens on the device now; the system default is above it.
+        vcx.simulate_keystrokes("enter");
+        assert_eq!(view.read_with(vcx, |v, _| v.settings.as_ref().unwrap().audio_menu), Some(1));
+        vcx.simulate_keystrokes("up enter");
+        assert_eq!(view.read_with(vcx, |v, _| v.snapshot(false).audio_output), None);
     }
 
     #[gpui::test]
