@@ -54,6 +54,9 @@ const MAX_PREROLL: StdDuration = StdDuration::from_millis(500);
 /// keyframe. Audio is read from the same file as video, so video that
 /// cannot keep up must skip, or it holds the audio back with it.
 const MAX_VIDEO_LAG: f64 = 0.5;
+/// The newest decoded frame trailing the clock by this much is a picture
+/// visibly frozen, not one frame's jitter.
+const FROZEN: f64 = 0.25;
 
 #[derive(Clone, Debug, Default)]
 pub struct MediaInfo {
@@ -128,11 +131,15 @@ struct Shared {
     /// Only ever incremented when a frame is lost, so it costs nothing
     /// while playback keeps up.
     lost_frames: AtomicU64,
+    /// The frame at the open or seek target has been shown. Until then the
+    /// decoder is catching up from the keyframe before it, and frames it
+    /// passes over are the seek's doing, not playback falling behind.
+    settled: AtomicBool,
 }
 
 impl Shared {
     fn lose(&self, frames: usize) {
-        if frames > 0 {
+        if frames > 0 && self.settled.load(Ordering::Relaxed) {
             self.lost_frames.fetch_add(frames as u64, Ordering::Relaxed);
         }
     }
@@ -378,6 +385,7 @@ impl Shared {
             upscale: AtomicBool::new(false),
             upscale_status: Mutex::new(upscale::Status::Off),
             lost_frames: AtomicU64::new(0),
+            settled: AtomicBool::new(false),
         }
     }
 }
@@ -602,6 +610,7 @@ impl Player {
         self.clock.seek(secs, generation);
         *self.shared.seek_target.lock().unwrap() = secs;
         self.shared.frames.lock().unwrap().clear();
+        self.shared.settled.store(false, Ordering::Relaxed);
         self.shared.generation.store(generation, Ordering::Release);
         self.shared.frames_cv.notify_all();
     }
@@ -650,6 +659,28 @@ impl Player {
     /// counted while the clock runs, so seeks and pauses add nothing.
     pub fn lost_frames(&self) -> u64 {
         self.shared.lost_frames.load(Ordering::Relaxed)
+    }
+
+    /// How far the newest decoded video frame trails the clock, when it
+    /// trails far enough to freeze the picture: a decoder too slow to drop
+    /// anything yet, or one still short of a seek target when pre-roll gave
+    /// up waiting. Reads the frame queue under its lock, so the UI asks once
+    /// per window, not per frame.
+    pub fn video_behind(&self) -> Option<f64> {
+        let now = self.clock.running()?;
+        let generation = self.shared.current();
+        if self.info.video.is_none()
+            || self.shared.video_done.load(Ordering::Acquire) == generation
+            || self.shared.error.lock().unwrap().is_some()
+        {
+            return None;
+        }
+        let queued = self.shared.frames.lock().unwrap().iter().rev().find(|f| f.generation == generation).map(|f| f.pts);
+        let shown = self.last_shown.get().filter(|(g, _)| *g == generation).map(|(_, pts)| pts);
+        // Nothing decoded since the seek: the picture is held at the target.
+        let target = *self.shared.seek_target.lock().unwrap();
+        let newest = queued.into_iter().chain(shown).fold(target, f64::max);
+        (now - newest > FROZEN).then_some(now - newest)
     }
 
     /// Times the audio ran dry mid-stream so far.
@@ -730,6 +761,9 @@ impl Player {
         self.shared.frames_cv.notify_all();
         if let Some(f) = &best {
             self.last_shown.set(Some((generation, f.pts)));
+            if f.pts >= target - SAME_TIME {
+                self.shared.settled.store(true, Ordering::Relaxed);
+            }
         }
         best
     }
@@ -1797,6 +1831,7 @@ mod tests {
     #[test]
     fn frames_too_late_to_show_do_not_block_the_decoder() {
         let shared = Shared::new();
+        shared.settled.store(true, Ordering::Relaxed);
         shared.max_frames.store(1, Ordering::Relaxed);
         let mut stage = Stage::default();
         let frame = || (2, 2, vec![0u8; 16]);
@@ -1808,5 +1843,19 @@ mod tests {
         let q = shared.frames.lock().unwrap();
         assert_eq!(q.iter().map(|f| f.pts).collect::<Vec<_>>(), [3.0]);
         assert_eq!(shared.lost_frames.load(Ordering::Relaxed), 1, "the dropped frame is counted as lost");
+    }
+
+    #[test]
+    fn frames_passed_over_reaching_a_seek_target_are_not_lost() {
+        // Scrubbing a long-GOP file: the clock runs on from the target while
+        // the decoder still works through the frames before it.
+        let shared = Shared::new();
+        shared.max_frames.store(1, Ordering::Relaxed);
+        let mut stage = Stage::default();
+        let frame = || (2, 2, vec![0u8; 16]);
+        assert!(queue_frame(&shared, &mut stage, 0, 1.0, frame(), &|| Some(1.0)));
+        assert!(queue_frame(&shared, &mut stage, 0, 3.0, frame(), &|| Some(3.0)));
+        shared.lose(4);
+        assert_eq!(shared.lost_frames.load(Ordering::Relaxed), 0);
     }
 }

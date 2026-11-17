@@ -363,7 +363,8 @@ pub struct MediaPlayer {
     never_drawn: u32,
     longest_gap: Duration,
     last_draw: Instant,
-    frame_pending: bool,
+    /// The generation of the frame taken but not yet rendered, if any.
+    frame_pending: Option<u64>,
     /// Whether the status bar warns that playback is not keeping up, judged
     /// from the counts above once per window.
     perf: PerfWatch,
@@ -459,7 +460,7 @@ impl MediaPlayer {
             never_drawn: 0,
             longest_gap: Duration::ZERO,
             last_draw: Instant::now(),
-            frame_pending: false,
+            frame_pending: None,
             perf: PerfWatch::default(),
             summaries: Default::default(),
             folders: Folders::default(),
@@ -686,10 +687,12 @@ impl MediaPlayer {
                 let _ = window.drop_image(old);
             }
             changed = true;
-            if self.frame_pending {
+            // Replacing a frame from before a seek, or while paused (a
+            // scrub), is the user moving on, not the renderer falling behind.
+            if self.frame_pending == Some(frame.generation) && !player.is_paused() {
                 self.never_drawn += 1;
             }
-            self.frame_pending = true;
+            self.frame_pending = Some(frame.generation);
             self.fps_count += 1;
         }
         let elapsed = self.fps_since.elapsed();
@@ -704,9 +707,11 @@ impl MediaPlayer {
                     self.longest_gap.as_millis()
                 );
             }
-            // Two atomic reads and one uncontended lock every two seconds;
+            // A few reads and uncontended locks every two seconds;
             // the footer only re-renders when the warning comes or goes.
-            changed |= self.perf.close(player.lost_frames(), player.audio_dropouts(), self.never_drawn, self.draw_count, elapsed);
+            let totals =
+                perf::Totals { lost_frames: player.lost_frames(), dropouts: player.audio_dropouts(), behind: player.video_behind() };
+            changed |= self.perf.close(totals, self.never_drawn, self.draw_count, elapsed);
             (self.fps_count, self.draw_count, self.never_drawn) = (0, 0, 0);
             self.longest_gap = Duration::ZERO;
             self.fps_since = Instant::now();
@@ -2297,9 +2302,15 @@ impl MediaPlayer {
                     .child(div().text_color(Theme::text()).child(state))
                     .when_some(summary, |el, s| el.child(div().truncate().child(s)))
                     .when_some(self.perf.shown().filter(|_| self.player.is_some()), |el, trouble| {
+                        let mut lines = self.perf.detail().map(|d| d.lines()).unwrap_or_default();
+                        if let Some(v) = self.player.as_ref().and_then(|p| p.info.video.as_ref()) {
+                            lines.push(format!("Decoding with {}", v.decoder));
+                        }
                         el.child(
                             div()
+                                .id("sb-perf")
                                 .debug_selector(|| "sb-perf".into())
+                                .tooltip(move |_, cx| cx.new(|_| PerfTooltip(lines.clone())).into())
                                 .flex()
                                 .flex_none()
                                 .items_center()
@@ -2441,12 +2452,35 @@ impl MediaPlayer {
     }
 }
 
+/// The numbers behind the status bar's performance warning.
+struct PerfTooltip(Vec<String>);
+
+impl Render for PerfTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .debug_selector(|| "sb-perf-detail".into())
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .px(px(8.))
+            .py(px(6.))
+            .bg(Theme::elevated_bg())
+            .border_1()
+            .border_color(Theme::border())
+            .rounded(px(6.))
+            .shadow_lg()
+            .text_xs()
+            .text_color(Theme::text())
+            .children(self.0.iter().map(|l| div().child(l.clone())))
+    }
+}
+
 impl Render for MediaPlayer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(p) = &self.player {
             self.drawn_position = p.position();
         }
-        self.frame_pending = false;
+        self.frame_pending = None;
         self.draw_count += 1;
         self.longest_gap = self.longest_gap.max(self.last_draw.elapsed());
         self.last_draw = Instant::now();
@@ -3447,20 +3481,58 @@ mod tests {
         view.update(vcx, |v, cx| {
             let p = v.player.as_ref().unwrap();
             let (lost, dropouts) = (p.lost_frames(), p.audio_dropouts());
-            assert!(v.perf.close(lost + 5, dropouts, 0, 120, perf::WINDOW));
+            assert!(v.perf.close(perf::Totals { lost_frames: lost + 5, dropouts, behind: None }, 0, 120, perf::WINDOW));
             cx.notify();
         });
         vcx.run_until_parked();
         assert!(vcx.debug_bounds("sb-perf").is_some(), "the warning shows");
         assert_eq!(view.read_with(vcx, |v, _| v.perf.shown().map(|t| t.label())), Some("Dropping frames"));
 
+        // Hovering it gives the numbers behind it.
+        let warning = vcx.debug_bounds("sb-perf").unwrap();
+        vcx.simulate_mouse_move(warning.center(), None, gpui::Modifiers::none());
+        vcx.executor().advance_clock(Duration::from_secs(1));
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("sb-perf-detail").is_some(), "the tooltip shows");
+        assert_eq!(
+            view.read_with(vcx, |v, _| v.perf.detail().map(|d| d.lines())),
+            Some(vec!["5 frames missed in 2 s".to_string()])
+        );
+
         // It stays through two clean windows, so it never flickers, and
-        // goes after the third.
+        // goes after the third. (Read from state: GPUI never clears an
+        // element's debug bounds once both frame buffers have drawn it.)
         close_window(vcx);
         close_window(vcx);
-        assert!(vcx.debug_bounds("sb-perf").is_some(), "still shown after two clean windows");
+        assert_eq!(view.read_with(vcx, |v, _| v.perf.shown()), Some(perf::Trouble::Frames), "still shown after two clean windows");
         close_window(vcx);
-        assert!(vcx.debug_bounds("sb-perf").is_none(), "gone after three");
+        assert_eq!(view.read_with(vcx, |v, _| v.perf.shown()), None, "gone after three");
+    }
+
+    #[gpui::test]
+    fn scrubbing_is_not_counted_as_frames_never_drawn(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(vec![fixture("video_only.mp4")], None, window, cx));
+        tick_until(&view, vcx, "the first frame", |v| v.frame.is_some());
+        // Seek after seek with no render between: each frame replaces one
+        // from before the seek, which the user moved on from.
+        for paused in [true, false] {
+            view.update_in(vcx, |v, window, cx| {
+                v.player.as_mut().unwrap().set_paused(paused);
+                v.never_drawn = 0;
+                for at in [0.4, 1.2, 2.0, 2.8] {
+                    v.player.as_mut().unwrap().seek(at);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let taken = v.fps_count;
+                    while v.fps_count == taken && Instant::now() < deadline {
+                        v.tick(window, cx);
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(v.fps_count > taken, "a frame for the seek to {at}");
+                }
+                assert_eq!(v.never_drawn, 0, "paused: {paused}");
+            });
+        }
     }
 
     #[gpui::test]

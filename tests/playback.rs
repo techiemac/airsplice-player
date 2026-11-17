@@ -364,3 +364,29 @@ fn frames_the_screen_misses_are_counted_but_seeks_are_not() {
     let lost = player.lost_frames();
     assert!(lost >= 5, "{lost} frames counted lost over a 0.5 s stall at 25 fps");
 }
+
+#[test]
+fn scrubbing_while_playing_is_not_falling_behind() {
+    for name in ["video_only.mp4", "h264_aac.mp4", "vp8_opus.webm"] {
+        let Some(mut player) = open(name) else { continue };
+        let duration = player.info.duration.unwrap();
+        wait_for_frame(&player, Duration::from_secs(5), |_| true);
+        // A seek every 60 ms, as dragging the seek bar does, with the screen
+        // taking frames every 5 ms.
+        let start = Instant::now();
+        let mut last_seek = Instant::now() - Duration::from_secs(1);
+        let mut at = 0.0;
+        while start.elapsed() < Duration::from_millis(1500) {
+            if last_seek.elapsed() >= Duration::from_millis(60) {
+                at = (at + 0.17) % (duration - 0.5);
+                player.seek(at);
+                last_seek = Instant::now();
+            }
+            let _ = player.take_frame();
+            assert_eq!(player.video_behind(), None, "{name}: frozen at {at:.2} s");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(player.lost_frames(), 0, "{name}");
+        assert_eq!(player.audio_dropouts(), 0, "{name}");
+    }
+}
