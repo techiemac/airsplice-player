@@ -16,6 +16,9 @@ use super::{DecodedFrame, Reorder, VideoDecoder};
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 const NAL_SLICE: u8 = 1;
 const NAL_IDR: u8 = 5;
+/// OpenH264 rejects larger access units outright (`MAX_ACCESS_UNIT_CAPACITY`,
+/// the level 5.2 bound); streams beyond their level's bitrate hit it.
+const MAX_ACCESS_UNIT: usize = 7_077_888;
 
 /// Parameter sets and NAL length size from an `AVCDecoderConfigurationRecord`.
 #[derive(Debug, PartialEq)]
@@ -357,6 +360,11 @@ impl VideoDecoder for H264Decoder {
             annexb.extend_from_slice(&self.config.annexb_headers);
         }
         to_annexb(data, self.config.nal_length_size, &mut annexb);
+        if annexb.len() > MAX_ACCESS_UNIT {
+            log::warn!("OpenH264: frame of {} bytes is over its {MAX_ACCESS_UNIT}-byte limit", annexb.len());
+            self.scratch = annexb;
+            bail!("bitrate too high for software decoding");
+        }
 
         let mut dst = [null_mut::<u8>(); 3];
         let mut info = SBufferInfo { uiInBsTimeStamp: pts as u64, ..Default::default() };
@@ -370,13 +378,16 @@ impl VideoDecoder for H264Decoder {
                 &raw mut info,
             )
         };
-        if state != dsErrorFree {
-            // Concealable errors still often produce a picture; keep going
-            // like other players do.
-            log::debug!("openh264 decode state {state:#x}");
-        }
         let frame = self.frame_from(&info, &dst);
         self.scratch = annexb;
+        if state != dsErrorFree {
+            // Concealable errors still often produce a picture; keep going
+            // like other players do. No picture is a failure to report.
+            log::debug!("openh264 decode state {state:#x}");
+            if frame.is_none() {
+                bail!("damaged or unsupported data");
+            }
+        }
         Ok(self.reorder.push(frame))
     }
 
@@ -428,6 +439,20 @@ mod tests {
         let mut out = Vec::new();
         to_annexb(&packet, 4, &mut out);
         assert_eq!(out, vec![0, 0, 0, 1, 0x65, 0x11, 0, 0, 0, 1, 0x06]);
+    }
+
+    #[test]
+    fn a_frame_over_openh264s_limit_is_an_error_not_a_blank_picture() {
+        let avcc = [1, 0x64, 0, 0x1f, 0xff, 0xe1, 0, 3, 0x67, 0xaa, 0xbb, 1, 0, 2, 0x68, 0xcc];
+        let mut dec = H264Decoder::new(&avcc).unwrap();
+        // One IDR NAL unit just over the limit.
+        let len = MAX_ACCESS_UNIT;
+        let mut packet = (len as u32).to_be_bytes().to_vec();
+        packet.push(0x65);
+        packet.resize(4 + len, 0);
+        let Err(err) = dec.decode(&packet, 0) else { panic!("decoded a frame over the limit") };
+        let err = err.to_string();
+        assert_eq!(err, "bitrate too high for software decoding");
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! The player counts lost video frames and audio dropouts as they happen;
 //! this looks at those counts once per window and turns them into a warning
 //! that neither flickers nor lingers: it appears after a window with a
-//! visible stutter and goes after several clean windows in a row.
+//! visible stutter and goes once playback has been free of trouble for a
+//! while.
 
 use std::time::Duration;
 
@@ -12,8 +13,8 @@ pub const WINDOW: Duration = Duration::from_secs(2);
 /// Lost frames in one window that make a visible stutter. One or two can
 /// be a one-off hiccup nobody notices.
 const LOST_FRAMES: u64 = 3;
-/// Clean windows in a row before the warning goes away.
-const CLEAN_WINDOWS: u32 = 3;
+/// How long after the last trouble the warning goes away.
+const LINGER: Duration = Duration::from_secs(12);
 /// Below this many renders a second, frames replaced before they were
 /// drawn are the renderer falling behind. Above it they are video faster
 /// than the display (120 fps on a 60 Hz screen), which loses nothing.
@@ -119,20 +120,25 @@ pub struct Totals {
     pub dropouts: u64,
     /// How far the video trails the clock now, if the picture is frozen.
     pub behind: Option<f64>,
+    /// The user seeked during the window, or playback is still reaching
+    /// the last seek's target. Scrubbing skips and holds frames by design,
+    /// so such a window says nothing either way.
+    pub seeking: bool,
 }
 
 pub struct PerfWatch {
     /// Running counts at the start of the window.
     lost_frames: u64,
     dropouts: u64,
-    clean: u32,
+    /// Time since the last window with trouble.
+    quiet: Duration,
     shown: Option<Trouble>,
     detail: Option<Detail>,
 }
 
 impl Default for PerfWatch {
     fn default() -> Self {
-        Self { lost_frames: 0, dropouts: 0, clean: CLEAN_WINDOWS, shown: None, detail: None }
+        Self { lost_frames: 0, dropouts: 0, quiet: LINGER, shown: None, detail: None }
     }
 }
 
@@ -164,13 +170,23 @@ impl PerfWatch {
             behind: player.behind,
             length,
         };
-        let Totals { lost_frames, dropouts, .. } = player;
+        let Totals { lost_frames, dropouts, seeking, .. } = player;
         self.lost_frames = lost_frames;
         self.dropouts = dropouts;
         let before = self.shown;
-        match window.trouble() {
+        // A seek's window is judged neither way, but its time still counts
+        // towards the warning going, so scrubbing never holds it up.
+        match window.trouble().filter(|_| !seeking) {
             Some(trouble) => {
-                self.clean = 0;
+                log::debug!(
+                    "playback trouble: {} lost, {} never drawn at {:.0} renders/s, behind {:?}, {} audio dropouts",
+                    window.lost_frames,
+                    window.never_drawn,
+                    window.renders_per_sec(),
+                    window.behind,
+                    window.dropouts
+                );
+                self.quiet = Duration::ZERO;
                 self.detail = Some(Detail {
                     frames: window.frames(),
                     behind: window.behind,
@@ -184,8 +200,8 @@ impl PerfWatch {
                 }
             }
             None => {
-                self.clean += 1;
-                if self.clean >= CLEAN_WINDOWS {
+                self.quiet += length;
+                if self.quiet >= LINGER {
                     self.shown = None;
                     self.detail = None;
                 }
@@ -202,32 +218,36 @@ mod tests {
     const W: Duration = WINDOW;
 
     fn t(lost_frames: u64, dropouts: u64) -> Totals {
-        Totals { lost_frames, dropouts, behind: None }
+        Totals { lost_frames, dropouts, behind: None, seeking: false }
+    }
+
+    /// Close `n` clean windows.
+    fn quiet(p: &mut PerfWatch, n: u32) {
+        for _ in 0..n {
+            p.close(Totals { lost_frames: p.lost_frames, dropouts: p.dropouts, ..t(0, 0) }, 0, 120, W);
+        }
     }
 
     #[test]
-    fn a_stutter_shows_the_warning_and_clean_windows_clear_it() {
+    fn a_stutter_shows_the_warning_for_twelve_seconds() {
         let mut p = PerfWatch::default();
         assert!(!p.close(t(0, 0), 0, 120, W));
         assert!(p.close(t(5, 0), 0, 120, W));
         assert_eq!(p.shown(), Some(Trouble::Frames));
-        // Two clean windows: still shown, so it never flickers.
-        assert!(!p.close(t(5, 0), 0, 120, W));
-        assert!(!p.close(t(5, 0), 0, 120, W));
+        // Ten seconds clean: still shown, so it never flickers.
+        quiet(&mut p, 5);
         assert_eq!(p.shown(), Some(Trouble::Frames));
         assert!(p.close(t(5, 0), 0, 120, W));
         assert_eq!(p.shown(), None);
     }
 
     #[test]
-    fn a_trouble_window_restarts_the_clean_count() {
+    fn more_trouble_restarts_the_twelve_seconds() {
         let mut p = PerfWatch::default();
         p.close(t(3, 0), 0, 120, W);
-        p.close(t(3, 0), 0, 120, W);
-        p.close(t(3, 0), 0, 120, W);
+        quiet(&mut p, 4);
         p.close(t(6, 0), 0, 120, W);
-        p.close(t(6, 0), 0, 120, W);
-        p.close(t(6, 0), 0, 120, W);
+        quiet(&mut p, 5);
         assert_eq!(p.shown(), Some(Trouble::Frames));
     }
 
@@ -268,11 +288,10 @@ mod tests {
         // running dry once.
         p.close(t(4, 1), 20, 40, W);
         assert_eq!(p.detail().unwrap().lines(), ["24 frames missed in 2 s", "Audio ran dry 1 time in 2 s", "Screen redrawn 20 times a second"]);
-        p.close(t(5, 1), 0, 120, W);
-        p.close(t(5, 1), 0, 120, W);
-        // A clean window keeps the numbers that caused the warning.
+        // Clean windows keep the numbers that caused the warning.
+        quiet(&mut p, 5);
         assert_eq!(p.detail().unwrap().lines(), ["24 frames missed in 2 s", "Audio ran dry 1 time in 2 s", "Screen redrawn 20 times a second"]);
-        p.close(t(5, 1), 0, 120, W);
+        quiet(&mut p, 1);
         assert_eq!(p.detail(), None);
     }
 
@@ -283,6 +302,26 @@ mod tests {
         assert!(p.close(Totals { behind: Some(3.24), ..t(0, 0) }, 0, 120, W));
         assert_eq!(p.shown(), Some(Trouble::Frames));
         assert_eq!(p.detail().unwrap().lines(), ["Video 3.2 s behind"]);
+    }
+
+    #[test]
+    fn scrubbing_never_warns_nor_holds_a_warning_up() {
+        let mut p = PerfWatch::default();
+        let seeking = |lost| Totals { seeking: true, behind: Some(1.0), ..t(lost, 1) };
+        // Scrubbing: frames skipped, the picture held, audio restarted.
+        assert!(!p.close(seeking(40), 0, 30, W));
+        assert_eq!(p.shown(), None);
+        // What was lost while scrubbing is not carried into the next window.
+        assert!(!p.close(t(40, 1), 0, 120, W));
+        assert_eq!(p.shown(), None);
+        // A warning from before goes on time, scrubbing or not.
+        p.close(t(45, 1), 0, 120, W);
+        for lost in [50, 60, 70, 80, 90] {
+            p.close(seeking(lost), 0, 30, W);
+        }
+        assert_eq!(p.shown(), Some(Trouble::Frames));
+        assert!(p.close(seeking(100), 0, 30, W));
+        assert_eq!(p.shown(), None);
     }
 
     #[test]

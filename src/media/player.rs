@@ -118,6 +118,10 @@ struct Shared {
     demux_done: AtomicU64,
     video_done: AtomicU64,
     error: Mutex<Option<String>>,
+    /// A decode error that the video recovers from: the time of the first
+    /// frame decoded again, when the error stops applying. The decoder runs
+    /// ahead of playback, so this is a time on the clock, not now.
+    error_until: Mutex<Option<f64>>,
     stop: AtomicBool,
     /// Largest size video can be shown at, `width << 32 | height`; 0 = unknown.
     output_limit: AtomicU64,
@@ -321,11 +325,23 @@ fn seek_to_keyframe(
 
 /// Decode errors in a row, so a stream the decoder cannot handle is
 /// reported rather than leaving the picture black. A single bad packet is
-/// only logged.
+/// only logged, and the report goes once frames come out again (a stream
+/// that recovers at its next keyframe).
 #[derive(Default)]
 struct Failures {
     in_a_row: u32,
     first: Option<String>,
+    reported: bool,
+}
+
+const DECODE_FAILED: &str = "Can't decode the video: ";
+
+#[derive(Debug, PartialEq)]
+enum Report {
+    /// The video can't be decoded, for this reason.
+    Failing(String),
+    /// Frames come out again.
+    Recovered,
 }
 
 impl Failures {
@@ -333,20 +349,25 @@ impl Failures {
     /// reported as undecodable.
     const LIMIT: u32 = 3;
 
-    /// Note one packet's outcome (frames out, or the error); the reason to
-    /// report, once, when errors reach the limit.
-    fn record(&mut self, outcome: std::result::Result<usize, String>) -> Option<String> {
+    /// Note one packet's outcome (frames out, or the error): the reason,
+    /// once, when errors reach the limit, and the recovery after it.
+    fn record(&mut self, outcome: std::result::Result<usize, String>) -> Option<Report> {
         match outcome {
             Ok(0) => None,
             Ok(_) => {
+                let reported = self.reported;
                 *self = Self::default();
-                None
+                reported.then_some(Report::Recovered)
             }
             Err(e) => {
                 log::debug!("video decode error: {e}");
                 self.in_a_row += 1;
                 let first = self.first.get_or_insert(e);
-                (self.in_a_row == Self::LIMIT).then(|| first.clone())
+                if self.in_a_row != Self::LIMIT {
+                    return None;
+                }
+                self.reported = true;
+                Some(Report::Failing(first.clone()))
             }
         }
     }
@@ -379,6 +400,7 @@ impl Shared {
             demux_done: AtomicU64::new(NO_GENERATION),
             video_done: AtomicU64::new(NO_GENERATION),
             error: Mutex::new(None),
+            error_until: Mutex::new(None),
             stop: AtomicBool::new(false),
             output_limit: AtomicU64::new(0),
             max_frames: std::sync::atomic::AtomicUsize::new(MAX_QUEUED_FRAMES),
@@ -671,7 +693,7 @@ impl Player {
         let generation = self.shared.current();
         if self.info.video.is_none()
             || self.shared.video_done.load(Ordering::Acquire) == generation
-            || self.shared.error.lock().unwrap().is_some()
+            || self.error().is_some()
         {
             return None;
         }
@@ -681,6 +703,17 @@ impl Player {
         let target = *self.shared.seek_target.lock().unwrap();
         let newest = queued.into_iter().chain(shown).fold(target, f64::max);
         (now - newest > FROZEN).then_some(now - newest)
+    }
+
+    /// Seeks so far. A change means the user moved the playhead.
+    pub fn seeks(&self) -> u64 {
+        self.shared.current()
+    }
+
+    /// The frame at the last open or seek target has been shown: playback
+    /// is no longer catching up to where the user put it.
+    pub fn settled(&self) -> bool {
+        self.shared.settled.load(Ordering::Relaxed)
     }
 
     /// Times the audio ran dry mid-stream so far.
@@ -769,7 +802,12 @@ impl Player {
     }
 
     pub fn error(&self) -> Option<String> {
-        self.shared.error.lock().unwrap().clone()
+        let error = self.shared.error.lock().unwrap().clone()?;
+        let until = *self.shared.error_until.lock().unwrap();
+        if until.is_some_and(|t| self.clock.now() >= t - SAME_TIME) {
+            return None;
+        }
+        Some(error)
     }
 
     pub fn is_finished(&self) -> bool {
@@ -1382,8 +1420,19 @@ fn video_thread(mut decoder: Box<dyn VideoDecoder>, rx: Receiver<VideoMsg>, time
                     decoder.set_output_limit((packed != 0).then_some(((packed >> 32) as u32, packed as u32)));
                 }
                 let decoded = decoder.decode(&data, pts);
-                if let Some(why) = failures.record(decoded.as_ref().map(Vec::len).map_err(|e| format!("{e:#}"))) {
-                    *shared.error.lock().unwrap() = Some(format!("Can't decode the video: {why}"));
+                match failures.record(decoded.as_ref().map(Vec::len).map_err(|e| format!("{e:#}"))) {
+                    Some(Report::Failing(why)) => {
+                        *shared.error.lock().unwrap() = Some(format!("{DECODE_FAILED}{why}"));
+                        *shared.error_until.lock().unwrap() = None;
+                    }
+                    Some(Report::Recovered) => {
+                        let error = shared.error.lock().unwrap();
+                        if error.as_deref().is_some_and(|e| e.starts_with(DECODE_FAILED)) {
+                            let first = decoded.iter().flatten().map(|f| secs(f.pts)).fold(f64::INFINITY, f64::min);
+                            *shared.error_until.lock().unwrap() = Some(first);
+                        }
+                    }
+                    None => {}
                 }
                 if let Ok(frames) = decoded {
                     push(frames, generation);
@@ -1719,13 +1768,15 @@ mod tests {
     fn repeated_decode_errors_are_reported_once_with_the_first_reason() {
         let mut f = Failures::default();
         let err = |s: &str| Err(s.to_string());
+        let failing = |s: &str| Some(Report::Failing(s.to_string()));
         assert_eq!(f.record(err("bad packet")), None, "one bad packet is only logged");
-        assert_eq!(f.record(Ok(1)), None);
+        assert_eq!(f.record(Ok(1)), None, "nothing was reported, so nothing recovers");
         assert_eq!((f.record(err("a")), f.record(Ok(0)), f.record(err("b"))), (None, None, None), "nothing out is not a frame");
-        assert_eq!(f.record(err("c")).as_deref(), Some("a"), "third in a row: the first reason");
+        assert_eq!(f.record(err("c")), failing("a"), "third in a row: the first reason");
         assert_eq!(f.record(err("d")), None, "reported once");
-        f.record(Ok(2));
-        assert_eq!((f.record(err("e")), f.record(err("f")), f.record(err("g")).as_deref()), (None, None, Some("e")), "counted again after a frame");
+        assert_eq!(f.record(Ok(2)), Some(Report::Recovered), "frames again: the report goes");
+        assert_eq!(f.record(Ok(1)), None, "and only once");
+        assert_eq!((f.record(err("e")), f.record(err("f")), f.record(err("g"))), (None, None, failing("e")), "counted again after a frame");
     }
 
     #[test]

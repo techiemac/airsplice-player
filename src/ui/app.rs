@@ -365,6 +365,10 @@ pub struct MediaPlayer {
     last_draw: Instant,
     /// The generation of the frame taken but not yet rendered, if any.
     frame_pending: Option<u64>,
+    /// The player's seek count when the perf window opened.
+    window_seeks: u64,
+    /// The player error last copied into `error`.
+    player_error: Option<String>,
     /// Whether the status bar warns that playback is not keeping up, judged
     /// from the counts above once per window.
     perf: PerfWatch,
@@ -461,6 +465,8 @@ impl MediaPlayer {
             longest_gap: Duration::ZERO,
             last_draw: Instant::now(),
             frame_pending: None,
+            window_seeks: 0,
+            player_error: None,
             perf: PerfWatch::default(),
             summaries: Default::default(),
             folders: Folders::default(),
@@ -709,9 +715,14 @@ impl MediaPlayer {
             }
             // A few reads and uncontended locks every two seconds;
             // the footer only re-renders when the warning comes or goes.
-            let totals =
-                perf::Totals { lost_frames: player.lost_frames(), dropouts: player.audio_dropouts(), behind: player.video_behind() };
+            let totals = perf::Totals {
+                lost_frames: player.lost_frames(),
+                dropouts: player.audio_dropouts(),
+                behind: player.video_behind(),
+                seeking: player.seeks() != self.window_seeks || !player.settled(),
+            };
             changed |= self.perf.close(totals, self.never_drawn, self.draw_count, elapsed);
+            self.window_seeks = player.seeks();
             (self.fps_count, self.draw_count, self.never_drawn) = (0, 0, 0);
             self.longest_gap = Duration::ZERO;
             self.fps_since = Instant::now();
@@ -720,8 +731,18 @@ impl MediaPlayer {
         if (position - self.drawn_position).abs() >= 0.04 || (!player.is_paused() && player.info.audio.is_some()) {
             changed = true;
         }
-        if let Some(e) = player.error() {
-            self.error = Some(e);
+        // The player's error can go again (video that recovers at its next
+        // keyframe); errors from elsewhere stay.
+        let error = player.error();
+        if error != self.player_error {
+            if self.error.is_some() && self.error == self.player_error {
+                self.error = None;
+            }
+            if error.is_some() {
+                self.error = error.clone();
+            }
+            self.player_error = error;
+            changed = true;
         }
         if !self.ended && player.is_finished() {
             self.on_track_end(window, cx);
@@ -896,6 +917,7 @@ impl MediaPlayer {
         self.frame = loaded.frame;
         self.cover = loaded.cover;
         self.error = loaded.error;
+        self.player_error = None;
         self.ended = loaded.ended;
         self.drawn_position = -1.0;
     }
@@ -903,6 +925,7 @@ impl MediaPlayer {
     /// Start a new window of render counts (for the debug log and the
     /// performance warning).
     fn start_window(&mut self) {
+        self.window_seeks = self.player.as_ref().map_or(0, Player::seeks);
         self.fps_count = 0;
         self.draw_count = 0;
         self.never_drawn = 0;
@@ -3481,7 +3504,7 @@ mod tests {
         view.update(vcx, |v, cx| {
             let p = v.player.as_ref().unwrap();
             let (lost, dropouts) = (p.lost_frames(), p.audio_dropouts());
-            assert!(v.perf.close(perf::Totals { lost_frames: lost + 5, dropouts, behind: None }, 0, 120, perf::WINDOW));
+            assert!(v.perf.close(perf::Totals { lost_frames: lost + 5, dropouts, behind: None, seeking: false }, 0, 120, perf::WINDOW));
             cx.notify();
         });
         vcx.run_until_parked();
@@ -3499,14 +3522,15 @@ mod tests {
             Some(vec!["5 frames missed in 2 s".to_string()])
         );
 
-        // It stays through two clean windows, so it never flickers, and
-        // goes after the third. (Read from state: GPUI never clears an
-        // element's debug bounds once both frame buffers have drawn it.)
+        // It stays through ten clean seconds, so it never flickers, and goes
+        // at twelve. (Read from state: GPUI never clears an element's debug
+        // bounds once both frame buffers have drawn it.)
+        for _ in 0..5 {
+            close_window(vcx);
+        }
+        assert_eq!(view.read_with(vcx, |v, _| v.perf.shown()), Some(perf::Trouble::Frames), "still shown after ten seconds");
         close_window(vcx);
-        close_window(vcx);
-        assert_eq!(view.read_with(vcx, |v, _| v.perf.shown()), Some(perf::Trouble::Frames), "still shown after two clean windows");
-        close_window(vcx);
-        assert_eq!(view.read_with(vcx, |v, _| v.perf.shown()), None, "gone after three");
+        assert_eq!(view.read_with(vcx, |v, _| v.perf.shown()), None, "gone at twelve");
     }
 
     #[gpui::test]
