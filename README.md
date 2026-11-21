@@ -22,7 +22,10 @@ the Raspberry Pi 5. The Windows build has not been tested yet.
   including the one the controls are on. Choose them in the settings and
   switch them on and off from the status bar; the choice is remembered, and
   each output comes back by itself when its display is reconnected
-- Audio output: the system default, or a device chosen in the settings
+- Audio output: the system default, or a device chosen in the settings.
+  On Linux the choices are the sound server's outputs (PipeWire or
+  PulseAudio), Bluetooth included. With no output connected, video plays
+  without sound
 - Real-time GPU upscaling (optional) for video smaller than the screen:
   MetalFX on Apple GPUs, AMD FSR 1 on other GPUs; the settings name the
   upscaler in use (see [Upscaling](#upscaling))
@@ -346,5 +349,6 @@ These are worth fixing upstream; each workaround can go once they are.
   draws video from main memory: each frame is uploaded, upscaled, read back
   and uploaded again for display. That is cheap on unified-memory machines
   (Apple silicon, the Pi) and costs bus bandwidth on discrete GPUs.
-- With PulseAudio's ALSA plugin, sound can start about 2 s late (video
-  waits for it, so sync is kept). PipeWire does not show this.
+- Through PulseAudio's ALSA plugin, used only when the app cannot reach
+  the sound server directly, sound can start about 2 s late (video waits
+  for it, so sync is kept).

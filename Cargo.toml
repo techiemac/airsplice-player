@@ -16,7 +16,7 @@ gpui = "0.2.2"
 # Demuxing (MP4, MKV/WebM, OGG, WAV, AIFF, CAF) and audio decoding (MP3, AAC,
 # FLAC, Vorbis, ALAC, PCM, ADPCM), all pure Rust.
 symphonia = { version = "0.6.1", features = ["all", "exp-video-codecs"] }
-# Audio output (CoreAudio, WASAPI, ALSA/PulseAudio/PipeWire).
+# Audio output (CoreAudio, WASAPI; PulseAudio or ALSA on Linux).
 cpal = "0.18.2"
 # Sample-rate conversion.
 rubato = "5.1.0"
@@ -73,6 +73,10 @@ lto = "thin"
 # definitions generated from the system headers, and ioctl declarations.
 v4l2r = "0.0.8"
 nix = { version = "0.28", features = ["ioctl"] }
+# Audio through the desktop's sound server (PipeWire answers the PulseAudio
+# protocol), pure Rust: its outputs are the user's real sinks, one per HDMI
+# port, where raw ALSA lists a dozen aliases. ALSA remains the fallback.
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # The window handle souvlaki needs for Windows media controls.

@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedBufferSize};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
@@ -73,18 +73,44 @@ pub fn output_devices() -> Vec<OutputDevice> {
     let mut list: Vec<OutputDevice> = Vec::new();
     for device in devices {
         let Ok(id) = device.id() else { continue };
+        #[cfg(target_os = "linux")]
+        let alsa = id.host() == cpal::HostId::Alsa;
+        #[cfg(not(target_os = "linux"))]
+        let alsa = false;
+        #[cfg(target_os = "linux")]
+        if alsa && !is_alsa_output(id.id()) {
+            continue;
+        }
         let name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| id.id().to_string());
         let id = id.to_string();
-        if !list.iter().any(|d| d.id == id) {
+        // ALSA lists each card by number and by name: the same output twice.
+        // Elsewhere two outputs may share a name (two HDMI ports).
+        if !list.iter().any(|d| d.id == id || (alsa && d.name == name)) {
             list.push(OutputDevice { id, name });
         }
     }
     list
 }
 
+/// Without a sound server, ALSA lists every alias of every output: default,
+/// sysdefault, hdmi, hw, plughw, dmix and more, per card. Only `plughw`
+/// (the hardware with format conversion) is kept: one entry per output that
+/// opens with any stream format. The system default is offered separately.
+#[cfg(any(target_os = "linux", test))]
+fn is_alsa_output(pcm_id: &str) -> bool {
+    pcm_id.starts_with("plughw:")
+}
+
+/// Set to act as if no audio output is connected (diagnostics, and its
+/// tests).
+pub const NO_OUTPUT_ENV: &str = "AIRSPLICE_PLAYER_NO_AUDIO_OUTPUT";
+
 /// The device with stable id `id`, if it is connected; else the system's
 /// default output.
 fn output_device(host: &cpal::Host, id: Option<&str>) -> Result<cpal::Device> {
+    if std::env::var_os(NO_OUTPUT_ENV).is_some() {
+        bail!("no audio output device");
+    }
     if let Some(id) = id {
         match id.parse::<cpal::DeviceId>().ok().and_then(|parsed| host.device_by_id(&parsed)) {
             Some(device) => return Ok(device),
@@ -466,6 +492,22 @@ mod tests {
         assert!(frames > 46_000 && frames <= 48_000, "{frames}");
         // After the startup delay a DC input stays DC.
         assert!(out[out.len() / 2..].iter().all(|s| (s - 0.1).abs() < 0.01));
+    }
+}
+
+#[cfg(test)]
+mod alsa_list_tests {
+    use super::is_alsa_output;
+
+    #[test]
+    fn alsa_lists_each_output_once() {
+        // What ALSA lists on a Raspberry Pi 5 with two HDMI ports.
+        let listed = [
+            "default", "pipewire", "pulse", "sysdefault:CARD=vc4hdmi0", "hdmi:CARD=vc4hdmi0,DEV=0", "hw:CARD=vc4hdmi0,DEV=0",
+            "plughw:CARD=vc4hdmi0,DEV=0", "dmix:CARD=vc4hdmi0,DEV=0", "plughw:CARD=vc4hdmi1,DEV=0", "hw:CARD=1,DEV=0",
+        ];
+        let kept: Vec<_> = listed.into_iter().filter(|id| is_alsa_output(id)).collect();
+        assert_eq!(kept, ["plughw:CARD=vc4hdmi0,DEV=0", "plughw:CARD=vc4hdmi1,DEV=0"]);
     }
 }
 

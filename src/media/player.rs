@@ -69,6 +69,9 @@ pub struct MediaInfo {
     pub video: Option<VideoInfo>,
     /// Set when the file has a video track we cannot decode.
     pub video_unsupported: Option<String>,
+    /// Set when the file has audio but no output could be opened (none
+    /// connected); video then plays without sound.
+    pub audio_unavailable: Option<String>,
     pub cover: Option<Image>,
 }
 
@@ -466,7 +469,21 @@ impl Player {
 
         let mut audio_out = None;
         let mut audio_pipeline = None;
-        if let Some(track) = &audio_track {
+        // With video to show, a missing audio output is not fatal: the video
+        // plays on the wall clock, without sound.
+        let output = match (&audio_track, &video_decoder) {
+            (None, _) => None,
+            (Some(_), None) => Some(AudioOutput::open(audio_device, volume, muted).context("audio output unavailable")?),
+            (Some(_), Some(_)) => match AudioOutput::open(audio_device, volume, muted) {
+                Ok(out) => Some(out),
+                Err(e) => {
+                    log::warn!("no audio output, playing video without sound: {e:#}");
+                    info.audio_unavailable = Some("no audio output".into());
+                    None
+                }
+            },
+        };
+        if let (Some(track), Some(out)) = (&audio_track, output) {
             let params = track
                 .codec_params
                 .as_ref()
@@ -474,7 +491,6 @@ impl Player {
                 .ok_or_else(|| anyhow!("audio track has no codec parameters"))?;
             let decoder = AudioDec::new(params)?;
             let (src_rate, src_channels) = decoder.format(params)?;
-            let out = AudioOutput::open(audio_device, volume, muted).context("audio output unavailable")?;
             info.audio = Some(AudioInfo {
                 codec: decoder.name(),
                 sample_rate: src_rate,

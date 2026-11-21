@@ -885,7 +885,8 @@ impl MediaPlayer {
                 player.set_upscaling(self.upscaling);
                 player.set_still_duration(self.still_duration());
                 let cover = player.info.cover.as_ref().map(image_to_render);
-                let error = player.info.video_unsupported.clone().map(|why| format!("Playing audio only: {why}"));
+                let error = (player.info.video_unsupported.clone().map(|why| format!("Playing audio only: {why}")))
+                    .or_else(|| player.info.audio_unavailable.clone().map(|why| format!("Playing without sound: {why}")));
                 if !autoplay {
                     player.set_paused(true);
                 }
@@ -2244,6 +2245,9 @@ impl MediaPlayer {
                         .child(row("Upscaling", Self::upscale_label(&p.upscale_status())));
                 } else if let Some(why) = &info.video_unsupported {
                     body = body.child(section("VIDEO")).child(row("Status", why.clone()));
+                }
+                if let (None, Some(why)) = (&info.audio, &info.audio_unavailable) {
+                    body = body.child(section("AUDIO")).child(row("Status", why.clone()));
                 }
                 if let Some(a) = &info.audio {
                     body = body
