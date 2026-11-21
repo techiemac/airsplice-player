@@ -98,3 +98,119 @@ impl FrameBuf {
         }
     }
 }
+
+/// Whole rows of one plane, addressed in picture coordinates like `Plane`.
+pub struct Rows<'a> {
+    pub data: &'a mut [u8],
+    pub stride: usize,
+    /// Offset in `data` of picture pixel (0, `first_row`).
+    origin: usize,
+    first_row: usize,
+}
+
+impl Rows<'_> {
+    /// Offset of picture pixel (`x`, `y`); `y` must be one of these rows.
+    #[inline(always)]
+    pub fn at(&self, x: usize, y: usize) -> usize {
+        self.origin + (y - self.first_row) * self.stride + x
+    }
+}
+
+/// Some macroblock rows of all three planes.
+pub struct FrameRows<'a> {
+    pub y: Rows<'a>,
+    pub u: Rows<'a>,
+    pub v: Rows<'a>,
+}
+
+/// A frame buffer lent out a band of macroblock rows at a time, so one
+/// thread can reconstruct a row while another filters the rows above it.
+pub struct RowSplit<'a> {
+    /// Per plane: start of `data`, stride, border and pixel rows per
+    /// macroblock row.
+    planes: [(*mut u8, usize, usize, usize); 3],
+    mb_rows: usize,
+    _frame: std::marker::PhantomData<&'a mut FrameBuf>,
+}
+
+// SAFETY: a `RowSplit` is only a way to make `FrameRows`, which are plain
+// mutable slices; `mb_rows`' contract keeps the ones alive at any moment
+// disjoint, wherever they live.
+unsafe impl Send for RowSplit<'_> {}
+unsafe impl Sync for RowSplit<'_> {}
+
+impl<'a> RowSplit<'a> {
+    pub fn new(frame: &'a mut FrameBuf) -> Self {
+        let mb_rows = frame.y.height / 16;
+        let plane = |p: &mut Plane, mb: usize| {
+            assert_eq!(p.height, mb_rows * mb, "planes of one frame");
+            (p.data.as_mut_ptr(), p.stride, p.border, mb)
+        };
+        let planes = [plane(&mut frame.y, 16), plane(&mut frame.u, 8), plane(&mut frame.v, 8)];
+        RowSplit { planes, mb_rows, _frame: Default::default() }
+    }
+
+    /// Macroblock rows `rows` of each plane, side borders included.
+    ///
+    /// # Safety
+    ///
+    /// No two `FrameRows` from one split that are alive at the same time may
+    /// share a macroblock row.
+    pub unsafe fn mb_rows(&self, rows: std::ops::Range<usize>) -> FrameRows<'a> {
+        assert!(rows.start <= rows.end && rows.end <= self.mb_rows, "macroblock rows {rows:?} are outside the frame");
+        let band = |&(ptr, stride, border, mb): &(*mut u8, usize, usize, usize)| {
+            let (start, end) = ((border + rows.start * mb) * stride, (border + rows.end * mb) * stride);
+            // SAFETY: picture rows (checked) lie inside `data`, which holds
+            // `border` rows above and below them; the caller guarantees no
+            // other live band overlaps; the frame stays borrowed for 'a.
+            let data = unsafe { std::slice::from_raw_parts_mut(ptr.add(start), end - start) };
+            Rows { data, stride, origin: border, first_row: rows.start * mb }
+        };
+        FrameRows { y: band(&self.planes[0]), u: band(&self.planes[1]), v: band(&self.planes[2]) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each band is exactly its macroblock rows, side borders included, and
+    /// addresses pixels where the whole plane does; neighbouring bands never
+    /// share a byte.
+    #[test]
+    fn bands_cover_their_rows_and_nothing_else() {
+        let mut frame = FrameBuf::new(3, 4);
+        let whole = |p: &Plane, x, y| p.at(x, y);
+        let expected: Vec<_> = [(&frame.y, 16), (&frame.u, 8), (&frame.v, 8)]
+            .iter()
+            .map(|&(p, mb)| (p.data.as_ptr() as usize, p.stride, p.border, mb, whole(p, 5, 2 * mb + 3)))
+            .collect();
+        let split = RowSplit::new(&mut frame);
+        for r in 0..4 {
+            // SAFETY: one band at a time.
+            let band = unsafe { split.mb_rows(r..r + 1) };
+            let next = (r < 3).then(|| unsafe { split.mb_rows(r + 1..r + 2) }.y.data.as_ptr() as usize);
+            for (rows, &(base, stride, border, mb, _)) in [&band.y, &band.u, &band.v].into_iter().zip(&expected) {
+                assert_eq!(rows.data.as_ptr() as usize, base + (border + r * mb) * stride);
+                assert_eq!(rows.data.len(), mb * stride);
+            }
+            if let Some(next) = next {
+                assert_eq!(band.y.data.as_ptr() as usize + band.y.data.len(), next, "bands {r} and {} touch", r + 1);
+            }
+        }
+        // A pixel two macroblock rows down, through a band of rows 1 and 2.
+        let band = unsafe { split.mb_rows(1..3) };
+        for (rows, &(base, stride, _, mb, at)) in [&band.y, &band.u, &band.v].into_iter().zip(&expected) {
+            assert_eq!(rows.data.as_ptr() as usize + rows.at(5, 2 * mb + 3), base + at);
+            assert_eq!(rows.data.len(), 2 * mb * stride);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the frame")]
+    fn bands_past_the_frame_are_refused() {
+        let mut frame = FrameBuf::new(2, 2);
+        let split = RowSplit::new(&mut frame);
+        let _ = unsafe { split.mb_rows(1..3) };
+    }
+}

@@ -3,11 +3,11 @@
 
 use crate::bool_decoder::BoolDecoder;
 use crate::dsp;
-use crate::frame::FrameBuf;
+use crate::frame::{FrameBuf, RowSplit};
 use crate::header::{CopyRef, Dequant, FrameHeader, FrameTag, Persistent, token_partitions};
 use crate::inter::{self, Interp};
 use crate::intra;
-use crate::loopfilter::LoopFilter;
+use crate::loopfilter::{LoopFilter, MbFilter};
 use crate::modes::{INTRA_FRAME, MbInfo, ModeParser, MvBounds};
 use crate::tables::B_PRED;
 use crate::tokens::{self, Coeffs, EdgeContext, Y2};
@@ -16,6 +16,10 @@ use crate::{Error, Frame};
 /// Last, golden, altref, the frame being decoded, and the last shown frame
 /// when no reference holds it any more.
 const MAX_BUFFERS: usize = 5;
+
+/// Frames of at least this many macroblocks (about 640x360) loop filter on
+/// a second thread.
+const THREADED_MBS: usize = 900;
 
 pub struct Decoder {
     state: Persistent,
@@ -233,86 +237,118 @@ impl Decoder {
         above_u.fill(127);
         above_v.fill(127);
 
-        for mb_row in 0..mb_rows {
-            let tbd = &mut token_bds[mb_row & part_mask];
-            let mut left_ctx: EdgeContext = [0; 9];
-            let (mut left_y, mut left_u, mut left_v) = ([129u8; 16], [129u8; 8], [129u8; 8]);
-            let corner = if mb_row == 0 { 127 } else { 129 };
-            let (mut tl_y, mut tl_u, mut tl_v) = (corner, corner, corner);
-            let row_start = (mb_row + 1) * stride + 1;
-
-            for mb_col in 0..mb_cols {
-                parser.parse(&mut bd, mbs, mb_col, mb_row);
-                let mb = &mut mbs[row_start + mb_col];
-                let dq = &dequant[if header.segmentation { usize::from(mb.segment & 3) } else { 0 }];
-                let above_c = &mut above_ctx[mb_col];
-                if mb.skip {
-                    tokens::skip_mb(mb, above_c, &mut left_ctx);
-                } else if !tokens::decode_mb(tbd, &state.probs.coeff, mb, dq, above_c, &mut left_ctx, coeffs) {
-                    // Nothing was coded after all; the loop filter treats
-                    // that the same as the flag.
-                    mb.skip = true;
-                }
-                let mb = &*mb;
-
-                let (x, y) = (mb_col * 16, mb_row * 16);
-                let (cx, cy) = (mb_col * 8, mb_row * 8);
-                let (y_at, ys) = (cur.y.at(x, y), cur.y.stride);
-                let (c_at, cs) = (cur.u.at(cx, cy), cur.u.stride);
-                let (have_above, have_left) = (mb_row > 0, mb_col > 0);
-
-                if mb.ref_frame == INTRA_FRAME {
-                    let au: &[u8; 8] = above_u[cx..].first_chunk().expect("row buffer covers the frame");
-                    let av: &[u8; 8] = above_v[cx..].first_chunk().expect("row buffer covers the frame");
-                    intra::predict_mb(&mut cur.u.data, c_at, cs, mb.uv_mode, au, &left_u, tl_u, have_above, have_left);
-                    intra::predict_mb(&mut cur.v.data, c_at, cs, mb.uv_mode, av, &left_v, tl_v, have_above, have_left);
-                    // 16 pixels above, then the 4 above-right.
-                    let ay: &[u8; 20] = above_y[x..].first_chunk().expect("row buffer covers the frame");
-                    if mb.mode == B_PRED {
-                        predict_subblocks(&mut cur.y.data, y_at, ys, mb, ay, &left_y, tl_y, coeffs);
-                    } else {
-                        let ay: &[u8; 16] = ay.first_chunk().expect("16 of 20");
-                        intra::predict_mb(&mut cur.y.data, y_at, ys, mb.mode, ay, &left_y, tl_y, have_above, have_left);
-                    }
-                } else {
-                    let reference = &frames[refs[usize::from(mb.ref_frame & 3)]];
-                    let bounds = MvBounds::new(mb_col, mb_row, mb_cols, mb_rows);
-                    inter::predict_mb(reference, cur, mb_col, mb_row, mb, &bounds, interp);
-                }
-
-                if !mb.skip {
-                    if mb.mode != B_PRED {
-                        add_luma_residual(&mut cur.y.data, y_at, ys, mb, coeffs);
-                    }
-                    for i in 0..4 {
-                        let at = c_at + (i >> 1) * 4 * cs + (i & 1) * 4;
-                        add_block(&mut cur.u.data, at, cs, &coeffs.blocks[16 + i], coeffs.eob[16 + i] > 1);
-                        add_block(&mut cur.v.data, at, cs, &coeffs.blocks[20 + i], coeffs.eob[20 + i] > 1);
-                    }
-                    coeffs.blocks = [[0; 16]; 25];
-                }
-
-                // Keep this macroblock's right column and bottom row,
-                // unfiltered, for the intra prediction of its neighbours.
-                tl_y = save_edges(&cur.y.data, y_at, ys, &mut above_y[x..x + 16], &mut left_y);
-                tl_u = save_edges(&cur.u.data, c_at, cs, &mut above_u[cx..cx + 8], &mut left_u);
-                tl_v = save_edges(&cur.v.data, c_at, cs, &mut above_v[cx..cx + 8], &mut left_v);
-            }
-
-            // Right of the frame, the row above continues with its last pixel.
-            let w = mb_cols * 16;
-            let edge = above_y[w - 1];
-            above_y[w..].fill(edge);
-
-            // Filtering a row touches only it and rows above it, and the
-            // rows below predict from the unfiltered copies kept above, so
-            // each row can be filtered as soon as it is reconstructed. (A
-            // later parallel decoder can run this loop a row behind on
-            // another thread.)
+        let split = RowSplit::new(cur);
+        // Filter a row: it and the row above (which its top edge changes).
+        let filter = |mb_row: usize, row: &[MbFilter]| {
             if let Some(lf) = &loop_filter {
-                lf.filter_row(cur, &mbs[row_start..row_start + mb_cols], mb_row);
+                // SAFETY: the reconstruction has moved past these rows.
+                let mut band = unsafe { split.mb_rows(mb_row.saturating_sub(1)..mb_row + 1) };
+                lf.filter_row(&mut band, row, mb_row);
             }
-        }
+        };
+        std::thread::scope(|scope| {
+            // Big enough frames filter on a second thread while the next
+            // row is reconstructed; the per-frame thread costs more than
+            // it saves on small ones.
+            let to_filter = (loop_filter.is_some() && mb_rows * mb_cols >= THREADED_MBS).then(|| {
+                let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<MbFilter>)>();
+                scope.spawn(move || {
+                    for (mb_row, row) in rx {
+                        filter(mb_row, &row);
+                    }
+                });
+                tx
+            });
+            for mb_row in 0..mb_rows {
+                let tbd = &mut token_bds[mb_row & part_mask];
+                let mut left_ctx: EdgeContext = [0; 9];
+                let (mut left_y, mut left_u, mut left_v) = ([129u8; 16], [129u8; 8], [129u8; 8]);
+                let corner = if mb_row == 0 { 127 } else { 129 };
+                let (mut tl_y, mut tl_u, mut tl_v) = (corner, corner, corner);
+                let row_start = (mb_row + 1) * stride + 1;
+
+                {
+                    // SAFETY: the only other band alive is the filter's,
+                    // which ends at the row above this one. It ends with
+                    // this block, before the row goes to the filter.
+                    let mut rows = unsafe { split.mb_rows(mb_row..mb_row + 1) };
+                    for mb_col in 0..mb_cols {
+                        parser.parse(&mut bd, mbs, mb_col, mb_row);
+                        let mb = &mut mbs[row_start + mb_col];
+                        let dq = &dequant[if header.segmentation { usize::from(mb.segment & 3) } else { 0 }];
+                        let above_c = &mut above_ctx[mb_col];
+                        if mb.skip {
+                            tokens::skip_mb(mb, above_c, &mut left_ctx);
+                        } else if !tokens::decode_mb(tbd, &state.probs.coeff, mb, dq, above_c, &mut left_ctx, coeffs) {
+                            // Nothing was coded after all; the loop filter treats
+                            // that the same as the flag.
+                            mb.skip = true;
+                        }
+                        let mb = &*mb;
+
+                        let (x, y) = (mb_col * 16, mb_row * 16);
+                        let (cx, cy) = (mb_col * 8, mb_row * 8);
+                        let (y_at, ys) = (rows.y.at(x, y), rows.y.stride);
+                        let (c_at, cs) = (rows.u.at(cx, cy), rows.u.stride);
+                        let (have_above, have_left) = (mb_row > 0, mb_col > 0);
+
+                        if mb.ref_frame == INTRA_FRAME {
+                            let au: &[u8; 8] = above_u[cx..].first_chunk().expect("row buffer covers the frame");
+                            let av: &[u8; 8] = above_v[cx..].first_chunk().expect("row buffer covers the frame");
+                            intra::predict_mb(rows.u.data, c_at, cs, mb.uv_mode, au, &left_u, tl_u, have_above, have_left);
+                            intra::predict_mb(rows.v.data, c_at, cs, mb.uv_mode, av, &left_v, tl_v, have_above, have_left);
+                            // 16 pixels above, then the 4 above-right.
+                            let ay: &[u8; 20] = above_y[x..].first_chunk().expect("row buffer covers the frame");
+                            if mb.mode == B_PRED {
+                                predict_subblocks(rows.y.data, y_at, ys, mb, ay, &left_y, tl_y, coeffs);
+                            } else {
+                                let ay: &[u8; 16] = ay.first_chunk().expect("16 of 20");
+                                intra::predict_mb(rows.y.data, y_at, ys, mb.mode, ay, &left_y, tl_y, have_above, have_left);
+                            }
+                        } else {
+                            let reference = &frames[refs[usize::from(mb.ref_frame & 3)]];
+                            let bounds = MvBounds::new(mb_col, mb_row, mb_cols, mb_rows);
+                            inter::predict_mb(reference, &mut rows, mb_col, mb_row, mb, &bounds, interp);
+                        }
+
+                        if !mb.skip {
+                            if mb.mode != B_PRED {
+                                add_luma_residual(rows.y.data, y_at, ys, mb, coeffs);
+                            }
+                            for i in 0..4 {
+                                let at = c_at + (i >> 1) * 4 * cs + (i & 1) * 4;
+                                add_block(rows.u.data, at, cs, &coeffs.blocks[16 + i], coeffs.eob[16 + i] > 1);
+                                add_block(rows.v.data, at, cs, &coeffs.blocks[20 + i], coeffs.eob[20 + i] > 1);
+                            }
+                            coeffs.blocks = [[0; 16]; 25];
+                        }
+
+                        // Keep this macroblock's right column and bottom row,
+                        // unfiltered, for the intra prediction of its neighbours.
+                        tl_y = save_edges(rows.y.data, y_at, ys, &mut above_y[x..x + 16], &mut left_y);
+                        tl_u = save_edges(rows.u.data, c_at, cs, &mut above_u[cx..cx + 8], &mut left_u);
+                        tl_v = save_edges(rows.v.data, c_at, cs, &mut above_v[cx..cx + 8], &mut left_v);
+                    }
+                }
+
+                // Right of the frame, the row above continues with its last pixel.
+                let w = mb_cols * 16;
+                let edge = above_y[w - 1];
+                above_y[w..].fill(edge);
+
+                // Filtering a row touches only it and the bottom of the row
+                // above, and the rows below predict from the unfiltered copies
+                // kept above, so each row is filtered as soon as it is
+                // reconstructed: on the filter thread, a row behind, or here.
+                if loop_filter.is_some() {
+                    let row = mbs[row_start..row_start + mb_cols].iter().map(MbFilter::new).collect();
+                    match &to_filter {
+                        Some(tx) => tx.send((mb_row, row)).expect("the filter thread outlives the frame"),
+                        None => filter(mb_row, &row),
+                    }
+                }
+            }
+        });
         cur.extend_borders();
     }
 }

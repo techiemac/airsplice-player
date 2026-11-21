@@ -69,6 +69,10 @@ pub(crate) fn pixel(m: &Matrix, y: i32, u: i32, v: i32, px: &mut [u8]) {
     px[3] = 255;
 }
 
+/// Pixels per block in `to_bgra` (even, so a 4:2:0 or 4:2:2 block starts on
+/// a chroma sample).
+const BLOCK: usize = 64;
+
 pub fn to_bgra<T>(p: &Planes<'_, T>) -> Vec<u8>
 where
     T: Copy + Into<u32> + Sync,
@@ -85,17 +89,46 @@ where
     let mono = p.subsampling == Subsampling::Mono;
 
     out.par_chunks_mut(w * 4).enumerate().for_each(|(row, line)| {
-        let y_row = &p.y[row * p.y_stride..];
+        let y_row = &p.y[row * p.y_stride..][..w];
         let uv_off = (row >> sy) * p.uv_stride;
-        for x in 0..w {
-            let y = (y_row[x].into() >> shift) as i32;
-            let (u, v) = if mono {
-                (128, 128)
+        let cw = (w + sx) >> sx;
+        let (u_row, v_row) = if mono { (&[][..], &[][..]) } else { (&p.u[uv_off..][..cw], &p.v[uv_off..][..cw]) };
+        // A block at a time in fixed-size, branch-free arrays so the
+        // compiler can use SIMD; the arithmetic is exactly `pixel`'s.
+        for x0 in (0..w).step_by(BLOCK) {
+            let n = BLOCK.min(w - x0);
+            let (mut yy, mut uu, mut vv) = ([0i32; BLOCK], [0i32; BLOCK], [0i32; BLOCK]);
+            for (d, s) in yy.iter_mut().zip(&y_row[x0..x0 + n]) {
+                *d = ((*s).into() >> shift) as i32;
+            }
+            if !mono {
+                let c0 = x0 >> sx;
+                let cn = ((x0 + n + sx) >> sx) - c0;
+                let (us, vs) = (&u_row[c0..c0 + cn], &v_row[c0..c0 + cn]);
+                if sx == 1 {
+                    for (j, (u, v)) in us.iter().zip(vs).enumerate().take(BLOCK / 2) {
+                        let (u, v) = (((*u).into() >> shift) as i32, ((*v).into() >> shift) as i32);
+                        (uu[2 * j], uu[2 * j + 1], vv[2 * j], vv[2 * j + 1]) = (u, u, v, v);
+                    }
+                } else {
+                    for (j, (u, v)) in us.iter().zip(vs).enumerate() {
+                        (uu[j], vv[j]) = (((*u).into() >> shift) as i32, ((*v).into() >> shift) as i32);
+                    }
+                }
             } else {
-                let cx = x >> sx;
-                ((p.u[uv_off + cx].into() >> shift) as i32, (p.v[uv_off + cx].into() >> shift) as i32)
-            };
-            pixel(&m, y, u, v, &mut line[x * 4..x * 4 + 4]);
+                (uu, vv) = ([128; BLOCK], [128; BLOCK]);
+            }
+            let mut px = [0u32; BLOCK];
+            for i in 0..BLOCK {
+                let (y, u, v) = ((yy[i] - 16) * m.y + 8192, uu[i] - 128, vv[i] - 128);
+                let b = ((y + m.bu * u) >> 14).clamp(0, 255) as u32;
+                let g = ((y - m.gu * u - m.gv * v) >> 14).clamp(0, 255) as u32;
+                let r = ((y + m.rv * v) >> 14).clamp(0, 255) as u32;
+                px[i] = b | g << 8 | r << 16 | 0xff00_0000;
+            }
+            for (d, s) in line[x0 * 4..(x0 + n) * 4].as_chunks_mut::<4>().0.iter_mut().zip(&px) {
+                *d = s.to_le_bytes();
+            }
         }
     });
     out
@@ -157,5 +190,76 @@ mod tests {
             bit_depth: 10,
         });
         assert_eq!(&out[..4], &[255, 255, 255, 255]);
+    }
+
+    /// The block path against `pixel` one sample at a time, on noise, for
+    /// every layout, odd sizes, padded strides and widths that end
+    /// mid-block.
+    #[test]
+    fn blocks_match_the_per_pixel_reference() {
+        let mut seed = 0x2545f491u32;
+        let mut noise = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for sub in [Subsampling::S420, Subsampling::S422, Subsampling::S444, Subsampling::Mono] {
+            for (w, h) in [(1, 1), (3, 5), (63, 2), (64, 3), (65, 4), (129, 7), (200, 720)] {
+                for depth in [8u32, 10] {
+                    let (sx, sy) = match sub {
+                        Subsampling::S420 => (1, 1),
+                        Subsampling::S422 => (1, 0),
+                        _ => (0, 0),
+                    };
+                    let (ys, cs) = (w + 3, ((w + sx) >> sx) + 5);
+                    let ch = (h + sy) >> sy;
+                    let max = (1u32 << depth) - 1;
+                    let mut plane = |len: usize| (0..len).map(|_| (noise() & max) as u16).collect::<Vec<_>>();
+                    let (y, u, v) = (plane(ys * h), plane(cs * ch), plane(cs * ch));
+                    let planes = Planes {
+                        y: &y,
+                        u: &u,
+                        v: &v,
+                        y_stride: ys,
+                        uv_stride: cs,
+                        width: w,
+                        height: h,
+                        subsampling: sub,
+                        bit_depth: depth,
+                    };
+                    let got = to_bgra(&planes);
+                    let m = matrix_for(h);
+                    let s = depth - 8;
+                    let mut want = vec![0u8; w * h * 4];
+                    for row in 0..h {
+                        for x in 0..w {
+                            let c = (row >> sy) * cs + (x >> sx);
+                            let (cu, cv) =
+                                if sub == Subsampling::Mono { (128, 128) } else { (u[c] as i32 >> s, v[c] as i32 >> s) };
+                            let at = (row * w + x) * 4;
+                            pixel(&m, y[row * ys + x] as i32 >> s, cu, cv, &mut want[at..at + 4]);
+                        }
+                    }
+                    assert!(got == want, "{sub:?} {w}x{h} {depth}-bit");
+                    if depth == 8 {
+                        let narrow = |p: &[u16]| p.iter().map(|&s| s as u8).collect::<Vec<_>>();
+                        let (y, u, v) = (narrow(&y), narrow(&u), narrow(&v));
+                        let eight = to_bgra(&Planes {
+                            y: &y,
+                            u: &u,
+                            v: &v,
+                            y_stride: ys,
+                            uv_stride: cs,
+                            width: w,
+                            height: h,
+                            subsampling: sub,
+                            bit_depth: 8,
+                        });
+                        assert!(eight == want, "{sub:?} {w}x{h} u8");
+                    }
+                }
+            }
+        }
     }
 }

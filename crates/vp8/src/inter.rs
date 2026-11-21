@@ -2,7 +2,7 @@
 //! (RFC 6386 section 18).
 
 use crate::dsp;
-use crate::frame::{FrameBuf, Plane};
+use crate::frame::{FrameBuf, FrameRows, Plane, Rows};
 use crate::modes::{MbInfo, Mv, MvBounds};
 use crate::tables::SPLITMV;
 
@@ -23,7 +23,7 @@ pub struct Interp {
 /// filter taps every read lands inside the plane's border.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn predict_block(src: &Plane, dst: &mut Plane, x: usize, y: usize, w: usize, h: usize, mv: Mv, interp: Interp) {
+fn predict_block(src: &Plane, dst: &mut Rows<'_>, x: usize, y: usize, w: usize, h: usize, mv: Mv, interp: Interp) {
     let stride = src.stride;
     let src_at = (src.at(x, y) as isize + isize::from(mv.row >> 3) * stride as isize + isize::from(mv.col >> 3)) as usize;
     let dst_at = dst.at(x, y);
@@ -35,9 +35,9 @@ fn predict_block(src: &Plane, dst: &mut Plane, x: usize, y: usize, w: usize, h: 
             _ => copy_block::<4>(&src.data[src_at..], &mut dst.data[dst_at..], stride, h),
         }
     } else if interp.bilinear {
-        dsp::bilinear(&src.data, src_at, stride, &mut dst.data, dst_at, stride, w, h, mx, my);
+        dsp::bilinear(&src.data, src_at, stride, dst.data, dst_at, stride, w, h, mx, my);
     } else {
-        dsp::sixtap(&src.data, src_at, stride, &mut dst.data, dst_at, stride, w, h, mx, my);
+        dsp::sixtap(&src.data, src_at, stride, dst.data, dst_at, stride, w, h, mx, my);
     }
 }
 
@@ -87,7 +87,7 @@ fn clamp_chroma(mv: Mv, b: &MvBounds) -> Mv {
 /// macroblock's distances to the frame edges, without margin.
 pub fn predict_mb(
     reference: &FrameBuf,
-    cur: &mut FrameBuf,
+    cur: &mut FrameRows<'_>,
     mb_col: usize,
     mb_row: usize,
     mb: &MbInfo,

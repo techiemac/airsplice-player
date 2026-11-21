@@ -5,9 +5,9 @@ mod support;
 
 use airsplice_vp8::Decoder;
 
-/// Vectors committed to the repository (59 from libvpx, 6 generated here);
+/// Vectors committed to the repository (59 from libvpx, 8 generated here);
 /// `fetch.sh` adds the rest.
-const COMMITTED: usize = 65;
+const COMMITTED: usize = 67;
 
 #[test]
 fn md5_known_answers() {

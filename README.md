@@ -125,6 +125,7 @@ real time:
 | 4K30 HEVC 10-bit | 7.1x | |
 | 1080p60 H.264 | 7.7x | 2.3x |
 | 1080p30 AV1 | | 7.3x |
+| 1080p30 VP8 | | 13.7x |
 
 Raspberry Pi 5, frames shown on screen by the app:
 

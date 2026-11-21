@@ -33,3 +33,7 @@ with libvpx (`ffmpeg -c:v libvpx -i <file> -f framemd5 -`):
   (the `is_droppable` test uses it).
 - `gen-odd-partitions`: 175x143 with four token partitions and
   `refresh_entropy_probs` off.
+- `gen-threaded`, `gen-threaded-simple`: 705x401 (above the size that loop
+  filters on a second thread), the first with four token partitions and
+  sharpness 3 from noisy `mandelbrot`, the second bitstream version 1 (the
+  simple filter).
