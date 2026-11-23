@@ -274,6 +274,35 @@ impl Drop for Av1Decoder {
 mod tests {
     use super::*;
 
+    /// The film grain assembly reads `Dav1dFilmGrainData` at fixed offsets
+    /// from `src/arm/asm-offsets.h`, a header added to the vendored rav1d
+    /// (see vendor/rav1d/PATCHED.md). They must match the struct.
+    #[test]
+    fn rav1d_film_grain_offsets_match_its_assembly() {
+        use rav1d::include::dav1d::headers::Dav1dFilmGrainData as F;
+        use std::mem::offset_of;
+        let header = include_str!("../../../vendor/rav1d/src/arm/asm-offsets.h");
+        let defined = |name: &str| -> usize {
+            let line = header.lines().find(|l| l.split_whitespace().nth(1) == Some(name)).unwrap_or_else(|| panic!("{name}"));
+            line.split_whitespace().nth(2).unwrap().parse().unwrap()
+        };
+        for (name, offset) in [
+            ("FGD_SEED", offset_of!(F, seed)),
+            ("FGD_AR_COEFF_LAG", offset_of!(F, ar_coeff_lag)),
+            ("FGD_AR_COEFFS_Y", offset_of!(F, ar_coeffs_y)),
+            ("FGD_AR_COEFFS_UV", offset_of!(F, ar_coeffs_uv)),
+            ("FGD_AR_COEFF_SHIFT", offset_of!(F, ar_coeff_shift)),
+            ("FGD_GRAIN_SCALE_SHIFT", offset_of!(F, grain_scale_shift)),
+            ("FGD_SCALING_SHIFT", offset_of!(F, scaling_shift)),
+            ("FGD_UV_MULT", offset_of!(F, uv_mult)),
+            ("FGD_UV_LUMA_MULT", offset_of!(F, uv_luma_mult)),
+            ("FGD_UV_OFFSET", offset_of!(F, uv_offset)),
+            ("FGD_CLIP_TO_RESTRICTED_RANGE", offset_of!(F, clip_to_restricted_range)),
+        ] {
+            assert_eq!(defined(name), offset, "{name}");
+        }
+    }
+
     #[test]
     fn keyframe_detection() {
         // Temporal delimiter (type 2, size 0), then a FRAME OBU (type 6) whose

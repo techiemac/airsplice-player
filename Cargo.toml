@@ -20,8 +20,7 @@ symphonia = { version = "0.6.1", features = ["all", "exp-video-codecs"] }
 cpal = "0.18.2"
 # Sample-rate conversion.
 rubato = "5.1.0"
-# AV1 video: Rust port of dav1d. Built without its assembly: the published
-# 1.1.0 crate omits src/arm/asm-offsets.h, and pure Rust needs no nasm on x86.
+# AV1 video: Rust port of dav1d. Its assembly is enabled on ARM below.
 rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 # H.264 video: Cisco's BSD-licensed decoder, built from bundled source.
 # There is no production-quality pure-Rust H.264 decoder.
@@ -68,6 +67,12 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+# AV1's NEON assembly (Apple silicon, the Raspberry Pi): several times
+# faster than the Rust fallbacks. Variants for newer CPU extensions are
+# picked at run time. Not on x86, where the assembly needs nasm to build.
+rav1d = { version = "1.1.0", default-features = false, features = ["asm", "asm_arm64_dotprod", "asm_arm64_i8mm", "asm_arm64_sve2"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Stateless V4L2 hardware decoding (Raspberry Pi HEVC): kernel struct
 # definitions generated from the system headers, and ioctl declarations.
@@ -109,3 +114,5 @@ symphonia-codec-aac = { path = "vendor/symphonia-codec-aac" }
 xattr = { path = "vendor/xattr" }
 # Parses 4K wavefront HEVC streams; see vendor/cros-codecs/PATCHED.md.
 cros-codecs = { path = "vendor/cros-codecs" }
+# Adds a header the ARM assembly needs; see vendor/rav1d/PATCHED.md.
+rav1d = { path = "vendor/rav1d" }

@@ -336,9 +336,10 @@ These are worth fixing upstream; each workaround can go once they are.
 - xattr 0.2.3 (via GPUI) does not build against current libc on Linux.
   Patched in `vendor/xattr`.
 - The published rav1d 1.1.0 crate is missing a header its ARM assembly
-  needs, so it is built without assembly.
-- OpenH264 deadlocks in threaded mode with the low-latency API, so software
-  H.264 decodes on one thread.
+  needs. Patched in `vendor/rav1d`, which adds it.
+- OpenH264 deadlocks in threaded mode with the low-latency API on streams
+  with B-frames (still so in the copy openh264-sys2 0.9.10 bundles), so
+  software H.264 decodes on one thread.
 
 ## Known limitations
 
