@@ -43,6 +43,53 @@ pub struct AudioState {
     /// The last callback was filled, so running dry now is a dropout (not
     /// the wait for the first audio after open or a seek).
     flowing: bool,
+    /// When the last callback ran and how many frames it played: between
+    /// callbacks the clock moves on with the wall clock, by at most that
+    /// many frames.
+    last_fill: Option<Instant>,
+    last_played: u64,
+    /// The latest time the clock reported, so it never steps backwards.
+    last_now: f64,
+}
+
+impl AudioState {
+    fn new(volume: f32, muted: bool, buf: VecDeque<f32>) -> Self {
+        AudioState {
+            buf,
+            consumed_frames: 0,
+            base_secs: 0.0,
+            generation: 0,
+            paused: false,
+            primed: true,
+            volume,
+            muted,
+            peak: [0.0; 2],
+            latency_frames: 0,
+            ended: false,
+            dropouts: 0,
+            flowing: false,
+            last_fill: None,
+            last_played: 0,
+            last_now: f64::NEG_INFINITY,
+        }
+    }
+
+    /// Media time being heard at `at`. Devices take audio in blocks (20 ms
+    /// here, often more), and a clock that only moved when one was taken
+    /// would jump a block at a time: at 60 fps two frames would come due at
+    /// once and one never be shown. So between blocks it runs on the wall
+    /// clock, never past the frames the last block played, and never
+    /// backwards (the latency estimate jitters).
+    fn now_at(&mut self, rate: u32, at: Instant) -> f64 {
+        let rate = rate as f64;
+        let mut secs = self.base_secs + self.consumed_frames.saturating_sub(self.latency_frames) as f64 / rate;
+        let heard = self.consumed_frames > self.latency_frames;
+        if let Some(last) = self.last_fill.filter(|_| heard && self.primed && !self.paused) {
+            secs += at.saturating_duration_since(last).as_secs_f64().min(self.last_played as f64 / rate);
+        }
+        self.last_now = self.last_now.max(secs);
+        self.last_now
+    }
 }
 
 pub struct AudioOutput {
@@ -143,21 +190,7 @@ impl AudioOutput {
             SupportedBufferSize::Unknown => None,
         };
 
-        let state = Arc::new(Mutex::new(AudioState {
-            buf: VecDeque::with_capacity(rate as usize * channels),
-            consumed_frames: 0,
-            base_secs: 0.0,
-            generation: 0,
-            paused: false,
-            primed: true,
-            volume,
-            muted,
-            peak: [0.0; 2],
-            latency_frames: 0,
-            ended: false,
-            dropouts: 0,
-            flowing: false,
-        }));
+        let state = Arc::new(Mutex::new(AudioState::new(volume, muted, VecDeque::with_capacity(rate as usize * channels))));
 
         let build_with = |config: &StreamConfig| match format {
             SampleFormat::F32 => build::<f32>(&device, config, state.clone()),
@@ -219,8 +252,10 @@ where
 {
     let gain = if st.muted { 0.0 } else { st.volume * st.volume };
     let silence = T::from_sample(0.0f32);
+    st.last_fill = Some(Instant::now());
     if st.paused || !st.primed {
         st.flowing &= st.primed;
+        st.last_played = 0;
         out.fill(silence);
         st.peak = [0.0; 2];
         return;
@@ -246,6 +281,7 @@ where
     // picture waits for the sound; after the end, silence counts.
     let played = if st.ended { out.len() } else { available };
     st.consumed_frames += (played / channels) as u64;
+    st.last_played = (played / channels) as u64;
     // Decay so the meter falls smoothly instead of snapping to zero.
     for (held, new) in st.peak.iter_mut().zip(peak) {
         *held = new.max(*held * 0.85);
@@ -278,11 +314,8 @@ impl Clock {
 
     pub fn now(&self) -> f64 {
         match self {
-            Clock::Audio { state, rate, .. } => {
-                let st = state.lock().unwrap();
-                // Frames still in the device buffer have not been heard yet.
-                st.base_secs + st.consumed_frames.saturating_sub(st.latency_frames) as f64 / *rate as f64
-            }
+            // Frames still in the device buffer have not been heard yet.
+            Clock::Audio { state, rate, .. } => state.lock().unwrap().now_at(*rate, Instant::now()),
             Clock::Wall(w) => {
                 let w = w.lock().unwrap();
                 w.base_secs + w.started.map_or(0.0, |s| s.elapsed().as_secs_f64())
@@ -334,6 +367,7 @@ impl Clock {
                 st.flowing = false;
                 st.consumed_frames = 0;
                 st.base_secs = secs;
+                (st.last_fill, st.last_played, st.last_now) = (None, 0, f64::NEG_INFINITY);
                 st.generation = generation;
             }
             Clock::Wall(w) => {
@@ -516,21 +550,50 @@ mod dropout_tests {
     use super::*;
 
     fn state(queued: usize) -> AudioState {
-        AudioState {
-            buf: std::iter::repeat_n(0.1, queued).collect(),
-            consumed_frames: 0,
-            base_secs: 0.0,
-            generation: 0,
-            paused: false,
-            primed: true,
-            volume: 1.0,
-            muted: false,
-            peak: [0.0; 2],
-            latency_frames: 0,
-            ended: false,
-            dropouts: 0,
-            flowing: false,
-        }
+        AudioState::new(1.0, false, std::iter::repeat_n(0.1, queued).collect())
+    }
+
+    /// Between device blocks the clock runs on the wall clock, by no more
+    /// than the last block played, and never backwards.
+    #[test]
+    fn the_clock_moves_smoothly_between_device_blocks() {
+        let ms = |n: u64| std::time::Duration::from_millis(n);
+        let mut st = state(0);
+        let t0 = Instant::now();
+        // A 20 ms block (960 frames at 48 kHz) heard from 1 s in.
+        (st.consumed_frames, st.last_played, st.last_fill) = (48_000, 960, Some(t0));
+        assert_eq!(st.now_at(48_000, t0), 1.0);
+        assert!((st.now_at(48_000, t0 + ms(8)) - 1.008).abs() < 1e-9, "moves between blocks");
+        assert!((st.now_at(48_000, t0 + ms(50)) - 1.020).abs() < 1e-9, "never past the block");
+        // The next block lands a little early: the clock holds, not steps back.
+        (st.consumed_frames, st.last_fill) = (48_960, Some(t0 + ms(19)));
+        assert!((st.now_at(48_000, t0 + ms(19)) - 1.020).abs() < 1e-9);
+        assert!((st.now_at(48_000, t0 + ms(25)) - 1.026).abs() < 1e-9);
+        // Latency jitter that would move it back is held.
+        st.latency_frames = 480;
+        assert!((st.now_at(48_000, t0 + ms(25)) - 1.026).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_clock_holds_while_paused_dry_or_not_yet_heard() {
+        let ms = |n: u64| std::time::Duration::from_millis(n);
+        let t0 = Instant::now();
+        let mut st = state(0);
+        (st.consumed_frames, st.last_played, st.last_fill, st.paused) = (48_000, 960, Some(t0), true);
+        assert_eq!(st.now_at(48_000, t0 + ms(10)), 1.0, "paused");
+        let mut st = state(0);
+        (st.consumed_frames, st.last_played, st.last_fill, st.primed) = (48_000, 960, Some(t0), false);
+        assert_eq!(st.now_at(48_000, t0 + ms(10)), 1.0, "waiting for the first frame");
+        let mut st = state(0);
+        (st.consumed_frames, st.latency_frames, st.last_played, st.last_fill) = (960, 1920, 960, Some(t0));
+        assert_eq!(st.now_at(48_000, t0 + ms(10)), 0.0, "still in the device buffer");
+        // A block that ran dry: only what it played counts.
+        let mut st = state(4);
+        let mut out = [0.0f32; 8];
+        fill(&mut st, &mut out, 2);
+        assert_eq!(st.last_played, 2);
+        let at = st.last_fill.unwrap();
+        assert!((st.now_at(1000, at + ms(100)) - 0.004).abs() < 1e-9, "2 frames + 2 frames at 1 kHz");
     }
 
     #[test]

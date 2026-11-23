@@ -78,6 +78,9 @@ actions!(
     ]
 );
 
+/// How often the info panel's level meters redraw while sound plays.
+const METER_INTERVAL: Duration = Duration::from_millis(33);
+
 const PLAYER_CONTEXT: &str = "Player";
 const PICKER_CONTEXT: &str = "Picker";
 const SEEK_STEP: f64 = 5.0;
@@ -728,7 +731,12 @@ impl MediaPlayer {
             self.fps_since = Instant::now();
         }
         let position = player.position();
-        if (position - self.drawn_position).abs() >= 0.04 || (!player.is_paused() && player.info.audio.is_some()) {
+        // The clock and seek bar move every 40 ms. The info panel's level
+        // meters, while on screen, at 30 per second: smooth to the eye, where
+        // redrawing the whole window every tick (200 times a second) cost a
+        // Pi most of a core that video decoding needs.
+        let meters = self.info_open && !player.is_paused() && player.info.audio.is_some();
+        if (position - self.drawn_position).abs() >= 0.04 || (meters && self.last_draw.elapsed() >= METER_INTERVAL) {
             changed = true;
         }
         // The player's error can go again (video that recovers at its next
@@ -3561,6 +3569,37 @@ mod tests {
                 assert_eq!(v.never_drawn, 0, "paused: {paused}");
             });
         }
+    }
+
+    /// Playing sound redraws the window only as the clock moves, and for
+    /// the level meters while they are on screen, 30 times a second.
+    /// (Every tick, 200 times a second, cost a Pi most of a core.)
+    #[gpui::test]
+    fn playing_audio_redraws_only_as_the_clock_and_meters_move(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(vec![fixture("stereo.ogg")], None, window, cx));
+        tick_until(&view, vcx, "playback", |v| v.player.as_ref().is_some_and(|p| p.position() > 0.05));
+        let notified = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = notified.clone();
+        let _watch = vcx.update(|_, cx| cx.observe(&view, move |_, _| count.set(count.get() + 1)));
+        // One tick with the clock where it was last drawn.
+        let tick = |vcx: &mut gpui::VisualTestContext, info_open: bool, since_draw: Duration| {
+            notified.set(0);
+            view.update_in(vcx, |v, window, cx| {
+                v.info_open = info_open;
+                v.last_draw = Instant::now() - since_draw;
+                let p = v.player.as_ref().unwrap();
+                assert!(!p.is_paused() && p.info.audio.is_some(), "playing sound (needs an audio output)");
+                v.drawn_position = p.position();
+                v.tick(window, cx);
+            });
+            vcx.run_until_parked();
+            notified.get()
+        };
+        let ms = Duration::from_millis;
+        assert_eq!(tick(vcx, false, ms(100)), 0, "nothing moved, nothing to redraw");
+        assert_eq!(tick(vcx, true, ms(5)), 0, "the meters were drawn 5 ms ago");
+        assert!(tick(vcx, true, ms(40)) > 0, "the meters move 30 times a second");
     }
 
     #[gpui::test]
