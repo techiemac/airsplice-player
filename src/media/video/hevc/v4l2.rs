@@ -60,6 +60,10 @@ const START_CODE_NONE: i32 = 0;
 const OUTPUT: u32 = b::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 const CAPTURE: u32 = b::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 const MMAP: u32 = b::v4l2_memory_V4L2_MEMORY_MMAP;
+const DMABUF: u32 = b::v4l2_memory_V4L2_MEMORY_DMABUF;
+/// The Raspberry Pi's heap of cached, IOMMU-mapped video buffers (an alias
+/// of the system heap); the generic name second.
+const CACHED_HEAPS: [&str; 2] = ["/dev/dma_heap/vidbuf_cached", "/dev/dma_heap/system"];
 const OUTPUT_BUFFERS: u32 = 2;
 /// Capture buffers beyond the stream's DPB: the picture being decoded plus
 /// slack for the driver.
@@ -82,7 +86,25 @@ mod ioctl {
     nix::ioctl_read!(media_request_alloc, b'|', 0x05, libc::c_int);
     nix::ioctl_none!(media_request_queue, b'|', 0x80);
     nix::ioctl_none!(media_request_reinit, b'|', 0x81);
+    nix::ioctl_readwrite!(dma_heap_alloc, b'H', 0, super::DmaHeapAllocation);
+    nix::ioctl_write_ptr!(dma_buf_sync, b'b', 0, u64);
 }
+
+/// `struct dma_heap_allocation_data` (linux/dma-heap.h).
+#[repr(C)]
+#[derive(Default)]
+struct DmaHeapAllocation {
+    len: u64,
+    fd: u32,
+    fd_flags: u32,
+    heap_flags: u64,
+}
+
+/// `DMA_BUF_SYNC_*` (linux/dma-buf.h): bracket CPU reads of a cached buffer
+/// the device wrote, so the CPU sees what it wrote.
+const DMA_BUF_SYNC_READ: u64 = 1;
+const DMA_BUF_SYNC_START: u64 = 0;
+const DMA_BUF_SYNC_END: u64 = 4;
 
 /// A memory-mapped plane of a V4L2 buffer.
 struct Mapping {
@@ -163,6 +185,9 @@ fn accepts_hevc_slices(file: &File) -> bool {
 
 struct CaptureBuffer {
     planes: [Mapping; 2],
+    /// Set for buffers we allocated (cached, from a DMA heap) rather than
+    /// the driver's uncached MMAP ones.
+    dmabufs: Option<[OwnedFd; 2]>,
     /// The picture it holds, while that picture may still be referenced.
     tag: Option<u64>,
     /// Decoded but not yet converted: must not be reused even if the
@@ -273,15 +298,23 @@ impl Device {
         };
         dev.output = dev.allocate(OUTPUT, OUTPUT_BUFFERS, 1)?.into_iter().map(|mut p| p.remove(0)).collect();
         let count = (frame.max_dpb + EXTRA_CAPTURE_BUFFERS) as u32;
-        dev.capture = dev
+        // SAFETY: as above.
+        let sizes = unsafe { [fmt.fmt.pix_mp.plane_fmt[0].sizeimage, fmt.fmt.pix_mp.plane_fmt[1].sizeimage] };
+        match dev.allocate_cached(count, sizes) {
+            Ok(capture) => dev.capture = capture,
+            Err(e) => log::debug!("HEVC picture buffers: uncached ({e:#})"),
+        }
+        if dev.capture.is_empty() {
+            dev.capture = dev
             .allocate(CAPTURE, count, 2)?
             .into_iter()
             .map(|mut planes| {
                 let chroma = planes.remove(1);
                 let luma = planes.remove(0);
-                CaptureBuffer { planes: [luma, chroma], tag: None, pinned: false }
+                CaptureBuffer { planes: [luma, chroma], dmabufs: None, tag: None, pinned: false }
             })
             .collect();
+        }
         for _ in 0..OUTPUT_BUFFERS {
             let mut req: libc::c_int = -1;
             // SAFETY: valid media fd and out-param.
@@ -320,9 +353,58 @@ impl Device {
         Ok(out)
     }
 
+    /// Picture buffers from a cached DMA heap, imported as DMABUF. The
+    /// driver's own MMAP buffers are uncached on the Pi 5 (its decoder
+    /// supports no cache hints), and the CPU reads every picture: uncached,
+    /// that read costs more than half a core at 1080p60. The decoder sits
+    /// behind an IOMMU, so these need not be contiguous.
+    fn allocate_cached(&self, count: u32, sizes: [u32; 2]) -> Result<Vec<CaptureBuffer>> {
+        let heap = CACHED_HEAPS
+            .iter()
+            .find_map(|p| OpenOptions::new().read(true).write(true).open(p).ok())
+            .ok_or_else(|| anyhow!("no DMA heap"))?;
+        let fd = self.video.as_raw_fd();
+        let mut req = b::v4l2_requestbuffers { count, type_: CAPTURE, memory: DMABUF, ..Default::default() };
+        // SAFETY: valid fd and in/out-param.
+        unsafe { ioctl::reqbufs(fd, &mut req) }.context("requesting DMABUF picture buffers")?;
+        let plane = |len: u32| -> Result<(Mapping, OwnedFd)> {
+            let mut alloc = DmaHeapAllocation { len: len as u64, fd_flags: (libc::O_RDWR | libc::O_CLOEXEC) as u32, ..Default::default() };
+            // SAFETY: valid heap fd and in/out-param.
+            unsafe { ioctl::dma_heap_alloc(heap.as_raw_fd(), &mut alloc) }.context("allocating from the DMA heap")?;
+            // SAFETY: the kernel returned a new fd we now own.
+            let buf = unsafe { OwnedFd::from_raw_fd(alloc.fd as RawFd) };
+            Ok((Mapping::new(buf.as_raw_fd(), 0, len)?, buf))
+        };
+        let buffers = (0..req.count)
+            .map(|_| {
+                let ((luma, lfd), (chroma, cfd)) = (plane(sizes[0])?, plane(sizes[1])?);
+                Ok(CaptureBuffer { planes: [luma, chroma], dmabufs: Some([lfd, cfd]), tag: None, pinned: false })
+            })
+            .collect::<Result<Vec<_>>>();
+        if buffers.is_err() {
+            let mut free = b::v4l2_requestbuffers { count: 0, type_: CAPTURE, memory: DMABUF, ..Default::default() };
+            // SAFETY: as above; frees the queue so MMAP can be requested.
+            let _ = unsafe { ioctl::reqbufs(fd, &mut free) };
+        }
+        let buffers = buffers?;
+        log::debug!("HEVC picture buffers: cached ({} from a DMA heap)", buffers.len());
+        Ok(buffers)
+    }
+
+    fn capture_memory(&self) -> u32 {
+        if self.capture.first().is_some_and(|c| c.dmabufs.is_some()) { DMABUF } else { MMAP }
+    }
+
     fn queue_capture(&self, index: usize) -> Result<()> {
         let mut planes = [b::v4l2_plane::default(); 2];
-        let mut buf = b::v4l2_buffer { index: index as u32, type_: CAPTURE, memory: MMAP, length: 2, ..Default::default() };
+        if let Some(fds) = &self.capture[index].dmabufs {
+            for (p, (fd, map)) in planes.iter_mut().zip(fds.iter().zip(&self.capture[index].planes)) {
+                p.m.fd = fd.as_raw_fd();
+                p.length = map.len as u32;
+            }
+        }
+        let memory = self.capture_memory();
+        let mut buf = b::v4l2_buffer { index: index as u32, type_: CAPTURE, memory, length: 2, ..Default::default() };
         buf.m.planes = planes.as_mut_ptr();
         // SAFETY: valid fd; `planes` outlives the call.
         unsafe { ioctl::qbuf(self.video.as_raw_fd(), &mut buf) }.context("queueing a picture buffer")?;
@@ -332,7 +414,8 @@ impl Device {
     /// Wait for the device to hand back a buffer of `type_`.
     fn dequeue(&self, type_: u32, planes: u32) -> Result<b::v4l2_buffer> {
         let mut plane_info = [b::v4l2_plane::default(); 2];
-        let mut buf = b::v4l2_buffer { type_, memory: MMAP, length: planes, ..Default::default() };
+        let memory = if type_ == CAPTURE { self.capture_memory() } else { MMAP };
+        let mut buf = b::v4l2_buffer { type_, memory, length: planes, ..Default::default() };
         buf.m.planes = plane_info.as_mut_ptr();
         // SAFETY: valid fd; `plane_info` outlives the call.
         unsafe { ioctl::dqbuf(self.video.as_raw_fd(), &mut buf) }.context("dequeueing a buffer")?;
@@ -442,21 +525,37 @@ impl Device {
 
     fn picture(&self, index: usize, scale: usize) -> (Vec<u8>, usize, usize) {
         let c = &self.capture[index];
-        // One sequential copy out of the (typically uncached) mapping; the
-        // scattered reads of de-tiling then hit cached memory.
-        let mut scratch = self.scratch.borrow_mut();
-        let (luma, chroma) = &mut *scratch;
-        parallel_copy(c.planes[0].slice(), luma);
-        parallel_copy(c.planes[1].slice(), chroma);
-        Col128 {
+        let col = |luma, chroma| Col128 {
             luma,
             chroma,
             width: self.width as usize,
             height: self.height as usize,
             column_height: self.column_height,
             ten_bit: self.ten_bit,
+        };
+        if let Some(fds) = &c.dmabufs {
+            // Cached: de-tile straight from the buffers, between the syncs
+            // that make the device's writes visible to the CPU.
+            let sync = |flags: u64| {
+                for fd in fds {
+                    // SAFETY: valid dma-buf fd and in-param. A failed sync
+                    // can only mean stale cache lines; there is no better
+                    // fallback than reading anyway.
+                    let _ = unsafe { ioctl::dma_buf_sync(fd.as_raw_fd(), &(flags | DMA_BUF_SYNC_READ)) };
+                }
+            };
+            sync(DMA_BUF_SYNC_START);
+            let picture = col(c.planes[0].slice(), c.planes[1].slice()).to_bgra_scaled(scale);
+            sync(DMA_BUF_SYNC_END);
+            return picture;
         }
-        .to_bgra_scaled(scale)
+        // One sequential copy out of the uncached mapping; the scattered
+        // reads of de-tiling then hit cached memory.
+        let mut scratch = self.scratch.borrow_mut();
+        let (luma, chroma) = &mut *scratch;
+        parallel_copy(c.planes[0].slice(), luma);
+        parallel_copy(c.planes[1].slice(), chroma);
+        col(luma, chroma).to_bgra_scaled(scale)
     }
 
     fn release_all(&mut self) {
@@ -573,7 +672,7 @@ impl Worker {
         let Some((index, pts, w, h)) = picture else { return self.reorder.push([]) };
         let dev = self.device.as_mut().expect("device open");
         let frame = (pts >= self.discard_before).then(|| {
-            let scale = super::col128::scale_for(w, h, self.limit);
+            let scale = super::super::yuv::scale_for(w, h, self.limit);
             let (bgra, width, height) = dev.picture(index, scale);
             DecodedFrame { pts, width: width as u32, height: height as u32, bgra }
         });

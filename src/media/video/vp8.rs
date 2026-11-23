@@ -13,11 +13,13 @@ pub struct Vp8Decoder {
     /// decoder never saw; they are skipped rather than shown as garbage.
     seen_keyframe: bool,
     discard_before: i64,
+    /// The largest size frames are shown at; bigger ones are shrunk to it.
+    limit: Option<(u32, u32)>,
 }
 
 impl Vp8Decoder {
     pub fn new() -> Self {
-        Self { decoder: Decoder::new(), seen_keyframe: false, discard_before: i64::MIN }
+        Self { decoder: Decoder::new(), seen_keyframe: false, discard_before: i64::MIN, limit: None }
     }
 }
 
@@ -27,7 +29,7 @@ impl Default for Vp8Decoder {
     }
 }
 
-fn convert(frame: &Frame<'_>, pts: i64) -> Result<DecodedFrame> {
+fn convert(frame: &Frame<'_>, pts: i64, limit: Option<(u32, u32)>) -> Result<DecodedFrame> {
     let (w, h) = (frame.width as usize, frame.height as usize);
     // The converter indexes the planes without checking; a picture that
     // does not fill them would panic the video thread.
@@ -41,7 +43,7 @@ fn convert(frame: &Frame<'_>, pts: i64) -> Result<DecodedFrame> {
     {
         bail!("VP8 decoder returned an incomplete {w}x{h} picture");
     }
-    let bgra = yuv::to_bgra(&Planes {
+    let (bgra, ow, oh) = yuv::to_bgra_scaled(&Planes {
         y: frame.y,
         u: frame.u,
         v: frame.v,
@@ -51,8 +53,8 @@ fn convert(frame: &Frame<'_>, pts: i64) -> Result<DecodedFrame> {
         height: h,
         subsampling: Subsampling::S420,
         bit_depth: 8,
-    });
-    Ok(DecodedFrame { pts, width: frame.width, height: frame.height, bgra })
+    }, yuv::scale_for(frame.width, frame.height, limit));
+    Ok(DecodedFrame { pts, width: ow as u32, height: oh as u32, bgra })
 }
 
 impl VideoDecoder for Vp8Decoder {
@@ -81,7 +83,7 @@ impl VideoDecoder for Vp8Decoder {
         if pts < self.discard_before {
             return Ok(Vec::new());
         }
-        Ok(vec![convert(&frame, pts)?])
+        Ok(vec![convert(&frame, pts, self.limit)?])
     }
 
     fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
@@ -94,6 +96,10 @@ impl VideoDecoder for Vp8Decoder {
         self.seen_keyframe = false;
         self.discard_before = discard_before;
         Ok(())
+    }
+
+    fn set_output_limit(&mut self, limit: Option<(u32, u32)>) {
+        self.limit = limit;
     }
 }
 
@@ -140,8 +146,8 @@ mod tests {
     fn incomplete_pictures_are_refused() {
         let (y, c) = ([0u8; 12], [0u8; 2]);
         let frame = |width, height| Frame { width, height, y: &y, u: &c, v: &c, y_stride: 4, uv_stride: 2 };
-        assert_eq!(convert(&frame(3, 2), 7).map(|f| (f.pts, f.bgra.len())).unwrap(), (7, 24));
-        assert!(convert(&frame(0, 2), 0).is_err(), "no picture");
-        assert!(convert(&frame(4, 4), 0).is_err(), "more rows than the planes hold");
+        assert_eq!(convert(&frame(3, 2), 7, None).map(|f| (f.pts, f.bgra.len())).unwrap(), (7, 24));
+        assert!(convert(&frame(0, 2), 0, None).is_err(), "no picture");
+        assert!(convert(&frame(4, 4), 0, None).is_err(), "more rows than the planes hold");
     }
 }

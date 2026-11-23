@@ -28,6 +28,8 @@ pub struct Av1Decoder {
     config_obus: Vec<u8>,
     seen_keyframe: bool,
     discard_before: i64,
+    /// The largest size frames are shown at; bigger ones are shrunk to it.
+    limit: Option<(u32, u32)>,
 }
 
 const OBU_FRAME_HEADER: u8 = 3;
@@ -93,7 +95,7 @@ impl Av1Decoder {
         }
         // av1C: 4-byte header, then optional configOBUs.
         let config_obus = av1c.filter(|c| c.len() > 4).map(|c| c[4..].to_vec()).unwrap_or_default();
-        let mut dec = Self { ctx, config_obus, seen_keyframe: true, discard_before: i64::MIN };
+        let mut dec = Self { ctx, config_obus, seen_keyframe: true, discard_before: i64::MIN, limit: None };
         dec.send_config()?;
         Ok(dec)
     }
@@ -153,7 +155,7 @@ impl Av1Decoder {
                 log::debug!("rav1d: get_picture error {}", res.0);
                 return Ok(());
             }
-            let frame = if pic.m.timestamp < self.discard_before { None } else { Some(convert(&pic)) };
+            let frame = if pic.m.timestamp < self.discard_before { None } else { Some(convert(&pic, self.limit)) };
             // SAFETY: pic was filled by dav1d_get_picture.
             unsafe { dav1d_picture_unref(Some(NonNull::from(&mut pic))) };
             if let Some(frame) = frame {
@@ -163,7 +165,7 @@ impl Av1Decoder {
     }
 }
 
-fn convert(pic: &Dav1dPicture) -> Result<DecodedFrame> {
+fn convert(pic: &Dav1dPicture, limit: Option<(u32, u32)>) -> Result<DecodedFrame> {
     let (w, h) = (pic.p.w as usize, pic.p.h as usize);
     let subsampling = match pic.p.layout {
         DAV1D_PIXEL_LAYOUT_I420 => Subsampling::S420,
@@ -182,7 +184,8 @@ fn convert(pic: &Dav1dPicture) -> Result<DecodedFrame> {
     let y_ptr = plane(0)?;
     let (u_ptr, v_ptr) = if mono { (y_ptr, y_ptr) } else { (plane(1)?, plane(2)?) };
     let (uv_len, uv_stride_bytes) = if mono { (ys * h, ys) } else { (cs * ch, cs) };
-    let bgra = if pic.p.bpc > 8 {
+    let scale = yuv::scale_for(w as u32, h as u32, limit);
+    let (bgra, ow, oh) = if pic.p.bpc > 8 {
         // SAFETY: dav1d planes are valid for stride*rows bytes while `pic`
         // is referenced, and 16-bit planes are 2-byte aligned.
         let (y, u, v) = unsafe {
@@ -192,7 +195,7 @@ fn convert(pic: &Dav1dPicture) -> Result<DecodedFrame> {
                 std::slice::from_raw_parts(v_ptr as *const u16, uv_len / 2),
             )
         };
-        yuv::to_bgra(&Planes {
+        yuv::to_bgra_scaled(&Planes {
             y,
             u,
             v,
@@ -202,7 +205,7 @@ fn convert(pic: &Dav1dPicture) -> Result<DecodedFrame> {
             height: h,
             subsampling,
             bit_depth: pic.p.bpc as u32,
-        })
+        }, scale)
     } else {
         // SAFETY: as above.
         let (y, u, v) = unsafe {
@@ -212,7 +215,7 @@ fn convert(pic: &Dav1dPicture) -> Result<DecodedFrame> {
                 std::slice::from_raw_parts(v_ptr, uv_len),
             )
         };
-        yuv::to_bgra(&Planes {
+        yuv::to_bgra_scaled(&Planes {
             y,
             u,
             v,
@@ -222,9 +225,9 @@ fn convert(pic: &Dav1dPicture) -> Result<DecodedFrame> {
             height: h,
             subsampling,
             bit_depth: 8,
-        })
+        }, scale)
     };
-    Ok(DecodedFrame { pts: pic.m.timestamp, width: w as u32, height: h as u32, bgra })
+    Ok(DecodedFrame { pts: pic.m.timestamp, width: ow as u32, height: oh as u32, bgra })
 }
 
 impl VideoDecoder for Av1Decoder {
@@ -260,6 +263,10 @@ impl VideoDecoder for Av1Decoder {
         self.seen_keyframe = false;
         self.discard_before = discard_before;
         self.send_config()
+    }
+
+    fn set_output_limit(&mut self, limit: Option<(u32, u32)>) {
+        self.limit = limit;
     }
 }
 

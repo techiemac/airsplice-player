@@ -25,13 +25,6 @@ pub struct Col128<'a> {
     pub ten_bit: bool,
 }
 
-/// The largest downscale (1, 2 or 4) that keeps the picture at least as big
-/// as `limit` (the size it can be shown at), so no visible detail is lost.
-pub fn scale_for(width: u32, height: u32, limit: Option<(u32, u32)>) -> usize {
-    let Some((lw, lh)) = limit.filter(|&(w, h)| w > 0 && h > 0) else { return 1 };
-    [4, 2].into_iter().find(|&s| width / s >= lw && height / s >= lh).map_or(1, |s| s as usize)
-}
-
 impl Col128<'_> {
     /// Convert with an integer box-filter downscale (`scale` 1, 2 or 4):
     /// each output pixel averages `scale`x`scale` luma samples and the
@@ -50,7 +43,8 @@ impl Col128<'_> {
     fn half_size(&self) -> (Vec<u8>, usize, usize) {
         let (ow, oh) = (self.width / 2, self.height / 2);
         let mut out = vec![0u8; ow * oh * 4];
-        let m = yuv::matrix_for(oh);
+        // The source's matrix: a 1080p picture halved is still HD video.
+        let m = yuv::matrix_for(self.height);
         let luma_col = self.column_height * 128;
         let chroma_col = luma_col / 2;
         let ten = self.ten_bit;
@@ -63,7 +57,9 @@ impl Col128<'_> {
                 let c = &self.chroma[col * chroma_col + oy * 128..][..128];
                 let x0 = col * col_px / 2;
                 let n = (col_px.min(self.width - col * col_px) / 2).min(ow - x0);
-                let px = &mut line[x0 * 4..(x0 + n) * 4];
+                // At most 64 output pixels per column (128 or 96 samples
+                // halved): one block for the shared packer.
+                let (mut yy, mut uu, mut vv) = ([0i32; yuv::BLOCK], [0i32; yuv::BLOCK], [0i32; yuv::BLOCK]);
                 if ten {
                     // Two words per row give six samples, three output pixels;
                     // two chroma words hold their three U/V pairs.
@@ -78,17 +74,18 @@ impl Col128<'_> {
                         ];
                         let uv = [(s(c0, 0), s(c0, 1)), (s(c0, 2), s(c1, 0)), (s(c1, 1), s(c1, 2))];
                         for k in 0..3.min(n - g * 3) {
-                            let y = (((ys[k] + 2) / 4) >> 2) as i32;
-                            let i = (g * 3 + k) * 4;
-                            yuv::pixel(&m, y, (uv[k].0 >> 2) as i32, (uv[k].1 >> 2) as i32, &mut px[i..i + 4]);
+                            let i = g * 3 + k;
+                            yy[i] = (((ys[k] + 2) / 4) >> 2) as i32;
+                            (uu[i], vv[i]) = ((uv[k].0 >> 2) as i32, (uv[k].1 >> 2) as i32);
                         }
                     }
                 } else {
-                    for j in 0..n {
-                        let y = (a[2 * j] as u32 + a[2 * j + 1] as u32 + b[2 * j] as u32 + b[2 * j + 1] as u32 + 2) / 4;
-                        yuv::pixel(&m, y as i32, c[2 * j] as i32, c[2 * j + 1] as i32, &mut px[j * 4..j * 4 + 4]);
+                    for j in 0..yuv::BLOCK.min(a.len() / 2) {
+                        yy[j] = ((a[2 * j] as u32 + a[2 * j + 1] as u32 + b[2 * j] as u32 + b[2 * j + 1] as u32 + 2) / 4) as i32;
+                        (uu[j], vv[j]) = (c[2 * j] as i32, c[2 * j + 1] as i32);
                     }
                 }
+                yuv::pack(&m, &yy, &uu, &vv, &mut line[x0 * 4..(x0 + n) * 4]);
             }
         });
         (out, ow, oh)
@@ -100,7 +97,8 @@ impl Col128<'_> {
         assert!(scale == 2 || scale == 4, "unsupported scale {scale}");
         let (ow, oh) = (self.width / scale, self.height / scale);
         let mut out = vec![0u8; ow * oh * 4];
-        let m = yuv::matrix_for(oh);
+        // The source's matrix: a 1080p picture halved is still HD video.
+        let m = yuv::matrix_for(self.height);
         let luma_col = self.column_height * 128;
         let chroma_col = luma_col / 2;
         let col_px = if self.ten_bit { 96 } else { 128 };
@@ -177,26 +175,21 @@ impl Col128<'_> {
                 let shift = if self.ten_bit { 2 } else { 0 };
                 let x0 = col * col_px;
                 let n = col_px.min(w - x0);
-                // Fixed-size, branch-free arrays so the compiler can use SIMD;
+                // Two blocks of 64 through the shared SIMD-friendly packer:
                 // the arithmetic is exactly `yuv::pixel`'s.
-                let (mut yy, mut uu, mut vv) = ([0i32; 128], [0i32; 128], [0i32; 128]);
-                for i in 0..128 {
-                    let c = (i / 2) * 2;
-                    yy[i] = ((ys[i] >> shift) as i32 - 16) * m.y;
-                    uu[i] = (cs[c] >> shift) as i32 - 128;
-                    vv[i] = (cs[c + 1] >> shift) as i32 - 128;
-                }
-                // Channels computed as separate arrays, then interleaved:
-                // both loops are simple enough to vectorise.
-                let (mut bs, mut gs, mut rs) = ([0u8; 128], [0u8; 128], [0u8; 128]);
-                for i in 0..128 {
-                    let (y, u, v) = (yy[i], uu[i], vv[i]);
-                    bs[i] = ((y + m.bu * u + 8192) >> 14).clamp(0, 255) as u8;
-                    gs[i] = ((y - m.gu * u - m.gv * v + 8192) >> 14).clamp(0, 255) as u8;
-                    rs[i] = ((y + m.rv * v + 8192) >> 14).clamp(0, 255) as u8;
-                }
-                for (i, px) in line[x0 * 4..(x0 + n) * 4].as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                    *px = [bs[i], gs[i], rs[i], 255];
+                for half in 0..2 {
+                    let (h0, hn) = (half * yuv::BLOCK, n.saturating_sub(half * yuv::BLOCK).min(yuv::BLOCK));
+                    if hn == 0 {
+                        break;
+                    }
+                    let (mut yy, mut uu, mut vv) = ([0i32; yuv::BLOCK], [0i32; yuv::BLOCK], [0i32; yuv::BLOCK]);
+                    for i in 0..yuv::BLOCK {
+                        let (k, c) = (h0 + i, ((h0 + i) / 2) * 2);
+                        yy[i] = (ys[k] >> shift) as i32;
+                        uu[i] = (cs[c] >> shift) as i32;
+                        vv[i] = (cs[c + 1] >> shift) as i32;
+                    }
+                    yuv::pack(&m, &yy, &uu, &vv, &mut line[(x0 + h0) * 4..(x0 + h0 + hn) * 4]);
                 }
             }
         });
@@ -266,36 +259,28 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    #[test]
-    fn scale_never_drops_below_the_display_size() {
-        assert_eq!(scale_for(3840, 2160, Some((1920, 1080))), 2);
-        assert_eq!(scale_for(3840, 2160, Some((1600, 900))), 2);
-        assert_eq!(scale_for(3840, 2160, Some((960, 540))), 4);
-        assert_eq!(scale_for(3840, 2160, Some((2560, 1440))), 1);
-        assert_eq!(scale_for(1920, 1080, Some((1920, 1080))), 1);
-        assert_eq!(scale_for(3840, 2160, None), 1);
-    }
-
+    /// Also at 1080 rows, halved to 540: still HD video, so still BT.709.
     #[test]
     fn two_x_downscale_matches_averaging_then_converting() {
-        let (w, h, col_h) = (300, 12, 16);
-        let y: Vec<u8> = (0..w * h).map(|i| ((i * 7) % 220 + 16) as u8).collect();
-        let cw = w / 2;
-        let u: Vec<u8> = (0..cw * h / 2).map(|i| ((i * 3) % 200 + 20) as u8).collect();
-        let v: Vec<u8> = (0..cw * h / 2).map(|i| (255 - (i * 5) % 200) as u8).collect();
-        let (luma, chroma) = tile8(&y, &u, &v, w, h, col_h);
-        let col = Col128 { luma: &luma, chroma: &chroma, width: w, height: h, column_height: col_h, ten_bit: false };
-        let (got, ow, oh) = col.to_bgra_scaled(2);
-        assert_eq!((ow, oh), (150, 6));
-        let m = yuv::matrix_for(oh);
-        for oy in 0..oh {
-            for ox in 0..ow {
-                let ys = [y[2 * oy * w + 2 * ox], y[2 * oy * w + 2 * ox + 1], y[(2 * oy + 1) * w + 2 * ox], y[(2 * oy + 1) * w + 2 * ox + 1]];
-                let yavg = (ys.iter().map(|&s| s as u32).sum::<u32>() + 2) / 4;
-                let mut want = [0u8; 4];
-                yuv::pixel(&m, yavg as i32, u[oy * cw + ox] as i32, v[oy * cw + ox] as i32, &mut want);
-                let at = (oy * ow + ox) * 4;
-                assert_eq!(&got[at..at + 4], &want, "pixel ({ox}, {oy})");
+        for (w, h, col_h) in [(300, 12, 16), (130, 1080, 1088)] {
+            let y: Vec<u8> = (0..w * h).map(|i| ((i * 7) % 220 + 16) as u8).collect();
+            let cw = w / 2;
+            let u: Vec<u8> = (0..cw * h / 2).map(|i| ((i * 3) % 200 + 20) as u8).collect();
+            let v: Vec<u8> = (0..cw * h / 2).map(|i| (255 - (i * 5) % 200) as u8).collect();
+            let (luma, chroma) = tile8(&y, &u, &v, w, h, col_h);
+            let col = Col128 { luma: &luma, chroma: &chroma, width: w, height: h, column_height: col_h, ten_bit: false };
+            let (got, ow, oh) = col.to_bgra_scaled(2);
+            assert_eq!((ow, oh), (w / 2, h / 2));
+            let m = yuv::matrix_for(h);
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let ys = [y[2 * oy * w + 2 * ox], y[2 * oy * w + 2 * ox + 1], y[(2 * oy + 1) * w + 2 * ox], y[(2 * oy + 1) * w + 2 * ox + 1]];
+                    let yavg = (ys.iter().map(|&s| s as u32).sum::<u32>() + 2) / 4;
+                    let mut want = [0u8; 4];
+                    yuv::pixel(&m, yavg as i32, u[oy * cw + ox] as i32, v[oy * cw + ox] as i32, &mut want);
+                    let at = (oy * ow + ox) * 4;
+                    assert_eq!(&got[at..at + 4], &want, "{w}x{h} pixel ({ox}, {oy})");
+                }
             }
         }
     }

@@ -71,7 +71,7 @@ pub(crate) fn pixel(m: &Matrix, y: i32, u: i32, v: i32, px: &mut [u8]) {
 
 /// Pixels per block in `to_bgra` (even, so a 4:2:0 or 4:2:2 block starts on
 /// a chroma sample).
-const BLOCK: usize = 64;
+pub(crate) const BLOCK: usize = 64;
 
 pub fn to_bgra<T>(p: &Planes<'_, T>) -> Vec<u8>
 where
@@ -118,20 +118,98 @@ where
             } else {
                 (uu, vv) = ([128; BLOCK], [128; BLOCK]);
             }
-            let mut px = [0u32; BLOCK];
-            for i in 0..BLOCK {
-                let (y, u, v) = ((yy[i] - 16) * m.y + 8192, uu[i] - 128, vv[i] - 128);
-                let b = ((y + m.bu * u) >> 14).clamp(0, 255) as u32;
-                let g = ((y - m.gu * u - m.gv * v) >> 14).clamp(0, 255) as u32;
-                let r = ((y + m.rv * v) >> 14).clamp(0, 255) as u32;
-                px[i] = b | g << 8 | r << 16 | 0xff00_0000;
-            }
-            for (d, s) in line[x0 * 4..(x0 + n) * 4].as_chunks_mut::<4>().0.iter_mut().zip(&px) {
-                *d = s.to_le_bytes();
-            }
+            pack(&m, &yy, &uu, &vv, &mut line[x0 * 4..(x0 + n) * 4]);
         }
     });
     out
+}
+
+/// A block of 8-bit-scale samples to BGRA: `pixel`'s arithmetic in
+/// fixed-size, branch-free arrays the compiler turns into SIMD. Fills as
+/// many pixels as `out` holds (at most `BLOCK`).
+#[inline(always)]
+pub(crate) fn pack(m: &Matrix, yy: &[i32; BLOCK], uu: &[i32; BLOCK], vv: &[i32; BLOCK], out: &mut [u8]) {
+    let mut px = [0u32; BLOCK];
+    for i in 0..BLOCK {
+        let (y, u, v) = ((yy[i] - 16) * m.y + 8192, uu[i] - 128, vv[i] - 128);
+        let b = ((y + m.bu * u) >> 14).clamp(0, 255) as u32;
+        let g = ((y - m.gu * u - m.gv * v) >> 14).clamp(0, 255) as u32;
+        let r = ((y + m.rv * v) >> 14).clamp(0, 255) as u32;
+        px[i] = b | g << 8 | r << 16 | 0xff00_0000;
+    }
+    for (d, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(&px) {
+        *d = s.to_le_bytes();
+    }
+}
+
+/// The largest whole-number shrink (4 or 2, else 1) that keeps a
+/// `width` x `height` picture at least `limit` in both directions: no
+/// detail the screen could show is lost.
+pub fn scale_for(width: u32, height: u32, limit: Option<(u32, u32)>) -> usize {
+    let Some((lw, lh)) = limit.filter(|&(w, h)| w > 0 && h > 0) else { return 1 };
+    [4, 2].into_iter().find(|&s| width / s >= lw && height / s >= lh).map_or(1, |s| s as usize)
+}
+
+/// Convert, shrinking by `scale` (1, 2 or 4) with a box filter: each
+/// output pixel averages the `scale` x `scale` luma samples it covers and
+/// the chroma samples covering those. Returns (bgra, width, height). A 4K
+/// picture shown at 1080p costs a quarter of the conversion and upload.
+pub fn to_bgra_scaled<T>(p: &Planes<'_, T>, scale: usize) -> (Vec<u8>, usize, usize)
+where
+    T: Copy + Into<u32> + Sync,
+{
+    let (w, h) = (p.width, p.height);
+    let (ow, oh) = (w / scale.max(1), h / scale.max(1));
+    if scale <= 1 || ow == 0 || oh == 0 {
+        return (to_bgra(p), w, h);
+    }
+    let mut out = vec![0u8; ow * oh * 4];
+    // The source's matrix: the picture is still that video.
+    let m = matrix_for(h);
+    let shift = p.bit_depth.saturating_sub(8);
+    let (sx, sy) = match p.subsampling {
+        Subsampling::S420 => (1, 1),
+        Subsampling::S422 => (1, 0),
+        Subsampling::S444 | Subsampling::Mono => (0, 0),
+    };
+    let mono = p.subsampling == Subsampling::Mono;
+    // Chroma samples under one output pixel, across and down.
+    let (cx, cy) = (scale >> sx, scale >> sy);
+    let avg = |sum: u32, n: u32| (((sum + n / 2) / n) >> shift) as i32;
+
+    out.par_chunks_mut(ow * 4).enumerate().for_each(|(oy, line)| {
+        let mut ys = vec![0u32; ow];
+        for k in 0..scale {
+            let row = &p.y[(oy * scale + k) * p.y_stride..][..ow * scale];
+            for (sum, box_) in ys.iter_mut().zip(row.chunks_exact(scale)) {
+                *sum += box_.iter().map(|&s| s.into()).sum::<u32>();
+            }
+        }
+        let (mut us, mut vs) = (vec![0u32; ow], vec![0u32; ow]);
+        if !mono {
+            for k in 0..cy {
+                let at = (oy * cy + k) * p.uv_stride;
+                let (u, v) = (&p.u[at..][..ow * cx], &p.v[at..][..ow * cx]);
+                for (i, (bu, bv)) in u.chunks_exact(cx).zip(v.chunks_exact(cx)).enumerate() {
+                    us[i] += bu.iter().map(|&s| s.into()).sum::<u32>();
+                    vs[i] += bv.iter().map(|&s| s.into()).sum::<u32>();
+                }
+            }
+        }
+        let (ny, nc) = ((scale * scale) as u32, (cx * cy) as u32);
+        for x0 in (0..ow).step_by(BLOCK) {
+            let n = BLOCK.min(ow - x0);
+            let (mut yy, mut uu, mut vv) = ([0i32; BLOCK], [128i32; BLOCK], [128i32; BLOCK]);
+            for i in 0..n {
+                yy[i] = avg(ys[x0 + i], ny);
+                if !mono {
+                    (uu[i], vv[i]) = (avg(us[x0 + i], nc), avg(vs[x0 + i], nc));
+                }
+            }
+            pack(&m, &yy, &uu, &vv, &mut line[x0 * 4..(x0 + n) * 4]);
+        }
+    });
+    (out, ow, oh)
 }
 
 #[cfg(test)]
@@ -261,5 +339,91 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The shrinking converter against a box average of each output pixel
+    /// worked out one sample at a time, then `pixel`.
+    #[test]
+    fn scaled_conversion_averages_each_box() {
+        let mut seed = 0x9e3779b9u32;
+        let mut noise = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for sub in [Subsampling::S420, Subsampling::S422, Subsampling::S444, Subsampling::Mono] {
+            for scale in [2usize, 4] {
+                for (w, h) in [(8, 8), (13, 9), (130, 17), (259, 723)] {
+                    for depth in [8u32, 10] {
+                        let (sx, sy) = match sub {
+                            Subsampling::S420 => (1, 1),
+                            Subsampling::S422 => (1, 0),
+                            _ => (0, 0),
+                        };
+                        let (ys, cs, ch) = (w + 7, ((w + sx) >> sx) + 3, (h + sy) >> sy);
+                        let max = (1u32 << depth) - 1;
+                        let mut plane = |len: usize| (0..len).map(|_| (noise() & max) as u16).collect::<Vec<_>>();
+                        let (y, u, v) = (plane(ys * h), plane(cs * ch), plane(cs * ch));
+                        let planes = Planes {
+                            y: &y,
+                            u: &u,
+                            v: &v,
+                            y_stride: ys,
+                            uv_stride: cs,
+                            width: w,
+                            height: h,
+                            subsampling: sub,
+                            bit_depth: depth,
+                        };
+                        let (got, ow, oh) = to_bgra_scaled(&planes, scale);
+                        assert_eq!((ow, oh), (w / scale, h / scale));
+                        let (m, shift) = (matrix_for(h), depth - 8);
+                        let (cx, cy) = (scale >> sx, scale >> sy);
+                        let avg = |sum: u32, n: usize| (((sum + n as u32 / 2) / n as u32) >> shift) as i32;
+                        let mut want = vec![0u8; ow * oh * 4];
+                        for oy in 0..oh {
+                            for ox in 0..ow {
+                                let mut ysum = 0;
+                                for dy in 0..scale {
+                                    for dx in 0..scale {
+                                        ysum += y[(oy * scale + dy) * ys + ox * scale + dx] as u32;
+                                    }
+                                }
+                                let (mut us, mut vs) = (0, 0);
+                                for dy in 0..cy {
+                                    for dx in 0..cx {
+                                        let at = (oy * cy + dy) * cs + ox * cx + dx;
+                                        (us, vs) = (us + u[at] as u32, vs + v[at] as u32);
+                                    }
+                                }
+                                let (cu, cv) =
+                                    if sub == Subsampling::Mono { (128, 128) } else { (avg(us, cx * cy), avg(vs, cx * cy)) };
+                                let at = (oy * ow + ox) * 4;
+                                pixel(&m, avg(ysum, scale * scale), cu, cv, &mut want[at..at + 4]);
+                            }
+                        }
+                        assert!(got == want, "{sub:?} x{scale} {w}x{h} {depth}-bit");
+                    }
+                }
+            }
+        }
+        // Scale 1, or too small to shrink: the plain conversion.
+        let (y, c) = ([100u8; 4], [128u8; 1]);
+        let tiny = Planes { y: &y, u: &c, v: &c, y_stride: 2, uv_stride: 1, width: 2, height: 2, subsampling: Subsampling::S420, bit_depth: 8 };
+        assert_eq!(to_bgra_scaled(&tiny, 4), (to_bgra(&tiny), 2, 2));
+    }
+
+    #[test]
+    fn shrinking_never_goes_below_the_screen() {
+        assert_eq!(scale_for(3840, 2160, Some((1920, 1080))), 2);
+        assert_eq!(scale_for(3840, 2160, Some((960, 540))), 4);
+        assert_eq!(scale_for(3840, 2160, Some((1600, 900))), 2);
+        assert_eq!(scale_for(3840, 2160, Some((1921, 1080))), 1);
+        assert_eq!(scale_for(3840, 2160, Some((2560, 1440))), 1);
+        assert_eq!(scale_for(1920, 1080, Some((1920, 1080))), 1);
+        assert_eq!(scale_for(1920, 1080, Some((1200, 760))), 1);
+        assert_eq!(scale_for(1920, 1080, None), 1);
+        assert_eq!(scale_for(1920, 1080, Some((0, 0))), 1);
     }
 }

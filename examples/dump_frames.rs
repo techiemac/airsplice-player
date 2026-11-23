@@ -19,20 +19,25 @@ fn main() -> anyhow::Result<()> {
     let timing = mp4_timing::read(std::path::Path::new(&input)).remove(&track.id).unwrap_or_default();
     let mut dec = make_decoder(track.codec_params.as_ref().unwrap().video().unwrap())?;
     eprintln!("decoder: {}", dec.name());
-    let mut frames = Vec::new();
+    // Written as decoded: a 4K file's frames would not fit in memory.
+    let mut out = std::io::BufWriter::new(File::create(&output)?);
+    let mut count = 0;
+    let mut write = |frames: Vec<airsplice_player::media::video::DecodedFrame>| -> anyhow::Result<()> {
+        for f in frames {
+            out.write_all(&f.pts.to_le_bytes())?;
+            out.write_all(&f.width.to_le_bytes())?;
+            out.write_all(&f.height.to_le_bytes())?;
+            out.write_all(&f.bgra)?;
+            count += 1;
+        }
+        Ok(())
+    };
     while let Some(p) = format.next_packet()? {
         if p.track_id == track.id {
-            frames.extend(dec.decode(&p.data, timing.pts(p.pts.get()))?);
+            write(dec.decode(&p.data, timing.pts(p.pts.get()))?)?;
         }
     }
-    frames.extend(dec.flush()?);
-    let mut out = File::create(&output)?;
-    for f in &frames {
-        out.write_all(&f.pts.to_le_bytes())?;
-        out.write_all(&f.width.to_le_bytes())?;
-        out.write_all(&f.height.to_le_bytes())?;
-        out.write_all(&f.bgra)?;
-    }
-    eprintln!("{} frames", frames.len());
+    write(dec.flush()?)?;
+    eprintln!("{count} frames");
     Ok(())
 }

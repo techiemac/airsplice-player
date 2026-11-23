@@ -26,6 +26,11 @@ enum Backend {
 /// Returns frames with PTS converted to seconds, sorted by PTS, or `None`
 /// when this platform has no hardware decoder for the codec.
 fn decode_video(name: &str, backend: Backend) -> anyhow::Result<Option<Vec<(f64, DecodedFrame)>>> {
+    decode_video_limited(name, backend, None)
+}
+
+/// As `decode_video`, with the decoder told frames show no larger than `limit`.
+fn decode_video_limited(name: &str, backend: Backend, limit: Option<(u32, u32)>) -> anyhow::Result<Option<Vec<(f64, DecodedFrame)>>> {
     let path = fixture(name);
     let mss = MediaSourceStream::new(Box::new(File::open(&path)?), Default::default());
     let mut hint = Hint::new();
@@ -46,6 +51,7 @@ fn decode_video(name: &str, backend: Backend) -> anyhow::Result<Option<Vec<(f64,
             }
         },
     };
+    dec.set_output_limit(limit);
     let mut frames = Vec::new();
     // Presentation times, as the engine computes them (Symphonia reports
     // raw decode times for MP4).
@@ -73,7 +79,12 @@ fn assert_red_green_blue(name: &str, backend: Backend) -> bool {
 }
 
 fn assert_red_green_blue_sized(name: &str, backend: Backend, size: (u32, u32)) -> bool {
-    let Some(frames) = decode_video(name, backend).unwrap_or_else(|e| panic!("{name} ({backend:?}): {e:#}")) else {
+    assert_red_green_blue_limited(name, backend, None, size)
+}
+
+fn assert_red_green_blue_limited(name: &str, backend: Backend, limit: Option<(u32, u32)>, size: (u32, u32)) -> bool {
+    let decoded = decode_video_limited(name, backend, limit).unwrap_or_else(|e| panic!("{name} ({backend:?}): {e:#}"));
+    let Some(frames) = decoded else {
         eprintln!("skipping {name} on {backend:?}: not available on this platform");
         return false;
     };
@@ -105,6 +116,19 @@ fn assert_red_green_blue_sized(name: &str, backend: Backend, size: (u32, u32)) -
 fn expect_hardware(available: bool, what: &str) {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         assert!(available, "{what} should have a hardware decoder on Apple silicon");
+    }
+}
+
+/// Software decoders shrink frames to the size they are shown at (a 4K
+/// picture in a 1080p window), never below it: a quarter of the conversion
+/// and of the upload for each halving.
+#[test]
+fn software_decoders_shrink_frames_to_the_screen() {
+    for name in ["vp8_opus.webm", "av1_opus.webm", "av1_10bit_opus51.mkv", "h264_aac.mp4"] {
+        assert!(assert_red_green_blue_limited(name, Backend::Software, Some((160, 120)), (160, 120)), "{name}");
+        assert!(assert_red_green_blue_limited(name, Backend::Software, Some((80, 60)), (80, 60)), "{name}");
+        // A screen even a pixel bigger than half keeps the full picture.
+        assert!(assert_red_green_blue_limited(name, Backend::Software, Some((161, 120)), (320, 240)), "{name}");
     }
 }
 

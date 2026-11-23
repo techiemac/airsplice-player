@@ -272,6 +272,8 @@ pub struct H264Decoder {
     discard_before: i64,
     /// OpenH264's low-latency API emits decode order.
     reorder: Reorder,
+    /// The largest size frames are shown at; bigger ones are shrunk to it.
+    limit: Option<(u32, u32)>,
 }
 
 impl H264Decoder {
@@ -287,6 +289,7 @@ impl H264Decoder {
             seen_keyframe: false,
             discard_before: i64::MIN,
             reorder: Reorder::new(reorder_depth),
+            limit: None,
         })
     }
 
@@ -317,7 +320,8 @@ impl H264Decoder {
                 std::slice::from_raw_parts(dst[2], cs * ch),
             )
         };
-        let bgra = yuv::to_bgra(&Planes {
+        let scale = yuv::scale_for(w as u32, h as u32, self.limit);
+        let (bgra, ow, oh) = yuv::to_bgra_scaled(&Planes {
             y,
             u,
             v,
@@ -327,8 +331,8 @@ impl H264Decoder {
             height: h,
             subsampling: Subsampling::S420,
             bit_depth: 8,
-        });
-        Some(DecodedFrame { pts, width: w as u32, height: h as u32, bgra })
+        }, scale);
+        Some(DecodedFrame { pts, width: ow as u32, height: oh as u32, bgra })
     }
 }
 
@@ -420,6 +424,10 @@ impl VideoDecoder for H264Decoder {
         self.discard_before = discard_before;
         self.reorder.drain();
         Ok(())
+    }
+
+    fn set_output_limit(&mut self, limit: Option<(u32, u32)>) {
+        self.limit = limit;
     }
 }
 
