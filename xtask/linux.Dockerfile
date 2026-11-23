@@ -11,6 +11,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
 RUN rustup component add clippy
-# Route ALSA's default device to PulseAudio, which test-linux.sh starts with
+# Route ALSA's default device to PulseAudio, which `cargo xtask linux` starts with
 # a null sink: a real-time audio device without sound hardware.
 RUN printf 'pcm.!default { type pulse }\nctl.!default { type pulse }\n' > /etc/asound.conf

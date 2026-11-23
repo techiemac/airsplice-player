@@ -6,8 +6,9 @@ description = "A cross-platform media player with a Zed-style UI, built on GPUI 
 license = "Apache-2.0"
 
 [workspace]
-members = [".", "crates/vp8"]
-# Plain `cargo test` (local, Docker, scripts/pi.sh) also checks the decoders.
+members = [".", "crates/vp8", "xtask"]
+# Plain `cargo test` (local, Docker, the Pi test bundle) also checks the
+# decoders. xtask is the build tool, run with `cargo xtask`.
 default-members = [".", "crates/vp8"]
 
 [dependencies]

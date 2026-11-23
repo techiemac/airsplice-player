@@ -147,18 +147,19 @@ cargo run --release -- [files or folders...]
 ### Raspberry Pi
 
 The player runs on 64-bit Raspberry Pi OS with the desktop. Building on the
-Pi takes close to an hour, so `scripts/pi.sh` builds in Docker on another
-machine and copies the result over SSH:
+Pi takes close to an hour, so `cargo xtask pi` builds it in Docker on
+another machine (natively on an ARM Mac). It does not connect to the Pi;
+copy the result over yourself:
 
 ```sh
-export PI_HOST=user@raspberrypi            # default pi@raspberrypi
-export PI_KEY=~/.ssh/id_ed25519            # default: ssh's own
-export PI_DIR=/home/user/airsplice-player  # where it lives on the Pi
-
-scripts/pi.sh release          # build and copy the release binary
-scripts/pi.sh run [files...]   # build, copy and launch it
-scripts/pi.sh test [filter]    # run the tests on the Pi
+cargo xtask pi   # the app, in target/pi/airsplice-player
+scp target/pi/airsplice-player pi@raspberrypi:
 ```
+
+`cargo xtask pi-tests` packs the test suite and its fixtures into
+`target/pi/airsplice-player-tests.tar.gz`, and prints how to unpack and run
+it on the Pi. The tests find their fixtures by absolute path, so it must be
+unpacked at `/home/pi/airsplice-player`, or the path given with `--dir`.
 
 Hardware HEVC uses the Pi's V4L2 stateless decoder (`rpi-hevc-dec`). Only
 the Pi 5 has been tested; the Pi 4 has the same decoder and may work.
@@ -256,8 +257,8 @@ crates are young. The workarounds are listed under
 ```sh
 cargo test                  # tests on this machine
 cargo clippy --all-targets  # lints
-scripts/test-linux.sh       # clippy and tests on Linux, in Docker
-scripts/pi.sh test          # tests on a Raspberry Pi
+cargo xtask linux           # clippy and tests on Linux, in Docker
+cargo xtask pi-tests        # test bundle for a Raspberry Pi
 ```
 
 The tests decode fixtures with known content through every backend the
@@ -289,6 +290,7 @@ Tools in `examples/`:
 | `src/media/picture.rs` | stills and animations: outlines, frame timing, decoding |
 | `src/media/upscale/` | MetalFX, and the FSR 1 compute shaders (`fsr1.wgsl`) |
 | `vendor/` | patched upstream crates, each with a `PATCHED.md` |
+| `xtask/` | `cargo xtask`: the Docker builds for Linux and the Pi |
 
 ### Upstream issues
 

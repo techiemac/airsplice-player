@@ -1,6 +1,6 @@
 # One Rust version for local builds, the Docker image and CI, so a newer
 # clippy on one of them cannot fail a build that passed on another. Bump it
-# here, in scripts/linux.Dockerfile, and fix what the new clippy reports.
+# here, in xtask/linux.Dockerfile, and fix what the new clippy reports.
 [toolchain]
 channel = "1.100.0"
 components = ["clippy"]
