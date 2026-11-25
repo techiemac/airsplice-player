@@ -608,6 +608,12 @@ impl Player {
         self.picture.as_ref().is_some_and(Outline::is_still)
     }
 
+    /// Whether this file has a picture to show: video it can decode, or
+    /// an image. Music (cover art aside) has none.
+    pub fn shows_picture(&self) -> bool {
+        self.info.video.is_some() || self.picture.is_some()
+    }
+
     pub fn set_still_duration(&mut self, secs: Option<f64>) {
         if self.picture.as_ref().is_some_and(Outline::is_still) {
             self.still_secs = secs.filter(|s| *s > 0.0);
@@ -651,6 +657,12 @@ impl Player {
         self.shared.settled.store(false, Ordering::Relaxed);
         self.shared.generation.store(generation, Ordering::Release);
         self.shared.frames_cv.notify_all();
+    }
+
+    /// The volume set last, when the file has sound playing to a device.
+    #[cfg(test)]
+    pub(crate) fn volume(&self) -> Option<f32> {
+        self.audio.as_ref().map(|out| out.state.lock().unwrap().volume)
     }
 
     pub fn set_volume(&self, volume: f32, muted: bool) {

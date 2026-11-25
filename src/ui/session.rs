@@ -39,6 +39,10 @@ pub struct Session {
     /// Seconds a still image shows before the playlist moves on; 0 keeps
     /// it up until skipped.
     pub still_seconds: u32,
+    /// Dissolve from one playlist entry into the next, over
+    /// `dissolve_seconds`.
+    pub dissolve: bool,
+    pub dissolve_seconds: f32,
     /// Move on to the next playlist entry when one ends.
     pub autoplay: bool,
     /// Folders collapsed in the playlist.
@@ -74,6 +78,8 @@ impl Default for Session {
             audio_output: None,
             upscaling: false,
             still_seconds: 10,
+            dissolve: false,
+            dissolve_seconds: 1.0,
             autoplay: true,
             collapsed_folders: Vec::new(),
             sidebar_width: 240.0,
@@ -208,6 +214,8 @@ mod tests {
             audio_output: Some("coreaudio:BuiltInSpeakerDevice".into()),
             upscaling: true,
             still_seconds: 45,
+            dissolve: true,
+            dissolve_seconds: 2.5,
             autoplay: false,
             collapsed_folders: vec![dir.clone()],
             sidebar_width: 320.0,

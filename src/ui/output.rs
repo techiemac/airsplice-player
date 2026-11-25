@@ -14,9 +14,9 @@ use super::app::MediaPlayer;
 pub struct OutputView {
     player: WeakEntity<MediaPlayer>,
     main: AnyWindowHandle,
-    /// The image last drawn here. Each window uploads images to its own
-    /// atlas, so this window frees its copy when the picture changes.
-    shown: Option<Arc<RenderImage>>,
+    /// The images last drawn here. Each window uploads images to its own
+    /// atlas, so this window frees its copies when the picture changes.
+    shown: Vec<Arc<RenderImage>>,
     _observe: Subscription,
 }
 
@@ -36,39 +36,47 @@ pub fn open(display: DisplayId, player: &Entity<MediaPlayer>, main: AnyWindowHan
         ..Default::default()
     };
     cx.open_window(options, |_, cx| {
-        cx.new(|cx| OutputView { player: player.downgrade(), main, shown: None, _observe: cx.observe(player, |_, _, cx| cx.notify()) })
+        cx.new(|cx| OutputView { player: player.downgrade(), main, shown: Vec::new(), _observe: cx.observe(player, |_, _, cx| cx.notify()) })
     })
 }
 
 impl OutputView {
+    /// The picture on top: the one being shown, or faded in.
     pub fn shown(&self) -> Option<&Arc<RenderImage>> {
-        self.shown.as_ref()
+        self.shown.last()
     }
 }
 
 impl Render for OutputView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let picture = self.player.upgrade().and_then(|p| p.read(cx).picture());
-        let same = match (&self.shown, &picture) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            (None, None) => true,
-            _ => false,
-        };
-        if !same && let Some(old) = std::mem::replace(&mut self.shown, picture.clone()) {
-            let _ = window.drop_image(old);
+        // The picture, or during a dissolve the old one under the new.
+        let layers = self.player.upgrade().map(|p| p.read(cx).layers(true)).unwrap_or_default();
+        for old in std::mem::take(&mut self.shown) {
+            if !layers.iter().any(|(l, _)| Arc::ptr_eq(l, &old)) {
+                let _ = window.drop_image(old);
+            }
         }
+        self.shown = layers.iter().map(|(l, _)| l.clone()).collect();
         let main = self.main;
         div()
             .id("output")
             .relative()
             .size_full()
             // Black only around the picture (see `letterbox`).
-            .when(picture.is_none(), |el| el.bg(rgb(0x000000)))
+            .when(layers.is_empty(), |el| el.bg(rgb(0x000000)))
             // Keys always go to the controls: a click here (an operator
             // reaching for them) hands the keyboard back.
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 let _ = main.update(cx, |_, window, _| window.activate_window());
             })
-            .when_some(picture, |el, p| el.child(super::letterbox::bars(&p)).child(img(p).absolute().inset_0().size_full().object_fit(ObjectFit::Contain)))
+            .children(layers.into_iter().map(|(p, opacity)| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+                    .when(opacity < 1.0, |el| el.opacity(opacity))
+                    .child(super::letterbox::bars(&p))
+                    .child(img(p).absolute().inset_0().size_full().object_fit(ObjectFit::Contain))
+            }))
     }
 }

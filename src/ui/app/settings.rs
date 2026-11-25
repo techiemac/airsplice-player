@@ -50,9 +50,10 @@ fn still_label(secs: u32) -> String {
     if secs == 0 { "Until skipped".into() } else { format!("{secs} s") }
 }
 
-/// Settings rows: upscaling, stills, one per display, then the audio
-/// output.
-const FIRST_SCREEN_ROW: usize = 2;
+/// Settings rows: upscaling, stills, the dissolve, one per display, then
+/// the audio output.
+const DISSOLVE_ROW: usize = 2;
+const FIRST_SCREEN_ROW: usize = 3;
 
 /// How often the connected displays are checked, so an output display
 /// plugged in or out is noticed.
@@ -103,11 +104,6 @@ fn display_for(uuid: &str, cx: &App) -> Option<DisplayId> {
 }
 
 impl MediaPlayer {
-    /// What the output windows show: the video frame, else the cover art.
-    pub(in crate::ui) fn picture(&self) -> Option<Arc<RenderImage>> {
-        self.frame.clone().or_else(|| self.cover.clone())
-    }
-
     /// Connected displays, the primary one first, numbered in that order.
     pub(super) fn screens(&self, window: &Window, cx: &App) -> Vec<Screen> {
         let mut displays = cx.displays();
@@ -314,6 +310,7 @@ impl MediaPlayer {
             return;
         }
         self.audio_output = id;
+        self.end_dissolve(window);
         let has_sound = |l: &Loaded| l.player.as_ref().is_some_and(|p| p.info.audio.is_some());
 
         let installed = self.take_installed();
@@ -451,6 +448,7 @@ impl MediaPlayer {
                     self.set_upscaling(!self.upscaling, cx);
                 }
             }
+            DISSOLVE_ROW => self.set_dissolve(!self.dissolve, window, cx),
             // Enter on the stills row starts typing seconds, or ends it.
             1 => {
                 if was_typing.is_none()
@@ -472,14 +470,16 @@ impl MediaPlayer {
         }
     }
 
-    /// Left and Right: a second less or more, when the stills row is
-    /// selected.
+    /// Left and Right: a second less or more on the stills row, half a
+    /// second on the dissolve's.
     fn settings_adjust(&mut self, by: i64, cx: &mut Context<Self>) {
-        if let Some(s) = self.settings.as_mut()
-            && s.selected == 1
-        {
-            s.typed = None;
-            self.set_still_seconds(step_still(self.still_seconds, by), cx);
+        match self.settings.as_mut() {
+            Some(s) if s.selected == 1 => {
+                s.typed = None;
+                self.set_still_seconds(step_still(self.still_seconds, by), cx);
+            }
+            Some(s) if s.selected == DISSOLVE_ROW => self.set_dissolve_secs(dissolve::step_dissolve(self.dissolve_secs, by), cx),
+            _ => {}
         }
     }
 
@@ -587,6 +587,49 @@ impl MediaPlayer {
             .child(icon_button("still-more", Icon::Plus, false, cx.listener(move |this, _, _, cx| {
                 this.settings_select(1);
                 this.set_still_seconds(step_still(secs, 1), cx)
+            })));
+
+        // Dissolve: row 2. The box switches it, the buttons set its length.
+        let dissolve_secs = self.dissolve_secs;
+        let dissolve_row = div()
+            .id("dissolve-choice")
+            .debug_selector(|| "dissolve-choice".into())
+            .h(px(32.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .rounded(px(4.))
+            .text_sm()
+            .when(selected == DISSOLVE_ROW, |el| el.bg(Theme::selected()))
+            .hover(|s| s.bg(Theme::hover()))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, window, cx| this.settings_toggle(DISSOLVE_ROW, window, cx)))
+            .child(checkbox(self.dissolve, true))
+            .child(div().flex_1().min_w_0().truncate().text_color(Theme::text()).child("Dissolve between entries"))
+            .child(div().debug_selector(|| "dissolve-less".into()).child(icon_button("dissolve-less", Icon::Minus, false, cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.settings_select(DISSOLVE_ROW);
+                this.set_dissolve_secs(dissolve::step_dissolve(dissolve_secs, -1), cx)
+            }))))
+            .child(
+                div()
+                    .w(px(96.))
+                    .h(px(24.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(Theme::border_variant())
+                    .text_color(if self.dissolve { Theme::text() } else { Theme::text_placeholder() })
+                    .child(dissolve::dissolve_label(dissolve_secs)),
+            )
+            .child(icon_button("dissolve-more", Icon::Plus, false, cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.settings_select(DISSOLVE_ROW);
+                this.set_dissolve_secs(dissolve::step_dissolve(dissolve_secs, 1), cx)
             })));
 
         let row = |ix: usize, screen: &Screen| {
@@ -754,6 +797,16 @@ impl MediaPlayer {
                     .gap(px(4.))
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(Theme::text()).child("Stills"))
                     .child(still_row),
+            )
+            .child(
+                div()
+                    .px(px(12.))
+                    .pt(px(12.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(Theme::text()).child("Transitions"))
+                    .child(dissolve_row),
             )
             .child(
                 div()

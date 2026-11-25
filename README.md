@@ -33,7 +33,10 @@ has not been tested.
   and layout come back, paused, on the next launch.
 
 Seeks land on the exact time asked for. The next entry is cued in the
-background, so moving on is instant. If playback drops frames, freezes, or
+background, so moving on is instant. Moving between entries can dissolve
+instead of cutting (off by default): both keep playing while the new one
+fades in and the sound crossfades, and autoplay starts it one dissolve
+before the current entry ends. If playback drops frames, freezes, or
 the audio drops out, a warning appears in the status bar; hover it for the
 numbers.
 
@@ -187,8 +190,8 @@ the Pi 5 has been tested; the Pi 4 has the same decoder and may work.
 | Close tab | Cmd+W | Ctrl+W |
 | Tab 1 to 8 / last tab | Cmd+1 to 8 / Cmd+9 | Ctrl+1 to 8 / Ctrl+9 |
 
-The settings choose the audio output, the external displays, upscaling and
-how long stills show. Autoplay, in the playlist pane, moves on to the next
+The settings choose the audio output, the external displays, upscaling,
+the dissolve and its length, and how long stills show. Autoplay, in the playlist pane, moves on to the next
 entry when one ends; repeat all loops the playlist and repeat one the entry.
 Drag the playlist's right edge to resize it (double-click to reset).
 

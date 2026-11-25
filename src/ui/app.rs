@@ -29,6 +29,7 @@ use crate::media::upscale::{self, Status as UpscaleStatus};
 use crate::media::picture::{self, is_picture};
 use crate::media::{Image, Player, Summary, audio, probe};
 
+mod dissolve;
 mod settings;
 use settings::{Output, SETTINGS_CONTEXT, SettingsScreen};
 
@@ -312,6 +313,14 @@ pub struct MediaPlayer {
     /// Move on to the next playlist entry when one ends (the playlist
     /// pane's switch). Off, playback stops at the end of each entry.
     autoplay: bool,
+    /// Dissolve from one entry into the next (a setting), over
+    /// `dissolve_secs`.
+    dissolve: bool,
+    dissolve_secs: f32,
+    /// The entry being dissolved away from, still playing under the new one.
+    outgoing: Option<dissolve::Outgoing>,
+    /// Set while an entry that will fade in is opened, so it starts silent.
+    fading_in: bool,
     /// The playlist pane's width (logical pixels), set by dragging its edge.
     sidebar_width: f32,
     /// Folders collapsed in the playlist pane. Sorted, for a stable
@@ -425,6 +434,10 @@ impl MediaPlayer {
             audio_devices_at: Instant::now(),
             upscaling: session.upscaling,
             still_seconds: session.still_seconds,
+            dissolve: session.dissolve,
+            dissolve_secs: session.dissolve_seconds.clamp(dissolve::MIN_DISSOLVE, dissolve::MAX_DISSOLVE),
+            outgoing: None,
+            fading_in: false,
             autoplay: session.autoplay,
             collapsed: session.collapsed_folders.iter().cloned().collect(),
             sidebar_width: session.sidebar_width.clamp(*SIDEBAR_WIDTH.start(), *SIDEBAR_WIDTH.end()),
@@ -618,6 +631,8 @@ impl MediaPlayer {
             audio_output: self.audio_output.clone(),
             upscaling: self.upscaling,
             still_seconds: self.still_seconds,
+            dissolve: self.dissolve,
+            dissolve_seconds: self.dissolve_secs,
             autoplay: self.autoplay,
             collapsed_folders: self.collapsed.iter().cloned().collect(),
             sidebar_width: self.sidebar_width,
@@ -644,6 +659,10 @@ impl MediaPlayer {
     // ---- playback ---------------------------------------------------------
 
     fn tick_interval(&self) -> Duration {
+        // A dissolve redraws at the display's pace while it lasts.
+        if self.outgoing.is_some() {
+            return Duration::from_millis(8);
+        }
         match &self.player {
             Some(p) if !p.is_paused() && p.info.video.is_some() => Duration::from_millis(5),
             Some(p) if !p.is_paused() => Duration::from_millis(33),
@@ -671,6 +690,9 @@ impl MediaPlayer {
             {
                 let _ = window.drop_image(old);
             }
+        }
+        if self.tick_dissolve(window) {
+            cx.notify();
         }
         if self.player.is_none() {
             return;
@@ -752,7 +774,7 @@ impl MediaPlayer {
             self.player_error = error;
             changed = true;
         }
-        if !self.ended && player.is_finished() {
+        if (!self.ended && player.is_finished()) || self.dissolve_due() {
             self.on_track_end(window, cx);
             changed = true;
         }
@@ -839,7 +861,13 @@ impl MediaPlayer {
     }
 
     fn play_index(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.dissolve_from(window);
+        self.fading_in = from.is_some();
         self.open_index(ix, true, 0.0, window, cx);
+        self.fading_in = false;
+        if let Some(from) = from {
+            self.begin_dissolve(from, window);
+        }
     }
 
     /// Open playlist entry `ix` in the active tab (a new one if none is
@@ -852,7 +880,7 @@ impl MediaPlayer {
             Some((p, mut loaded)) if p == path && start_at == 0.0 => {
                 if let Some(player) = loaded.player.as_mut() {
                     player.set_background(false);
-                    player.set_volume(self.volume, self.muted);
+                    player.set_volume(self.entry_volume(), self.muted);
                     player.set_paused(!autoplay);
                 }
                 loaded
@@ -888,7 +916,7 @@ impl MediaPlayer {
         // Opened at the current display size, so stills (preloaded ones too)
         // are decoded no bigger than they are shown.
         let limit = (self.limit.0 > 0 && self.limit.1 > 0).then_some(self.limit);
-        match Player::open_sized(path, self.audio_output.as_deref(), self.volume, self.muted, limit) {
+        match Player::open_sized(path, self.audio_output.as_deref(), self.entry_volume(), self.muted, limit) {
             Ok(mut player) => {
                 player.set_upscaling(self.upscaling);
                 player.set_still_duration(self.still_duration());
@@ -986,6 +1014,8 @@ impl MediaPlayer {
         if ix >= self.tabs.len() || self.active == Some(ix) {
             return;
         }
+        // A tab switch is a cut: any dissolve finishes first.
+        self.end_dissolve(window);
         let mut was_playing = false;
         if let Some(a) = self.active {
             was_playing = !self.ended && self.player.as_ref().is_some_and(|p| !p.is_paused());
@@ -1102,6 +1132,7 @@ impl MediaPlayer {
     }
 
     fn unload(&mut self, window: &mut Window) {
+        self.end_dissolve(window);
         self.player = None;
         self.ended = false;
         self.drawn_position = -1.0;
@@ -1378,6 +1409,8 @@ impl MediaPlayer {
     // ---- actions ----------------------------------------------------------
 
     fn play_pause(&mut self, _: &PlayPause, window: &mut Window, cx: &mut Context<Self>) {
+        // Pausing mid-dissolve settles on the new entry.
+        self.end_dissolve(window);
         match self.player.as_mut() {
             Some(p) if self.ended => {
                 p.seek(0.0);
@@ -2010,7 +2043,9 @@ impl MediaPlayer {
     }
 
     fn render_stage(&self, cx: &mut Context<Self>) -> AnyElement {
-        if let Some(frame) = &self.frame {
+        let layers = self.layers(false);
+        if !layers.is_empty() {
+            let top = layers.len() - 1;
             return div()
                 .id("video")
                 .debug_selector(|| "video".into())
@@ -2019,13 +2054,29 @@ impl MediaPlayer {
                 .min_h_0()
                 .overflow_hidden()
                 .on_click(cx.listener(|this, e: &ClickEvent, window, cx| this.stage_clicked(e.click_count(), window, cx)))
-                // Absolutely placed, so the image's box is exactly the stage
-                // whatever its shape: in the flex layout a tall picture's box
-                // grew past the stage and was cropped.
-                // Black only where the picture does not reach: nothing under
-                // the stage paints a background (see `letterbox`).
-                .child(letterbox::bars(frame))
-                .child(img(frame.clone()).debug_selector(|| "video-frame".into()).absolute().inset_0().size_full().object_fit(ObjectFit::Contain))
+                // One layer, or two during a dissolve (the new picture fading
+                // in over the old). Each is absolutely placed, so the image's
+                // box is exactly the stage whatever its shape: in the flex
+                // layout a tall picture's box grew past the stage and was
+                // cropped. Black only where the picture does not reach:
+                // nothing under the stage paints a background (see
+                // `letterbox`).
+                .children(layers.into_iter().enumerate().map(|(i, (frame, opacity))| {
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .when(opacity < 1.0, |el| el.opacity(opacity))
+                        .child(letterbox::bars(&frame))
+                        .child(
+                            img(frame)
+                                .when(i == top, |el| el.debug_selector(|| "video-frame".into()))
+                                .absolute()
+                                .inset_0()
+                                .size_full()
+                                .object_fit(ObjectFit::Contain),
+                        )
+                }))
                 .into_any_element();
         }
         let content: AnyElement = match (&self.player, &self.error) {
@@ -3240,9 +3291,9 @@ mod tests {
         let screens = view.update_in(vcx, |v, window, cx| v.screens(window, cx));
         assert_eq!((screens.len(), screens[0].label.as_str(), screens[0].here), (1, "Display 1", true));
 
-        // Down to it (past upscaling and stills), Enter turns it on: the
-        // picture goes there and follows playback.
-        vcx.simulate_keystrokes("down down enter");
+        // Down to it (past upscaling, stills and the dissolve), Enter turns
+        // it on: the picture goes there and follows playback.
+        vcx.simulate_keystrokes("down down down enter");
         vcx.run_until_parked();
         let out = *output_windows(&view, vcx).first().expect("output open");
         assert_eq!(vcx.windows().len(), 2);
@@ -3415,6 +3466,131 @@ mod tests {
         tick_until(&view, vcx, "the still again", |v| v.frame.is_some() && v.current == Some(0));
         assert_eq!(view.read_with(vcx, |v, _| v.player.as_ref().unwrap().info.duration), None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn picking_an_entry_dissolves_into_it_with_both_playing(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let files = vec![fixture("h264_aac.mp4"), fixture("vp8_opus.webm")];
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(files, None, window, cx));
+        view.update_in(vcx, |v, window, cx| {
+            v.set_dissolve(true, window, cx);
+            v.set_dissolve_secs(0.5, cx);
+        });
+        tick_until(&view, vcx, "the first video", |v| v.frame.is_some());
+        let volume = view.read_with(vcx, |v, _| v.volume);
+
+        // Next: the first file keeps playing underneath, the second opens
+        // silent and fades in over it.
+        vcx.simulate_keystrokes("n");
+        view.read_with(vcx, |v, _| {
+            let out = v.outgoing.as_ref().expect("dissolving");
+            let out = out.loaded.player.as_ref().expect("the old file still open");
+            assert_eq!(v.current, Some(1));
+            assert!(!out.is_paused(), "the old file keeps playing");
+            assert_eq!(v.player.as_ref().unwrap().volume().unwrap_or(0.0), 0.0, "the new one starts silent");
+        });
+        tick_until(&view, vcx, "the fade to start", |v| v.dissolve_progress().is_some_and(|p| p > 0.0));
+        let mut seen = vec![];
+        let started = Instant::now();
+        while view.read_with(vcx, |v, _| v.outgoing.is_some()) {
+            assert!(started.elapsed() < Duration::from_secs(3), "the dissolve did not end");
+            view.update_in(vcx, |v, window, cx| v.tick(window, cx));
+            view.read_with(vcx, |v, _| {
+                let Some(p) = v.dissolve_progress() else { return };
+                let layers = v.layers(false);
+                assert_eq!(layers.len(), 2, "old picture under the new");
+                assert_eq!(layers[0].1, 1.0);
+                assert!(layers[1].1 > 0.0 && layers[1].1 <= 1.0);
+                let out = v.outgoing.as_ref().and_then(|o| o.loaded.player.as_ref()).and_then(Player::volume);
+                let inc = v.player.as_ref().and_then(Player::volume);
+                seen.push((p, out, inc));
+            });
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(400), "lasted its length, not {took:?}");
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "the fade only moves forward");
+        // With an audio device, the sound crossfades: the old one fades
+        // out as the new one fades in.
+        let sound: Vec<(f32, f32)> = seen.iter().filter_map(|&(_, o, i)| Some((o?, i?))).collect();
+        if sound.len() >= 2 {
+            assert!(sound.windows(2).all(|w| w[1].0 <= w[0].0 + 1e-6 && w[1].1 + 1e-6 >= w[0].1), "{sound:?}");
+            assert!(sound.first().unwrap().0 > sound.last().unwrap().0);
+        }
+        view.read_with(vcx, |v, _| {
+            assert_eq!(v.layers(false).len(), 1, "just the new picture");
+            if let Some(level) = v.player.as_ref().unwrap().volume() {
+                assert_eq!(level, volume, "full volume once it is over");
+            }
+        });
+
+        // Pausing mid-dissolve settles on the new file; so does a tab switch.
+        vcx.simulate_keystrokes("p");
+        assert!(view.read_with(vcx, |v, _| v.outgoing.is_some()));
+        vcx.simulate_keystrokes("space");
+        view.read_with(vcx, |v, _| {
+            assert!(v.outgoing.is_none() && v.current == Some(0));
+            assert!(v.player.as_ref().unwrap().is_paused());
+        });
+
+        // Off: picking an entry cuts.
+        view.update_in(vcx, |v, window, cx| v.set_dissolve(false, window, cx));
+        vcx.simulate_keystrokes("n");
+        assert!(view.read_with(vcx, |v, _| v.outgoing.is_none() && v.current == Some(1)));
+    }
+
+    #[gpui::test]
+    fn autoplay_starts_the_dissolve_before_the_entry_ends(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (dir, files) = slides("dissolve-autoplay");
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(files, None, window, cx));
+        view.update_in(vcx, |v, window, cx| {
+            v.set_still_seconds(2, cx);
+            v.set_dissolve(true, window, cx);
+            v.set_dissolve_secs(0.5, cx);
+        });
+        tick_until(&view, vcx, "the second slide", |v| v.current == Some(1));
+        // Half a second early: the first slide has time left, and shows
+        // under the second as it fades in.
+        view.read_with(vcx, |v, _| {
+            let out = v.outgoing.as_ref().and_then(|o| o.loaded.player.as_ref()).expect("dissolving from the first slide");
+            let left = out.info.duration.unwrap() - out.position();
+            assert!((0.3..=0.55).contains(&left), "{left} s left");
+            assert!(!out.is_finished());
+        });
+        tick_until(&view, vcx, "the dissolve to end", |v| v.outgoing.is_none());
+        // Entries shorter than two dissolves play out, then dissolve.
+        view.update_in(vcx, |v, _, cx| v.set_dissolve_secs(1.5, cx));
+        tick_until(&view, vcx, "the third slide", |v| v.current == Some(2));
+        view.read_with(vcx, |v, _| {
+            let out = v.outgoing.as_ref().and_then(|o| o.loaded.player.as_ref()).expect("dissolving from the second slide");
+            assert!(out.is_finished(), "the second slide played out");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn the_dissolve_is_set_in_the_settings(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(vec![], None, window, cx));
+        assert!(view.read_with(vcx, |v, _| !v.dissolve && v.dissolve_secs == 1.0), "off, 1 s by default");
+        // Past upscaling and stills; Enter switches it on, Right lengthens it.
+        vcx.simulate_keystrokes("secondary-, down down enter right right");
+        view.read_with(vcx, |v, _| {
+            assert!(v.dissolve && v.dissolve_secs == 2.0);
+            let saved = v.snapshot(false);
+            assert!(saved.dissolve && saved.dissolve_seconds == 2.0, "saved");
+        });
+        // The length buttons set the length without switching it.
+        vcx.run_until_parked();
+        let minus = vcx.debug_bounds("dissolve-less").expect("the shorter button").center();
+        vcx.simulate_click(minus, gpui::Modifiers::none());
+        assert_eq!(view.read_with(vcx, |v, _| (v.dissolve, v.dissolve_secs)), (true, 1.5));
+        // Clicking the row itself switches it off.
+        let row = vcx.debug_bounds("dissolve-choice").expect("the dissolve row");
+        vcx.simulate_click(gpui::point(row.left() + px(12.), row.center().y), gpui::Modifiers::none());
+        assert!(view.read_with(vcx, |v, _| !v.dissolve));
     }
 
     /// Three one-colour stills in a fresh folder.
@@ -3623,9 +3799,9 @@ mod tests {
             v.audio_devices = vec![audio::OutputDevice { id: "coreaudio:desk".into(), name: "Desk speakers".into() }];
             v.audio_devices_at = Instant::now();
         });
-        // Past upscaling, stills and the one display, Enter opens the list
-        // on the current choice, under the button.
-        vcx.simulate_keystrokes("down down down enter");
+        // Past upscaling, stills, the dissolve and the one display, Enter
+        // opens the list on the current choice, under the button.
+        vcx.simulate_keystrokes("down down down down enter");
         assert_eq!(view.read_with(vcx, |v, _| v.settings.as_ref().unwrap().audio_menu), Some(0));
         let button = vcx.debug_bounds("audio-choice").expect("audio output button");
         let menu = vcx.debug_bounds("audio-menu").expect("audio output list");
