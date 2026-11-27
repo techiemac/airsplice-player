@@ -4,7 +4,7 @@ use gpui::{
     App, Application, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*,
     px, size,
 };
-use airsplice_player::ui::app::{self, MediaPlayer, OpenFiles, OpenSettings, Quit};
+use airsplice_player::ui::app::{self, MediaPlayer, OpenFiles, OpenSettings, Quit, SavePlaylist};
 use airsplice_player::ui::icons::Assets;
 use airsplice_player::ui::session::SessionStore;
 
@@ -23,7 +23,10 @@ fn main() {
                 name: "airsplice-player".into(),
                 items: vec![MenuItem::action("Settings…", OpenSettings), MenuItem::separator(), MenuItem::action("Quit", Quit)],
             },
-            Menu { name: "File".into(), items: vec![MenuItem::action("Open…", OpenFiles)] },
+            Menu {
+                name: "File".into(),
+                items: vec![MenuItem::action("Open…", OpenFiles), MenuItem::action("Save Playlist…", SavePlaylist)],
+            },
         ]);
 
         let bounds = Bounds::centered(None, size(px(1200.), px(760.)), cx);

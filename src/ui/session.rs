@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Session {
     pub playlist: Vec<PathBuf>,
+    /// Each playlist entry's own dissolve length in seconds (0 cuts),
+    /// from a playlist file; `None` follows the setting. Missing or short
+    /// in sessions saved before entries had one.
+    pub entry_dissolve: Vec<Option<f32>>,
+    /// The playlist file last opened or saved, offered when saving again.
+    pub playlist_file: Option<PathBuf>,
     pub current: Option<usize>,
     pub position: f64,
     pub volume: f32,
@@ -62,6 +68,8 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             playlist: Vec::new(),
+            entry_dissolve: Vec::new(),
+            playlist_file: None,
             current: None,
             position: 0.0,
             volume: 0.8,
@@ -104,7 +112,15 @@ impl Session {
             self.active_tab = Some(0);
         }
         let current_path = self.current.and_then(|i| self.playlist.get(i).cloned());
-        self.playlist.retain(|p| p.exists());
+        self.entry_dissolve.resize(self.playlist.len(), None);
+        let kept: Vec<bool> = self.playlist.iter().map(|p| p.exists()).collect();
+        let mut keep = kept.iter();
+        self.playlist.retain(|_| *keep.next().unwrap());
+        let mut keep = kept.iter();
+        self.entry_dissolve.retain(|_| *keep.next().unwrap());
+        for d in self.entry_dissolve.iter_mut() {
+            *d = d.filter(|s| s.is_finite() && *s >= 0.0);
+        }
         self.current = current_path.and_then(|c| self.playlist.iter().position(|p| *p == c));
         if self.current.is_none() {
             self.position = 0.0;
@@ -198,6 +214,8 @@ mod tests {
         std::fs::write(&track, b"x").unwrap();
         let session = Session {
             playlist: vec![track.clone()],
+            entry_dissolve: vec![Some(2.5)],
+            playlist_file: Some(dir.join("show.airsplice")),
             current: Some(0),
             position: 12.5,
             volume: 0.3,
@@ -232,13 +250,21 @@ mod tests {
         let (a, b, c) = (dir.join("a.mp3"), dir.join("gone.mp3"), dir.join("c.mp3"));
         std::fs::write(&a, b"x").unwrap();
         std::fs::write(&c, b"x").unwrap();
-        let s = Session { playlist: vec![a.clone(), b.clone(), c.clone()], current: Some(2), position: 40.0, ..Default::default() }
-            .without_missing_files();
+        let s = Session {
+            playlist: vec![a.clone(), b.clone(), c.clone()],
+            entry_dissolve: vec![None, Some(1.0), Some(f32::NAN)],
+            current: Some(2),
+            position: 40.0,
+            ..Default::default()
+        }
+        .without_missing_files();
         assert_eq!(s.playlist, vec![a.clone(), c.clone()]);
+        assert_eq!(s.entry_dissolve, vec![None, None], "kept in step with the playlist, bad lengths dropped");
         assert_eq!((s.current, s.position), (Some(1), 40.0));
 
         let s = Session { playlist: vec![a, b, c], current: Some(1), position: 40.0, ..Default::default() }.without_missing_files();
         assert_eq!((s.current, s.position), (None, 0.0), "the current file itself is gone");
+        assert_eq!(s.entry_dissolve, vec![None, None], "an older session without lengths");
         let _ = std::fs::remove_dir_all(dir);
     }
 

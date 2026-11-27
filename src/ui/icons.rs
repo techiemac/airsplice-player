@@ -32,6 +32,8 @@ pub enum Icon {
     Check,
     Minus,
     Warning,
+    Cut,
+    Dissolve,
 }
 
 impl Icon {
@@ -66,6 +68,8 @@ impl Icon {
             Icon::Check => "check",
             Icon::Minus => "minus",
             Icon::Warning => "warning",
+            Icon::Cut => "cut",
+            Icon::Dissolve => "dissolve",
         }
     }
 
@@ -95,11 +99,15 @@ impl Icon {
             Icon::Check => r##"<path d="M5 12.5l4.5 4.5L19 7"/>"##,
             Icon::Minus => r##"<path d="M5 12h14"/>"##,
             Icon::Warning => r##"<path d="M12 3.5L2.5 20h19z"/><path d="M12 10v4.5M12 17.5h.01"/>"##,
+            // Two shots side by side, and two overlapping with the second
+            // half see-through.
+            Icon::Cut => r##"<rect x="2.5" y="6" width="8" height="12" rx="1.5"/><rect x="13.5" y="6" width="8" height="12" rx="1.5"/>"##,
+            Icon::Dissolve => r##"<rect x="2.5" y="6" width="12" height="12" rx="1.5"/><rect x="9.5" y="6" width="12" height="12" rx="1.5" fill="#fff" fill-opacity=".4"/>"##,
             Icon::Settings => r##"<circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="6.5"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/>"##,
         }
     }
 
-    const ALL: [Icon; 25] = [
+    const ALL: [Icon; 27] = [
         Icon::Play,
         Icon::Pause,
         Icon::SkipBack,
@@ -125,6 +133,8 @@ impl Icon {
         Icon::Check,
         Icon::Minus,
         Icon::Warning,
+        Icon::Cut,
+        Icon::Dissolve,
     ];
 }
 

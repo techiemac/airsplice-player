@@ -31,6 +31,8 @@ has not been tested.
   Windows media overlay, Linux MPRIS).
 - **Session restore.** The playlist, tabs, positions, volume, repeat mode
   and layout come back, paused, on the next launch.
+- **Playlist files.** `.airsplice` files (YAML) save a playlist and can give
+  each entry its own dissolve length.
 
 Seeks land on the exact time asked for. The next entry is cued in the
 background, so moving on is instant. Moving between entries can dissolve
@@ -180,6 +182,7 @@ the Pi 5 has been tested; the Pi 4 has the same decoder and may work.
 | Full screen | F, or double-click the video | F, or double-click the video |
 | External outputs on / off | Cmd+Shift+F | Ctrl+Shift+F |
 | Open files | Cmd+O | Ctrl+O |
+| Save playlist | Cmd+S | Ctrl+S |
 | Find in playlist | Cmd+P | Ctrl+P |
 | Command palette | Cmd+Shift+P | Ctrl+Shift+P |
 | Playlist / info panel | Cmd+B / Cmd+R | Ctrl+B / Ctrl+R |
@@ -206,6 +209,34 @@ kept in `airsplice-player/session.json` in the platform's config directory
 - `AIRSPLICE_PLAYER_SOFTWARE_VIDEO=1` turns off hardware video decoding.
 - `RUST_LOG=airsplice_player=debug` logs why hardware decoding was skipped,
   decode errors, and the frame rate shown.
+
+### Playlist files
+
+Save Playlist writes the playlist to an `.airsplice` file. Opening one
+(Cmd/Ctrl+O, or dropping it on the window) adds its entries; on the
+command line they replace the saved playlist. An entry can have its own dissolve length, which applies whether
+or not the dissolve setting is on; entries without one follow the setting.
+Set it for the clip on screen with the button beside repeat (Cut,
+Dissolve with its length, or Use setting), or in the file.
+
+```yaml
+version: 1
+player:
+  playlist:
+    dissolve: 1        # seconds, for entries without their own
+    entries:
+    - intro.mp4
+    - path: slides/title.png
+      dissolve: 2.5    # into this entry
+    - path: talk.mp4
+      dissolve: 0      # cuts
+```
+
+Relative paths are from the file's folder. Entries whose files are missing
+are skipped (the status bar says how many), and saving leaves them out.
+Saving rewrites the file without its comments but keeps what other
+AirSplice tools wrote in it. The format is described in
+[`crates/file`](crates/file/README.md).
 
 ## Why not FFmpeg
 
@@ -292,6 +323,8 @@ Tools in `examples/`:
 | `src/media/mp4_timing.rs` | MP4 composition offsets and edit lists |
 | `src/media/picture.rs` | stills and animations: outlines, frame timing, decoding |
 | `src/media/upscale/` | MetalFX, and the FSR 1 compute shaders (`fsr1.wgsl`) |
+| `crates/file/` | `.airsplice` files, shared with other AirSplice tools |
+| `crates/vp8/` | the VP8 decoder |
 | `vendor/` | patched upstream crates, each with a `PATCHED.md` |
 | `xtask/` | `cargo xtask`: the Docker builds for Linux and the Pi |
 

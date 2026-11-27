@@ -30,6 +30,7 @@ use crate::media::picture::{self, is_picture};
 use crate::media::{Image, Player, Summary, audio, probe};
 
 mod dissolve;
+mod playlist_file;
 mod settings;
 use settings::{Output, SETTINGS_CONTEXT, SettingsScreen};
 
@@ -46,6 +47,7 @@ actions!(
         ToggleMute,
         CycleRepeat,
         OpenFiles,
+        SavePlaylist,
         ToggleSidebar,
         ToggleInfoPanel,
         ToggleFullscreen,
@@ -109,6 +111,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-right", NextTrack, None),
         KeyBinding::new("secondary-left", PreviousTrack, None),
         KeyBinding::new("secondary-o", OpenFiles, None),
+        KeyBinding::new("secondary-s", SavePlaylist, None),
         KeyBinding::new("secondary-b", ToggleSidebar, None),
         KeyBinding::new("secondary-r", ToggleInfoPanel, None),
         KeyBinding::new("secondary-shift-p", CommandPalette, None),
@@ -263,6 +266,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Cycle Repeat Mode", Box::new(CycleRepeat)),
         ("Toggle Autoplay", Box::new(ToggleAutoplay)),
         ("Open Files…", Box::new(OpenFiles)),
+        ("Save Playlist…", Box::new(SavePlaylist)),
         ("Toggle Playlist Panel", Box::new(ToggleSidebar)),
         ("Toggle Info Panel", Box::new(ToggleInfoPanel)),
         ("Toggle Full Screen", Box::new(ToggleFullscreen)),
@@ -282,6 +286,12 @@ pub struct MediaPlayer {
     focus: FocusHandle,
     picker_focus: FocusHandle,
     playlist: Vec<PathBuf>,
+    /// Each entry's own dissolve length in seconds (0 cuts), from a
+    /// playlist file; `None` follows the setting. Always as long as
+    /// `playlist`.
+    entry_dissolve: Vec<Option<f32>>,
+    /// The playlist file last opened or saved, offered when saving again.
+    playlist_file: Option<PathBuf>,
     /// Open tabs, left to right; `active` is `None` exactly when there are
     /// none. The active tab's state is in `current`, `player`, `frame`...
     tabs: Vec<Tab>,
@@ -321,6 +331,8 @@ pub struct MediaPlayer {
     outgoing: Option<dissolve::Outgoing>,
     /// Set while an entry that will fade in is opened, so it starts silent.
     fading_in: bool,
+    /// The menu of the transition button (beside repeat) is open.
+    transition_menu: bool,
     /// The playlist pane's width (logical pixels), set by dragging its edge.
     sidebar_width: f32,
     /// Folders collapsed in the playlist pane. Sorted, for a stable
@@ -421,6 +433,8 @@ impl MediaPlayer {
             focus,
             picker_focus: cx.focus_handle(),
             playlist: Vec::new(),
+            entry_dissolve: Vec::new(),
+            playlist_file: session.playlist_file.clone(),
             tabs: Vec::new(),
             active: None,
             notice: None,
@@ -438,6 +452,7 @@ impl MediaPlayer {
             dissolve_secs: session.dissolve_seconds.clamp(dissolve::MIN_DISSOLVE, dissolve::MAX_DISSOLVE),
             outgoing: None,
             fading_in: false,
+            transition_menu: false,
             autoplay: session.autoplay,
             collapsed: session.collapsed_folders.iter().cloned().collect(),
             sidebar_width: session.sidebar_width.clamp(*SIDEBAR_WIDTH.start(), *SIDEBAR_WIDTH.end()),
@@ -500,6 +515,7 @@ impl MediaPlayer {
         };
         if files.is_empty() {
             this.playlist = session.playlist;
+            this.entry_dissolve = session.entry_dissolve;
             this.removed_from_folders = session.removed_from_folders.into_iter().collect();
             // Rescans now, for files added while the app was closed.
             this.folders.set(session.folders);
@@ -591,6 +607,7 @@ impl MediaPlayer {
     // ---- session ----------------------------------------------------------
 
     fn snapshot(&self, exact: bool) -> Session {
+        debug_assert_eq!(self.entry_dissolve.len(), self.playlist.len(), "entry lengths out of step with the playlist");
         let saved_position = |player: Option<&Player>, ended: bool| match player {
             Some(_) if ended => 0.0,
             Some(p) if exact => p.position(),
@@ -615,6 +632,8 @@ impl MediaPlayer {
             .collect();
         Session {
             playlist: self.playlist.clone(),
+            entry_dissolve: self.entry_dissolve.clone(),
+            playlist_file: self.playlist_file.clone(),
             current: self.current,
             position,
             volume: self.volume,
@@ -861,7 +880,7 @@ impl MediaPlayer {
     }
 
     fn play_index(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let from = self.dissolve_from(window);
+        let from = self.dissolve_from(ix, window);
         self.fading_in = from.is_some();
         self.open_index(ix, true, 0.0, window, cx);
         self.fading_in = false;
@@ -1143,15 +1162,20 @@ impl MediaPlayer {
 
     fn add_paths(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
         let first_new = self.playlist.len();
+        // A playlist file adds its entries, each with its dissolve length.
+        let (items, problems) = playlist_file::expand(paths);
+        if let Some(file) = paths.iter().rev().find(|p| airsplice_file::is_airsplice_file(p) && p.is_file()) {
+            self.playlist_file = std::fs::canonicalize(file).ok();
+        }
         // Absolute paths, so the saved session works from any directory.
-        let absolute: Vec<PathBuf> = paths
-            .iter()
-            .map(|p| std::fs::canonicalize(p).or_else(|_| std::path::absolute(p)).unwrap_or_else(|_| p.clone()))
+        let absolute: Vec<(PathBuf, Option<f32>)> = items
+            .into_iter()
+            .map(|(p, d)| (std::fs::canonicalize(&p).or_else(|_| std::path::absolute(&p)).unwrap_or(p), d))
             .collect();
         // A folder's files already listed (the folder added twice) are not
         // added again.
         let mut present: std::collections::HashSet<PathBuf> = self.playlist.iter().cloned().collect();
-        for path in &absolute {
+        for (path, dissolve) in &absolute {
             if path.is_dir() {
                 // Adding a folder again brings back files removed from it.
                 self.removed_from_folders.retain(|p| !p.starts_with(path));
@@ -1165,6 +1189,7 @@ impl MediaPlayer {
                     self.stamps.insert(file.clone(), stamp);
                     if present.insert(file.clone()) {
                         self.playlist.push(file);
+                        self.entry_dissolve.push(*dissolve);
                     }
                 }
             } else {
@@ -1172,11 +1197,16 @@ impl MediaPlayer {
                 self.removed_from_folders.remove(path);
                 present.insert(path.clone());
                 self.playlist.push(path.clone());
+                self.entry_dissolve.push(*dissolve);
             }
         }
         self.probe_new(cx);
         if self.player.is_none() && self.playlist.len() > first_new {
             self.play_index(first_new, window, cx);
+        }
+        // After playing, which clears the notice.
+        if !problems.is_empty() {
+            self.notice = Some(problems.join("; "));
         }
         cx.notify();
     }
@@ -1226,6 +1256,7 @@ impl MediaPlayer {
             return;
         }
         self.playlist.remove(ix);
+        self.entry_dissolve.remove(ix);
         // Tabs showing the removed entry close; later entries shift down.
         for t in (0..self.tabs.len()).rev() {
             let active = self.active == Some(t);
@@ -1327,6 +1358,7 @@ impl MediaPlayer {
     /// Insert an entry at `ix`, keeping every tab on its file.
     fn insert_entry(&mut self, ix: usize, path: PathBuf) {
         self.playlist.insert(ix, path);
+        self.entry_dissolve.insert(ix, None);
         for t in 0..self.tabs.len() {
             let track = if self.active == Some(t) { &mut self.current } else { &mut self.tabs[t].track };
             if let Some(c) = track
@@ -1543,6 +1575,8 @@ impl MediaPlayer {
     fn clear_playlist(&mut self, _: &ClearPlaylist, window: &mut Window, cx: &mut Context<Self>) {
         self.close_all_tabs(window);
         self.playlist.clear();
+        self.entry_dissolve.clear();
+        self.playlist_file = None;
         self.folders.clear();
         self.removed_from_folders.clear();
         self.stamps.clear();
@@ -1911,6 +1945,22 @@ impl MediaPlayer {
                                 .text_color(if active { Theme::text() } else { Theme::text_muted() })
                                 .child(self.display_name(path)),
                         )
+                        // Its own dissolve length, from a playlist file.
+                        .when_some(self.entry_dissolve.get(ix).copied().flatten(), |el, secs| {
+                            el.child(
+                                div()
+                                    .debug_selector(move || format!("entry-dissolve {ix}"))
+                                    .flex_none()
+                                    .px(px(4.))
+                                    .rounded(px(3.))
+                                    .border_1()
+                                    .border_color(Theme::border())
+                                    .text_xs()
+                                    .text_color(Theme::text_placeholder())
+                                    .group_hover("track", |s| s.invisible())
+                                    .child(playlist_file::entry_dissolve_label(secs)),
+                            )
+                        })
                         .when_some(duration, |el, d| {
                             el.child(
                                 div()
@@ -2184,14 +2234,18 @@ impl MediaPlayer {
             .items_center()
             .justify_between()
             .child(
-                div().w(px(160.)).flex().items_center().gap(px(4.)).child(
-                    icon_button(
+                div()
+                    .w(px(160.))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(icon_button(
                         "repeat",
                         if self.repeat == Repeat::One { Icon::RepeatOne } else { Icon::Repeat },
                         self.repeat != Repeat::Off,
                         cx.listener(|this, _, window, cx| this.cycle_repeat(&CycleRepeat, window, cx)),
-                    ),
-                ),
+                    ))
+                    .children(self.render_transition_button(cx)),
             )
             .child(
                 div()
@@ -2623,6 +2677,7 @@ impl Render for MediaPlayer {
             .on_action(cx.listener(Self::toggle_mute))
             .on_action(cx.listener(Self::cycle_repeat))
             .on_action(cx.listener(Self::open_files))
+            .on_action(cx.listener(Self::save_playlist))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_info))
             .on_action(cx.listener(Self::toggle_fullscreen))
@@ -3591,6 +3646,148 @@ mod tests {
         let row = vcx.debug_bounds("dissolve-choice").expect("the dissolve row");
         vcx.simulate_click(gpui::point(row.left() + px(12.), row.center().y), gpui::Modifiers::none());
         assert!(view.read_with(vcx, |v, _| !v.dissolve));
+    }
+
+    #[gpui::test]
+    fn a_playlist_file_sets_each_entrys_dissolve(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (dir, _) = slides("playlist-file");
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let show = dir.join("show.airsplice");
+        // Another tool's keys, on the file, the playlist and an entry.
+        std::fs::write(
+            &show,
+            "version: 1\nplayer:\n  playlist:\n    entries:\n    - slide0.png\n    - path: slide1.png\n      dissolve: 0.5\n      splice:\n        in: 3\n    - path: slide2.png\n      dissolve: 0\n    - gone.png\n    loop: true\n  volume: 0.5\nsplice:\n  cuts: []\n",
+        )
+        .unwrap();
+        let (view, vcx) = cx.add_window_view({
+            let files = vec![show.clone()];
+            |window, cx| MediaPlayer::new(files, None, window, cx)
+        });
+        view.read_with(vcx, |v, _| {
+            assert_eq!(v.playlist, [dir.join("slide0.png"), dir.join("slide1.png"), dir.join("slide2.png")]);
+            assert_eq!(v.entry_dissolve, [None, Some(0.5), Some(0.0)]);
+            assert_eq!(v.notice.as_deref(), Some("show.airsplice: 1 entry not found"));
+            let saved = v.snapshot(false);
+            assert_eq!((saved.entry_dissolve, saved.playlist_file), (v.entry_dissolve.clone(), Some(show.clone())), "remembered");
+            // The setting is off, so only entries with their own length dissolve.
+            assert_eq!((0..3).map(|ix| v.dissolve_into(ix)).collect::<Vec<_>>(), [None, Some(0.5), None]);
+        });
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("entry-dissolve 1").is_some() && vcx.debug_bounds("entry-dissolve 2").is_some());
+        assert!(vcx.debug_bounds("entry-dissolve 0").is_none(), "no length of its own: no label");
+
+        // Autoplay dissolves into slide 1 half a second early, then cuts to
+        // slide 2.
+        view.update_in(vcx, |v, _, cx| v.set_still_seconds(2, cx));
+        tick_until(&view, vcx, "the second slide", |v| v.current == Some(1));
+        view.read_with(vcx, |v, _| {
+            let out = v.outgoing.as_ref().and_then(|o| o.loaded.player.as_ref()).expect("dissolving into slide 1");
+            let left = out.info.duration.unwrap() - out.position();
+            assert!((0.3..=0.55).contains(&left), "{left} s left");
+        });
+        tick_until(&view, vcx, "the third slide", |v| v.current == Some(2));
+        assert!(view.read_with(vcx, |v, _| v.outgoing.is_none()), "slide 2 cuts in");
+
+        // With the setting on, entries without a length use it; a 0 still cuts.
+        view.update_in(vcx, |v, window, cx| {
+            v.set_dissolve(true, window, cx);
+            assert_eq!((0..3).map(|ix| v.dissolve_into(ix)).collect::<Vec<_>>(), [Some(1.0), Some(0.5), None]);
+            v.play_index(0, window, cx);
+            assert!(v.outgoing.is_some(), "picking slide 0 dissolves");
+            v.play_index(2, window, cx);
+            assert!(v.outgoing.is_none(), "picking slide 2 cuts");
+        });
+
+        // Saving over the file keeps what the other tool wrote; the entry
+        // that was not found is left out.
+        view.update_in(vcx, |v, _, _| v.save_playlist_to(&show));
+        assert_eq!(view.read_with(vcx, |v, _| v.notice.clone()), None);
+        let entries = "    entries:\n    - slide0.png\n    - path: slide1.png\n      dissolve: 0.5\n      splice:\n        in: 3\n    - path: slide2.png\n      dissolve: 0\n";
+        assert_eq!(
+            std::fs::read_to_string(&show).unwrap(),
+            format!("version: 1\nplayer:\n  playlist:\n{entries}    loop: true\n  volume: 0.5\nsplice:\n  cuts: []\n")
+        );
+
+        // A new file gets the extension, and the entry keys stay with it.
+        view.update_in(vcx, |v, _, _| v.save_playlist_to(&dir.join("copy")));
+        assert_eq!(view.read_with(vcx, |v, _| v.playlist_file.clone()), Some(dir.join("copy.airsplice")));
+        let copy = std::fs::read_to_string(dir.join("copy.airsplice")).unwrap();
+        assert_eq!(copy, "version: 1\nplayer:\n  playlist:\n    entries:\n    - slide0.png\n    - path: slide1.png\n      dissolve: 0.5\n    - path: slide2.png\n      dissolve: 0\n");
+
+        // A file from a newer format is not overwritten.
+        let newer = dir.join("newer.airsplice");
+        std::fs::write(&newer, "version: 2\n").unwrap();
+        view.update_in(vcx, |v, _, _| v.save_playlist_to(&newer));
+        assert_eq!(
+            view.read_with(vcx, |v, _| v.notice.clone()).as_deref(),
+            Some("Not saved: newer.airsplice is not readable as a playlist (written for airsplice format version 2; this reads up to 1), so it was left alone")
+        );
+        assert_eq!(std::fs::read_to_string(&newer).unwrap(), "version: 2\n");
+        assert_eq!(view.read_with(vcx, |v, _| v.playlist_file.clone()), Some(dir.join("copy.airsplice")), "still the last one saved");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn each_clips_transition_is_set_from_the_button_beside_repeat(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let (dir, files) = slides("transition-button");
+        let (view, vcx) = cx.add_window_view(|window, cx| MediaPlayer::new(files, None, window, cx));
+        view.update_in(vcx, |v, window, cx| v.play_index(1, window, cx));
+        let click = |vcx: &mut gpui::VisualTestContext, what: &'static str| {
+            vcx.run_until_parked();
+            let b = vcx.debug_bounds(what).unwrap_or_else(|| panic!("no {what}"));
+            // Menu rows by their label, at the left; buttons in the middle.
+            let at = if what.starts_with("transition-") && !what.ends_with("less") && !what.ends_with("more") {
+                gpui::point(b.left() + px(30.), b.center().y)
+            } else {
+                b.center()
+            };
+            vcx.simulate_click(at, gpui::Modifiers::none());
+            vcx.run_until_parked();
+        };
+        let state = |vcx: &mut gpui::VisualTestContext| view.read_with(vcx, |v, _| (v.entry_dissolve.clone(), v.transition_menu));
+
+        // The button opens the menu; Dissolve gives the clip on screen its
+        // own dissolve, at the setting's length, and closes it.
+        click(vcx, "transition");
+        assert!(state(vcx).1, "menu open");
+        click(vcx, "transition-dissolve");
+        assert_eq!(state(vcx), (vec![None, Some(1.0), None], false), "only the clip on screen");
+
+        // The length steps without closing the menu, and stops at the shortest.
+        click(vcx, "transition");
+        click(vcx, "transition-more");
+        click(vcx, "transition-more");
+        assert_eq!(state(vcx), (vec![None, Some(2.0), None], true));
+        for _ in 0..5 {
+            click(vcx, "transition-less");
+        }
+        assert_eq!(state(vcx).0[1], Some(0.5));
+        assert_eq!(view.read_with(vcx, |v, _| v.snapshot(false).entry_dissolve), [None, Some(0.5), None], "saved");
+
+        click(vcx, "transition-cut");
+        assert_eq!(state(vcx), (vec![None, Some(0.0), None], false));
+        // Dissolve again comes back at the setting's length.
+        click(vcx, "transition");
+        click(vcx, "transition-dissolve");
+        assert_eq!(state(vcx).0[1], Some(1.0));
+        click(vcx, "transition");
+        click(vcx, "transition-setting");
+        assert_eq!(state(vcx), (vec![None, None, None], false), "follows the setting again");
+
+        // A click elsewhere closes the menu and changes nothing.
+        click(vcx, "transition");
+        click(vcx, "pl-autoplay");
+        assert_eq!(view.read_with(vcx, |v, _| (v.transition_menu, v.autoplay)), (false, true));
+
+        // Nothing on screen: no button. (Checked on the view: GPUI's test
+        // map of drawn elements keeps entries from earlier frames.)
+        view.update_in(vcx, |v, window, cx| {
+            v.close_active_tab(&CloseTab, window, cx);
+            assert!(v.render_transition_button(cx).is_none());
+        });
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Three one-colour stills in a fresh folder.

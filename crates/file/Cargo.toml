@@ -1,0 +1,12 @@
+[package]
+name = "airsplice-file"
+version = "0.1.0"
+edition = "2024"
+description = "Reads and writes .airsplice files, the documents AirSplice tools share"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+# A maintained fork of serde_yaml, which is no longer maintained.
+serde_norway = "0.9.42"
